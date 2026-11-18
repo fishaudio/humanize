@@ -64,8 +64,19 @@ diag() {
     printf 'polish-gemini: %s\n' "$msg" >&2
 }
 
+OUTCOME_EMITTED=false
+
+# emit_outcome OUTCOME REASON DELIVERED: print the one outcome line.
+# From here on the run is ending, so a signal is only recorded (see on_signal)
+# and can neither print a second outcome line nor cut the exit short; callers
+# exit with "${PENDING_SIGNAL:-CODE}".
 emit_outcome() {
+    IN_DELIVERY=true
+    if [[ "$OUTCOME_EMITTED" == "true" ]]; then
+        return 0
+    fi
     printf 'polish-gemini: outcome=%s reason=%s delivered=%s\n' "$1" "$2" "$3" >&2
+    OUTCOME_EMITTED=true
 }
 
 cleanup_temps() {
@@ -76,9 +87,10 @@ cleanup_temps() {
     TEMP_FILES=()
 }
 
-# While the fallback copy is being delivered, a signal is recorded and handled
-# once delivery has finished: the outcome line reports what was delivered and
-# the exit code (130 or 143) reports the interruption.
+# While the fallback copy is being delivered, and once the outcome line is
+# being printed, a signal is recorded and handled at exit: the outcome line
+# reports what was delivered and the exit code (130 or 143) reports the
+# interruption.
 IN_DELIVERY=false
 PENDING_SIGNAL=""
 
@@ -90,7 +102,9 @@ on_signal() {
         SIGNALS_SEEN=$((SIGNALS_SEEN + 1))
         return 0
     fi
-    trap - INT TERM
+    # A second signal from here on is only recorded, so the outcome line below
+    # is always printed.
+    IN_DELIVERY=true
     cleanup_temps
     emit_outcome failed interrupted no
     exit "$1"
@@ -116,17 +130,32 @@ trap 'on_signal 143' TERM
 # sent to the whole process group (for example Ctrl-C) cannot cut it short.
 # Waiting with the wait builtin lets the trap record a signal sent to this
 # shell alone; in the foreground, bash would drop a SIGINT that the child
-# survived. wait returns 130 or 143 when a trapped signal interrupts it; the
-# step itself cannot end that way because it ignores both signals.
+# survived.
+#
+# wait returns 130 or 143 when a trapped signal interrupts it; waiting again
+# then gives the step's own status (or 127 once that status was collected).
+# A step that itself ended with 130 or 143 was signalled in the moment before
+# it could ignore the signal, so it had not started the command yet and is
+# run again.
 shielded() {
-    local pid status seen
-    ( trap '' INT TERM; exec "$@" ) &
-    pid=$!
+    local pid status again seen attempt=0
     while :; do
+        ( trap '' INT TERM; exec "$@" ) &
+        pid=$!
         seen="$SIGNALS_SEEN"
         wait "$pid"
         status=$?
-        if [[ "$SIGNALS_SEEN" != "$seen" ]] && (( status == 130 || status == 143 )); then
+        while [[ "$SIGNALS_SEEN" != "$seen" ]] && (( status == 130 || status == 143 )); do
+            seen="$SIGNALS_SEEN"
+            wait "$pid" 2>/dev/null
+            again=$?
+            if (( again == 127 )); then
+                break
+            fi
+            status=$again
+        done
+        if (( (status == 130 || status == 143) && attempt < 3 )); then
+            attempt=$((attempt + 1))
             continue
         fi
         return "$status"
@@ -138,7 +167,7 @@ usage_error() {
     diag "Use --help for usage information"
     cleanup_temps
     emit_outcome failed usage_error no
-    exit 1
+    exit "${PENDING_SIGNAL:-1}"
 }
 
 show_help() {
@@ -435,42 +464,66 @@ file_mode() {
 deliver_original() {
     local reason="$1"
     local src="$INPUT"
-    local tmp_out="" mode=""
+    local tmp_out="" mode="" same_file=false
 
     if [[ "$INPUT" == "-" ]]; then
         src="$(mktemp "${TMPDIR:-/tmp}/polish-gemini-in.XXXXXX")" || {
             cleanup_temps
             emit_outcome failed delivery_error no
-            exit 4
+            exit "${PENDING_SIGNAL:-4}"
         }
         TEMP_FILES+=("$src")
-        cat > "$src"
+        if ! cat > "$src"; then
+            diag "could not copy standard input to a temporary file"
+            cleanup_temps
+            emit_outcome failed delivery_error no
+            exit "${PENDING_SIGNAL:-4}"
+        fi
+    fi
+
+    # The mode of the result is settled before delivery starts. A signal that
+    # cuts this lookup short ends the run here, with nothing delivered, so a
+    # partial lookup is never used.
+    if [[ -n "$OUTPUT" ]]; then
+        if [[ "$INPUT" != "-" && -e "$OUTPUT" && "$OUTPUT" -ef "$INPUT" ]]; then
+            same_file=true
+        elif [[ -e "$OUTPUT" ]]; then
+            mode="$(file_mode "$OUTPUT")"
+        else
+            mode="$(umask)"
+            mode="$(printf '%o' $(( 0666 & ~0$mode )))"
+        fi
+        if [[ "$same_file" != "true" ]] && ! [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+            diag "could not read the file mode for $OUTPUT"
+            cleanup_temps
+            emit_outcome failed delivery_error no
+            exit "${PENDING_SIGNAL:-4}"
+        fi
     fi
 
     # A signal that arrived before this point has already ended the run with
     # nothing delivered. From here on, signals wait until delivery is done.
     IN_DELIVERY=true
-    if [[ -n "$OUTPUT" ]]; then
-        if [[ "$INPUT" != "-" && -e "$OUTPUT" && "$OUTPUT" -ef "$INPUT" ]]; then
-            :
-        else
-            if [[ -d "$OUTPUT" ]] || ! tmp_out="$(mktemp "$(dirname "$OUTPUT")/.polish-gemini-XXXXXX" 2>/dev/null)"; then
-                diag "could not write $OUTPUT"
-                finish_delivery failed delivery_error no 4
-            fi
-            TEMP_FILES+=("$tmp_out")
-            if [[ -e "$OUTPUT" ]]; then
-                mode="$(file_mode "$OUTPUT")"
-            else
-                mode="$(printf '%o' $(( 0666 & ~0$(umask) )))"
-            fi
-            if ! shielded cat "$src" > "$tmp_out" || ! shielded chmod "${mode:-644}" "$tmp_out" \
-                || ! shielded mv -f "$tmp_out" "$OUTPUT"; then
+    if [[ -n "$OUTPUT" && "$same_file" != "true" ]]; then
+        if [[ -d "$OUTPUT" ]] || ! tmp_out="$(mktemp "$(dirname "$OUTPUT")/.polish-gemini-XXXXXX" 2>/dev/null)"; then
+            diag "could not write $OUTPUT"
+            finish_delivery failed delivery_error no 4
+        fi
+        TEMP_FILES+=("$tmp_out")
+        if ! shielded cat "$src" > "$tmp_out" || ! shielded chmod "$mode" "$tmp_out"; then
+            diag "could not write $OUTPUT"
+            finish_delivery failed delivery_error no 4
+        fi
+        if ! shielded mv -f "$tmp_out" "$OUTPUT"; then
+            # mv can fail after the rename itself succeeded (for example when
+            # it is killed right after). The temporary file is gone and the
+            # destination holds the original only when the rename happened.
+            if [[ -e "$tmp_out" ]] || ! shielded cmp -s "$src" "$OUTPUT"; then
                 diag "could not write $OUTPUT"
                 finish_delivery failed delivery_error no 4
             fi
         fi
-    else
+    elif [[ -z "$OUTPUT" ]]; then
         if ! shielded cat "$src"; then
             finish_delivery failed delivery_error no 4
         fi
@@ -515,5 +568,6 @@ PY_ARGS=(
 [[ "$STRICT" == "true" ]] && PY_ARGS+=(--strict)
 
 cleanup_temps
-trap - INT TERM
+# exec resets the traps; Python installs its own handlers. A signal before the
+# exec still ends the run through on_signal with one outcome line.
 exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"

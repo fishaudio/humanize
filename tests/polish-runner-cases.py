@@ -16,7 +16,10 @@ Covered here (the loopback mock cannot produce these reliably):
 - SIGTERM and SIGINT, sent to the process alone and to its whole process
   group, while stdout delivery is blocked on a full pipe, through the Python
   helper and through the shell fallback without Python;
-- SIGINT that was ignored when the run started stays ignored on both paths.
+- SIGINT that was ignored when the run started stays ignored on both paths;
+- shell fallback edges: a failed stdin copy, SIGTERM during the output mode
+  lookup, SIGTERM right before a usage error exits, SIGTERM in the moment
+  before a delivery step ignores signals, and mv killed after the rename.
 
 No network is used: the HTTP call is replaced in the child process.
 """
@@ -25,9 +28,11 @@ import itertools
 import json
 import os
 import re
+import resource
 import shutil
 import signal
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -288,6 +293,155 @@ def blocked_stdout_cases():
                "rc=%s %r" % (proc.returncode, outcomes))
 
 
+def fallback_env(work, extra=None):
+    env = dict(os.environ)
+    for key in ("HUMANIZE_CONFIG", "PYTHONPATH", "HUMANIZE_POLISH_BASE_URL", "BASH_ENV"):
+        env.pop(key, None)
+    env.update(CLAUDE_PROJECT_DIR=work, XDG_CONFIG_HOME=work, XDG_CACHE_HOME=work,
+               OPENROUTER_API_KEY="", HUMANIZE_POLISH_PYTHON=os.path.join(work, "no-such-python3"))
+    env.update(extra or {})
+    return env
+
+
+def outcome_lines(err):
+    return [ln for ln in err.decode("utf-8", "replace").splitlines() if ln.startswith(OUTCOME_PREFIX)]
+
+
+def write_script(path, body):
+    with open(path, "w") as fh:
+        fh.write(body)
+    os.chmod(path, 0o755)
+
+
+def fallback_edge_cases():
+    """Shell fallback paths found by the second Round 1 re-review."""
+    payload = b"Read the source text for the fallback path.\n"
+    failed_no = [OUTCOME_PREFIX + "failed reason=delivery_error delivered=no"]
+    skipped_yes = [OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"]
+
+    # Copying stdin to a temporary file fails (file size limit): nothing is
+    # delivered and an existing output is left alone.
+    big = b"Read the source text.\n" * 70000
+    limit = lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (8192, 8192))
+    work = tempfile.mkdtemp(prefix="polish-runner-edge-")
+    out = os.path.join(work, "out.md")
+    with open(out, "wb") as fh:
+        fh.write(b"old\n")
+    proc = subprocess.run([RUNNER, "--input", "-"], input=big, env=fallback_env(work),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=limit, timeout=60)
+    report("failed stdin copy to stdout: delivery_error, nothing delivered, exit 4",
+           proc.returncode == 4 and outcome_lines(proc.stderr) == failed_no and proc.stdout == b"",
+           "rc=%s %r %d bytes" % (proc.returncode, outcome_lines(proc.stderr), len(proc.stdout)))
+    proc = subprocess.run([RUNNER, "--input", "-", "--output", out], input=big, env=fallback_env(work),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=limit, timeout=60)
+    with open(out, "rb") as fh:
+        unchanged = fh.read() == b"old\n"
+    report("failed stdin copy to a file: delivery_error and the file is unchanged",
+           proc.returncode == 4 and outcome_lines(proc.stderr) == failed_no and unchanged,
+           "rc=%s %r unchanged=%s" % (proc.returncode, outcome_lines(proc.stderr), unchanged))
+    shutil.rmtree(work, ignore_errors=True)
+
+    # A group SIGTERM while the output's mode is looked up ends the run before
+    # delivery; the file keeps its content and mode 600.
+    work = tempfile.mkdtemp(prefix="polish-runner-edge-")
+    source = os.path.join(work, "input.md")
+    out = os.path.join(work, "out.md")
+    with open(source, "wb") as fh:
+        fh.write(payload)
+    with open(out, "wb") as fh:
+        fh.write(b"old\n")
+    os.chmod(out, 0o600)
+    shim = os.path.join(work, "bin")
+    os.mkdir(shim)
+    flag = os.path.join(work, "stat.flag")
+    real_stat = shutil.which("stat")
+    write_script(os.path.join(shim, "stat"),
+                 "#!/bin/bash\n: > '%s'\nsleep 2\nexec '%s' \"$@\"\n" % (flag, real_stat))
+    proc = subprocess.Popen([RUNNER, "--input", source, "--output", out],
+                            env=fallback_env(work, {"PATH": shim + os.pathsep + os.environ["PATH"]}),
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+    for _ in range(200):
+        if os.path.exists(flag):
+            break
+        time.sleep(0.05)
+    os.killpg(proc.pid, signal.SIGTERM)
+    _, err = proc.communicate(timeout=30)
+    with open(out, "rb") as fh:
+        unchanged = fh.read() == b"old\n"
+    mode = stat.S_IMODE(os.stat(out).st_mode)
+    report("SIGTERM during the mode lookup: interrupted, file and mode 600 unchanged, exit 143",
+           proc.returncode == 143 and unchanged and mode == 0o600
+           and outcome_lines(err) == [OUTCOME_PREFIX + "failed reason=interrupted delivered=no"],
+           "rc=%s %r mode=%o unchanged=%s" % (proc.returncode, outcome_lines(err), mode, unchanged))
+    shutil.rmtree(work, ignore_errors=True)
+
+    # SIGTERM right before a usage error exits: still one outcome line.
+    work = tempfile.mkdtemp(prefix="polish-runner-edge-")
+    env_file = os.path.join(work, "bash-env.sh")
+    with open(env_file, "w") as fh:
+        fh.write("set -o functrace\n"
+                 "trap 'if [[ \"${FUNCNAME[0]:-}\" == usage_error && \"$BASH_COMMAND\" == exit* ]]; then"
+                 " kill -TERM $$; fi' DEBUG\n")
+    proc = subprocess.run([RUNNER, "--input", os.path.join(work, "missing.md")],
+                          env=fallback_env(work, {"BASH_ENV": env_file}),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    report("SIGTERM right before a usage error exits: one outcome line, exit 143",
+           proc.returncode == 143
+           and outcome_lines(proc.stderr) == [OUTCOME_PREFIX + "failed reason=usage_error delivered=no"],
+           "rc=%s %r" % (proc.returncode, outcome_lines(proc.stderr)))
+    shutil.rmtree(work, ignore_errors=True)
+
+    # A group SIGTERM in the moment before a delivery step ignores signals:
+    # the step is run again and delivery completes.
+    for target in ("stdout", "file"):
+        work = tempfile.mkdtemp(prefix="polish-runner-edge-")
+        source = os.path.join(work, "input.md")
+        out = os.path.join(work, "out.md")
+        with open(source, "wb") as fh:
+            fh.write(payload)
+        flag = os.path.join(work, "fired")
+        env_file = os.path.join(work, "bash-env.sh")
+        with open(env_file, "w") as fh:
+            fh.write("set -o functrace\n"
+                     "trap 'if (( BASH_SUBSHELL > 0 )) && [[ \"$BASH_COMMAND\" == \"trap '\"''\"' INT TERM\""
+                     " && ! -e \"%s\" ]]; then : > \"%s\"; kill -TERM 0; fi' DEBUG\n" % (flag, flag))
+        args = [RUNNER, "--input", source] + (["--output", out] if target == "file" else [])
+        proc = subprocess.Popen(args, env=fallback_env(work, {"BASH_ENV": env_file}),
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+        stdout, err = proc.communicate(timeout=30)
+        if target == "file":
+            with open(out, "rb") if os.path.exists(out) else open(os.devnull, "rb") as fh:
+                got = fh.read()
+        else:
+            got = stdout
+        fired = os.path.exists(flag)
+        shutil.rmtree(work, ignore_errors=True)
+        report("SIGTERM before a %s delivery step ignores signals: delivered, exit 143" % target,
+               fired and proc.returncode == 143 and got == payload and outcome_lines(err) == skipped_yes,
+               "fired=%s rc=%s %r exact=%s" % (fired, proc.returncode, outcome_lines(err), got == payload))
+
+    # mv is killed right after the rename: the delivery is still reported.
+    work = tempfile.mkdtemp(prefix="polish-runner-edge-")
+    source = os.path.join(work, "input.md")
+    out = os.path.join(work, "out.md")
+    with open(source, "wb") as fh:
+        fh.write(payload)
+    with open(out, "wb") as fh:
+        fh.write(b"old\n")
+    shim = os.path.join(work, "bin")
+    os.mkdir(shim)
+    write_script(os.path.join(shim, "mv"), "#!/bin/bash\n'%s' \"$@\"\nkill -USR1 $$\n" % shutil.which("mv"))
+    proc = subprocess.run([RUNNER, "--input", source, "--output", out],
+                          env=fallback_env(work, {"PATH": shim + os.pathsep + os.environ["PATH"]}),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    with open(out, "rb") as fh:
+        exact = fh.read() == payload
+    shutil.rmtree(work, ignore_errors=True)
+    report("mv killed after the rename: delivered=yes, exit 0",
+           proc.returncode == 0 and exact and outcome_lines(proc.stderr) == skipped_yes,
+           "rc=%s %r exact=%s" % (proc.returncode, outcome_lines(proc.stderr), exact))
+
+
 def ignored_signal_cases():
     """SIGINT ignored when the run starts (a background job) stays ignored."""
     payload = b"Read the source text.\n" * 50000
@@ -331,6 +485,7 @@ def main():
     shell_finish_race_cases()
     blocked_stdout_cases()
     ignored_signal_cases()
+    fallback_edge_cases()
     sys.exit(1 if FAILED else 0)
 
 

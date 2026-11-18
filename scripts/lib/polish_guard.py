@@ -404,6 +404,16 @@ def extract_tokens(text):
     for k, ch in hidden:
         chars[k] = ch
 
+    # Link destinations, autolinks and URLs are read again from the original
+    # text: code-span, math or escape syntax inside a destination is part of
+    # the destination, so masking it above must not leave the rest editable.
+    for m in LINK_RE.finditer(text):
+        found.append((m.start(), "dest", (m.group(3) + (m.group(4) or "")).strip()))
+    for m in AUTOLINK_RE.finditer(text):
+        found.append((m.start(), "dest", m.group(0)))
+    for m in URL_RE.finditer(text):
+        found.append((m.start(), "dest", _strip_url(m.group(0))))
+
     found.sort(key=lambda item: item[0])
     tokens = [(kind, value) for _, kind, value in found]
     return tokens, "".join(chars)
@@ -590,13 +600,6 @@ def _split_cells(row):
     return cells
 
 
-def _prose_line(text):
-    """Strip a prose line but keep trailing hard-break markup."""
-    if text.endswith("  ") or text.endswith("\\"):
-        return text.lstrip()
-    return text.strip()
-
-
 def _is_table_sep(line):
     return "|" in line and "-" in line and bool(TABLE_SEP_RE.match(line))
 
@@ -615,8 +618,8 @@ def _starts_block(body, in_list):
         return True
     if FOOTNOTE_DEF_RE.match(body) or REFDEF_RE.match(body):
         return True
-    if body.lstrip().startswith("$$"):
-        return True
+    # A "$$" line does not interrupt a paragraph: display math written inside
+    # a paragraph ("Use $$\na + b\n$$ here.") stays one protected math token.
     return False
 
 
@@ -748,13 +751,31 @@ def parse_blocks(text):
             out.update(extra)
             return out
 
-        if POLISH_OFF_LINE_RE.match(cbody):
+        if indent - base < 4 and POLISH_OFF_LINE_RE.match(cbody):
             j = i + 1
             while j < n and not POLISH_ON_RE.search(lines[j]):
                 j += 1
-            end = min(j, n - 1)
-            blocks.append(Block("protected", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
-            i = end + 1
+            if j >= n:
+                blocks.append(Block("protected", attrs(), "\n".join(lines[i:]), [], start_line))
+                i = n
+                continue
+            on = POLISH_ON_RE.search(lines[j])
+            rest = lines[j][on.end():]
+            if not rest.strip():
+                blocks.append(Block("protected", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
+                i = j + 1
+                continue
+            # The region ends at the polish:on marker; the rest of that line is
+            # read again as ordinary content, keeping its quote prefix and
+            # indentation.
+            blocks.append(Block("protected", attrs(), "\n".join(lines[i:j] + [lines[j][:on.end()]]),
+                                [], start_line))
+            qm = QUOTE_PREFIX_RE.match(lines[j])
+            prefix = qm.group(1) if qm else ""
+            after = lines[j][len(prefix):]
+            lead = after[:len(after) - len(after.lstrip(" \t"))]
+            lines[j] = prefix + lead + rest.lstrip(" \t")
+            i = j
             continue
 
         if indent - base >= 4:
@@ -911,14 +932,10 @@ def parse_blocks(text):
             gap = 1 if (ws >= 5 or not rest_raw.strip()) else ws
             content_col = col0 + gap
             task = lm.group("task")
-            prev = blocks[-1] if blocks else None
-            # A blank line before an item makes the list loose, when the
-            # previous block belongs to the list (an item, content inside an
-            # item, or a quote indented inside an item).
-            in_list = prev is not None and (prev.kind == "list_item"
-                                            or prev.attrs.get("container", 0) > 0
-                                            or prev.attrs.get("qcol", 0) > 0)
-            blank_before = bool(in_list and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
+            # Whether a blank line comes before the item (it makes a list
+            # loose). Recorded for every item, so adding or removing one is
+            # visible however the previous block is nested.
+            blank_before = bool(blocks and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
             list_stack.append((indent, content_col))
             blocks.append(Block("list_item", {
                 "quote": quote,
@@ -946,7 +963,10 @@ def parse_blocks(text):
         # Paragraph, possibly a setext heading. An underline only counts when
         # it sits in the same blockquote and the same list item as the
         # paragraph; a lazy "---" line outside them is a thematic break.
-        content = [_prose_line(cbody)]
+        # Unit lines keep their bytes after the leading indentation of the
+        # first line, so whitespace inside a code span or math that spans
+        # lines is compared exactly. Whitespace outside tokens is not compared.
+        content = [cbody.lstrip(" \t")]
         j = i + 1
         setext_level = 0
         while j < n:
@@ -970,7 +990,7 @@ def parse_blocks(text):
                 break
             if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
-            content.append(_prose_line(nbody))
+            content.append(nbody)
             j += 1
         if setext_level:
             blocks.append(Block("heading", attrs(level=setext_level),
@@ -988,37 +1008,45 @@ def prose_block_count(text):
                 if b.kind not in RAW_KINDS and any(u.strip() for u in b.units)])
 
 
-def _mask_code(text):
-    """``text`` with fenced code and inline code spans blanked out (same length)."""
-    out = []
-    fence = None
-    for line in text.split("\n"):
-        m = FENCE_LINE_RE.match(line)
-        if fence is None:
-            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
-                fence = m.group(1)
-                out.append(" " * len(line))
-            else:
-                out.append(line)
-        else:
-            out.append(" " * len(line))
-            if (m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
-                    and not m.group(2).strip()):
-                fence = None
-    chars = list("\n".join(out))
-    for kind, start, end, _ in _scan_inline("".join(chars)):
-        if kind == "code":
-            _mask(chars, start, end)
-    return "".join(chars)
+def _mask_code(text, segments=False):
+    """``text`` with code blanked out (same length), so markers in code are text.
+
+    Fenced and indented code blocks come from the block parser, so fences
+    behind several list markers count too. Code spans are matched only inside
+    one block (or one segment line), because a code span cannot cross a block
+    boundary; a stray backtick elsewhere cannot hide a real marker.
+    """
+    lines = text.split("\n")
+    masked = list(lines)
+    if segments:
+        chunks = [(k, k) for k in range(len(lines))]
+    else:
+        chunks = []
+        for block in parse_blocks(text):
+            first = block.line - 1
+            last = min(first + block.raw.count("\n"), len(lines) - 1)
+            if block.kind in ("fence", "indented_code"):
+                for k in range(first, last + 1):
+                    masked[k] = " " * len(lines[k])
+            elif block.kind not in RAW_KINDS:
+                chunks.append((first, last))
+    for first, last in chunks:
+        chunk = "\n".join(masked[first:last + 1])
+        chars = list(chunk)
+        for kind, start, end, _ in _scan_inline(chunk):
+            if kind == "code":
+                _mask(chars, start, end)
+        masked[first:last + 1] = "".join(chars).split("\n")
+    return "\n".join(masked)
 
 
-def protected_slices(text):
+def protected_slices(text, segments=False):
     """Exact source slices covered by polish:off regions, in order.
 
     A region runs from a polish:off marker to the next polish:on marker, or to
     the end of the text when it is never closed. Markers inside code are text.
     """
-    masked = _mask_code(text)
+    masked = _mask_code(text, segments)
     slices = []
     pos = 0
     while True:
@@ -1032,10 +1060,10 @@ def protected_slices(text):
     return slices
 
 
-def check_regions(source, candidate):
+def check_regions(source, candidate, segments=False):
     """Reject any change to text inside polish:off regions, including whitespace."""
-    src = protected_slices(source)
-    cand = protected_slices(candidate)
+    src = protected_slices(source, segments)
+    cand = protected_slices(candidate, segments)
     if src != cand:
         if len(src) != len(cand):
             detail = "the number of polish:off regions changed from %d to %d" % (len(src), len(cand))
@@ -1120,7 +1148,7 @@ def check_segments(source_text, candidate_text, html_mode=False,
         cand = parse_segments(candidate_text)
     except ValueError as exc:
         raise GuardReject("segment_mismatch", str(exc))
-    check_regions(source_text, candidate_text)
+    check_regions(source_text, candidate_text, segments=True)
     src_ids = [s[0] for s in src]
     cand_ids = [c[0] for c in cand]
     if src_ids != cand_ids:

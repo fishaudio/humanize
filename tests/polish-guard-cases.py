@@ -592,4 +592,54 @@ accepts("an item after a quoted sibling stays editable",
         "- Parent.\n  - > Read the quote.\n  - Read the guide carefully.\n",
         "- Parent.\n  - > Read the quote.\n  - Read the guide with care.\n")
 
+# Round 1 second re-review.
+rejects("link destination suffix after TeX-like escapes changed", "Read [guide](folder\\(old\\)tail) carefully.\n",
+        "Read [guide](folder\\(old\\)evil) carefully.\n", "protected_token")
+rejects("link destination suffix after dollar signs changed",
+        "Read [guide](https://example.com/$token$old) carefully.\n",
+        "Read [guide](https://example.com/$token$new) carefully.\n", "protected_token")
+STRAY_TICKS = ("A literal ` here.\n\nRead <!-- polish:off -->Keep.\n\nKeep this protected sentence.\n\n"
+               "End <!-- polish:on --> with another `.\n")
+rejects("backticks in other paragraphs do not hide a polish:off region", STRAY_TICKS,
+        STRAY_TICKS.replace("Keep this protected", "Change this protected"), "region_changed")
+try:
+    g.check_segments("[[a]] A literal ` here.\n[[b]] Read <!-- polish:off -->Keep.\n"
+                     "[[c]] Keep this protected sentence.\n[[d]] End <!-- polish:on --> with another `.",
+                     "[[a]] A literal ` here.\n[[b]] Read <!-- polish:off -->Keep.\n"
+                     "[[c]] Change this protected sentence.\n[[d]] End <!-- polish:on --> with another `.")
+    report("backticks in other segments do not hide a polish:off region", False, "accepted")
+except g.GuardReject as exc:
+    report("backticks in other segments do not hide a polish:off region", exc.reason == "region_changed",
+           exc.reason)
+rejects("indentation inside a code span that spans lines changed", "Use `a\n\tb` carefully.\n",
+        "Use `a\n    b` carefully.\n", "protected_token")
+rejects("a trailing space inside a code span that spans lines removed", "Use `a \nb` carefully.\n",
+        "Use `a\nb` carefully.\n", "protected_token")
+rejects("indentation inside TeX math that spans lines changed", "Use \\(a +\n  b\\) carefully.\n",
+        "Use \\(a +\nb\\) carefully.\n", "protected_token")
+rejects("display math written inside a paragraph changed", "Use $$\na + b\n$$ here.\n",
+        "Use $$\na - b\n$$ here.\n", "protected_token")
+accepts("prose around display math inside a paragraph stays editable",
+        "The formula:\n$$\nE = mc^2\n$$\nholds for all cases here.\n",
+        "The formula:\n$$\nE = mc^2\n$$\nholds in every case here.\n")
+accepts("a paragraph may be wrapped differently", "This paragraph is long and it\nwraps across several lines of\n"
+        "text in the source.\n", "This paragraph is long, and it wraps\nacross several lines of text in the source.\n")
+accepts("continuation indentation outside tokens may change", "- First item reads\n  like this one.\n- Second item.\n",
+        "- First item reads\n    like this.\n- Second item.\n")
+rejects("blank line added after a quoted list item inside a quote", "> - > Quoted.\n> - Next item.\n",
+        "> - > Quoted.\n>\n> - Next item.\n", "structure")
+rejects("blank line removed before the first list item", "Para.\n\n- item one here\n",
+        "Para.\n- item one here\n", "structure")
+accepts("prose after a standalone region's polish:on stays editable",
+        "Intro.\n\n<!-- polish:off -->\nKeep.\n<!-- polish:on --> Read carefully.\n",
+        "Intro.\n\n<!-- polish:off -->\nKeep.\n<!-- polish:on --> Read with care.\n")
+rejects("the closing line of a standalone region before its marker is protected",
+        "Intro.\n\n<!-- polish:off -->\nKeep.\nAlso keep. <!-- polish:on --> Read carefully.\n",
+        "Intro.\n\n<!-- polish:off -->\nKeep.\nAlso held. <!-- polish:on --> Read carefully.\n", "region_changed")
+accepts("a marker inside indented code is just text", "    <!-- polish:off -->\n\nRead carefully.\n",
+        "    <!-- polish:off -->\n\nRead with care.\n")
+accepts("a marker inside a fence behind two list markers is just text",
+        "- - ```html\n    <!-- polish:off -->\n    ```\n\nRead carefully.\n",
+        "- - ```html\n    <!-- polish:off -->\n    ```\n\nRead with care.\n")
+
 sys.exit(1 if FAILED else 0)
