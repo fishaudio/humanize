@@ -64,6 +64,7 @@ The quiz is advisory, not a gate. You always have the option to proceed. But tha
 | `/gen-plan --input <draft.md> --output <plan.md>` | Generate structured plan from draft |
 | `/refine-plan --input <annotated-plan.md>` | Refine an annotated plan and generate a QA ledger |
 | `/ask-codex [question]` | One-shot consultation with Codex |
+| `/polish-gemini --input <file>` | Readability-only polish of human-facing text with Gemini |
 
 ## Command Reference
 
@@ -253,6 +254,148 @@ for getting a second opinion, reviewing a design, or asking domain-specific ques
 Responses are saved to `.humanize/skill/<timestamp>/` with `input.md`, `output.md`,
 and `metadata.md` for reference.
 
+### polish-gemini
+
+```
+/humanize:polish-gemini --input <file|-> [OPTIONS]
+
+scripts/polish-gemini.sh --input <file|-> [--output <file>]
+                         [--format markdown|text|segments|html] [--auto]
+                         [--model MODEL] [--effort xhigh|high|medium|low]
+                         [--timeout SECONDS] [--max-tokens N] [--max-bytes N]
+                         [--strict]
+
+OPTIONS:
+  --input <file|->       Source document, or - for stdin (required)
+  --output <file>        Write the result to this file atomically; may equal --input.
+                         Without it, the result goes to stdout.
+  --format <name>        markdown, text, segments or html. Default: from the file
+                         extension (.html/.htm -> html, .md -> markdown, else text)
+  --auto                 Automatic call site: skip when gemini_polish_enabled is false
+                         or the config cannot be loaded
+  --model <id>           OpenRouter model ID (default: google/gemini-4-hydrogen)
+  --effort <level>       Reasoning effort (default: xhigh)
+  --timeout <seconds>    Overall deadline for the request (default: 900)
+  --max-tokens <n>       Completion budget, reasoning included (default: 131072)
+  --max-bytes <n>        Largest input to send (default: 262144)
+  --strict               Exit 3 instead of 0 when the original had to be delivered
+```
+
+Claude and Codex often write documents full of jargon. `polish-gemini` sends text that people will read to a Gemini model on OpenRouter for a readability-only pass, then delivers either the polished text or the exact original bytes.
+
+Gemini acts only as a copy editor:
+
+- The request carries no tools, so Gemini cannot read files, run commands, or search the web. Web-search model IDs (ending in `:online`) are refused.
+- The document is sent as data between per-run marker lines. Instructions inside the document are not followed.
+- Gemini may reword sentences, replace jargon with plainer words, add brief glosses for terms already present, split long sentences, and fix grammar.
+- Gemini must not translate, add or remove facts, change negations or obligation words, or change code, identifiers, paths, URLs, numbers, or document structure.
+
+#### When it runs
+
+Polishing is on by default (`gemini_polish_enabled: true`) in three scenarios, where Claude runs it with `--auto`:
+
+1. **Writing documentation** for people: README files, files under `docs/`, guides, reports, release notes.
+2. **Making web pages**: `.html` files are handled by the HTML adapter. Component files (JSX, TSX, Vue, Svelte) use the skill's manual segments procedure.
+3. **Writing the RLCR finalize summary**: the finalize prompt tells Claude to polish `finalize-summary.md`. Round summaries are never polished.
+
+Everything else (chat replies, commit messages, PR descriptions, code comments, idea drafts, plans) is polished only when you ask. Plan files, round summaries, the goal tracker, review results, QA ledgers, code, and config are never polished automatically because tools parse them.
+
+`--auto` marks an automatic call site. With `--auto`, the script skips when `gemini_polish_enabled` is `false` (`reason=disabled`) or when the config cannot be loaded (`reason=config_error`). Without `--auto`, an explicit request always runs.
+
+#### API key setup
+
+Polishing needs an [OpenRouter](https://openrouter.ai/) API key. The script looks for it in this order:
+
+1. the `OPENROUTER_API_KEY` environment variable;
+2. the file named by `gemini_polish_api_key_file`, which holds either the raw key or one `OPENROUTER_API_KEY=value` line (an optional `export` prefix is allowed).
+
+```bash
+printf '%s\n' 'sk-or-...' > ~/.env/openrouter_key
+chmod 600 ~/.env/openrouter_key
+```
+
+```json
+{
+  "gemini_polish_api_key_file": "~/.env/openrouter_key"
+}
+```
+
+The key is read inside the Python helper. It is never placed on a command line, and it never appears in run records, cache files, stdout, or stderr. A key file that group or others can read produces a warning. Without a key, the original is delivered with `reason=no_api_key`.
+
+#### Outcomes and exit codes
+
+Every run ends with exactly one line on stderr:
+
+```
+polish-gemini: outcome=<polished|unchanged|skipped|rejected|failed> reason=<code> delivered=<yes|no>
+```
+
+| Outcome | Meaning | Example reasons |
+|---------|---------|-----------------|
+| `polished` | The guard accepted a rewrite and it was delivered | `ok` |
+| `unchanged` | Gemini returned the same text | `identical` |
+| `skipped` | Nothing was sent; the original was delivered | `no_api_key`, `disabled`, `config_error`, `empty_input`, `too_large`, `sentinel_collision`, `secret_in_input`, `unsupported_encoding`, `unsupported_html`, `invalid_segments`, `nothing_to_polish`, `missing_dependency` |
+| `rejected` | The reply failed the guard; the original was delivered | `envelope`, `structure`, `region_changed`, `protected_token`, `inline_markup`, `script_changed`, `length_ratio`, `segment_mismatch`, `markup_in_text`, `html_mismatch`, `tool_call` |
+| `failed` | The request failed; the original was delivered | `network`, `auth`, `insufficient_credits`, `rate_limited`, `provider_error`, `timeout`, `truncated`, `empty_response`, `bad_json`, `api_error`, `delivery_error`, `interrupted`, `usage_error` |
+
+| Exit code | Meaning |
+|-----------|---------|
+| `0` | Content delivered: the polished text or the exact original bytes |
+| `3` | `--strict` only: the original was delivered because polishing was skipped, rejected, or failed |
+| `1` | Usage error; nothing delivered |
+| `4` | Delivery failed (for example an unwritable `--output`); the destination is unchanged |
+| `130` / `143` | Interrupted by SIGINT / SIGTERM; nothing is delivered if the signal arrives before delivery starts |
+
+Delivery to stdout is a single write after every check has finished. Delivery to `--output` goes through a temporary file in the same directory and a rename, so the file is either the old content or the new content.
+
+#### Request details
+
+- One `POST <gemini_polish_base_url>/chat/completions` per run, plus at most one retry.
+- The body holds the model, a system message with the polish-only contract (`prompt-template/gemini/polish-contract.md`), the document in the user message, `reasoning: {"effort": ..., "exclude": true}`, and `max_tokens`. It never holds `tools`, `tool_choice`, or `plugins`.
+- If the API answers HTTP 400 and explicitly rejects reasoning effort `xhigh`, the script retries once with `high` and records `effort_used: high`.
+- HTTP 429 is retried once, after `Retry-After`, if that still fits inside the deadline.
+- The reply is accepted only for HTTP 200, valid JSON, no error object, `finish_reason` `stop`, no tool calls, and non-empty text inside exactly one output block.
+
+#### The guard and its limits
+
+A local, deterministic guard checks every reply before delivery. For Markdown and text it requires:
+
+- the same blocks one-to-one and in order (headings and levels, paragraphs, list items, table rows and columns);
+- the same list nesting (measured from each item's content column), list markers, task boxes, blockquote depth, and the same list item for each block inside a list;
+- byte-identical front matter, fenced code (including a fence that opens on a list marker), indented code, HTML blocks (a `script`, `pre`, `style`, or `textarea` block or a comment runs to its closing tag, even across blank lines), math blocks, footnote definitions with their continuation lines, reference definitions with their titles, and text between `<!-- polish:off -->` and `<!-- polish:on -->`;
+- the same protected tokens in each block, in the same order: inline code, inline math, URLs and link targets, reference labels and any other bracketed text, file paths (`and/or` and similar prose pairs excepted), identifiers (names with `_`, a leading `_`, `::`, `()`, a leading `--` or `$`, internal capitals such as `XMLParser`, or dots; abbreviations such as `e.g.` excepted), numbers with their units (`30 ms` cannot become `30 s`), and numbers and IDs such as `AC-1` or `task3`;
+- the same inline markup: HTML tags (attribute values byte for byte), link and image syntax (link text and alt text may be reworded), emphasis markers, and hard line breaks;
+- the same writing scripts in each block (for example Latin, Han, Kana, Hangul, Cyrillic, Arabic), with similar shares;
+- length ratios between 0.5 and 2.0 per block and between 0.6 and 1.8 for the whole document. A block under 40 characters may grow to at most twice its length or 12 more characters, whichever is larger. Set `HUMANIZE_POLISH_BLOCK_RATIO` or `HUMANIZE_POLISH_DOC_RATIO` (format `LOW:HIGH`) to change them.
+
+The guard cannot prove that meaning is unchanged. It does not detect translation between two languages that use the same script (for example English to Spanish), changed negations, caveats, or obligation words, numbers that keep their order but move to other nouns (`2 workers and 5 retries` becoming `2 retries and 5 workers`), or conversion between Simplified and Traditional Chinese. That is why Claude reviews every polished result against a checklist (same claims, same negations and caveats, same obligation strength, same language and variant, glosses only explain existing terms, nothing added, nothing dropped) before delivering it.
+
+The guard errs toward rejecting. A rewrite of a name written as `__word__` (treated as an identifier) or a cut that shortens a wordy document below the 0.6 document ratio is rejected even when it is harmless; the original is then delivered.
+
+Documents that contain the text `@@HUMANIZE-POLISH-` are not sent (`reason=sentinel_collision`), because that prefix is reserved for the marker lines. Documents with mixed line endings or bare carriage returns are not sent either (`reason=unsupported_encoding`); files that use CRLF throughout are fine.
+
+#### HTML pages
+
+For `.html` and `.htm` files, the script polishes only visible text: text nodes inside `<body>` and `<title>`, and the values of `alt`, `title`, `aria-label`, and `placeholder`. It skips `script`, `style`, `template`, `code`, `pre`, `kbd`, `samp`, `noscript`, `textarea`, `svg`, `math`, `iframe`, `xmp`, `listing`, `plaintext`, `noembed`, `noframes`, elements with an inline `white-space: pre` style (and everything nested in all of these), whitespace-only text, and text that contains template syntax (`{{`, `}}`, `{%`, `${`, `<%`). Only HTML whitespace is collapsed in the text sent to the model; non-breaking spaces are kept. Character references such as `&amp;` must come back unchanged. The polished strings are put back at their original offsets with `&`, `<`, `>`, and the attribute quote escaped, and the page is parsed again to confirm that tags, attributes, comments, scripts, and styles are unchanged. A page is skipped (`reason=unsupported_html`) when the parser cannot map it to source offsets, when a non-void element is written self-closing outside SVG or MathML (browsers ignore the slash, so `<script/>` still opens a script), when attribute syntax could be read two ways, or when eligible text has a character reference without its semicolon (such as `&copy 2026`). CSS rules in stylesheets that preserve whitespace are not detected.
+
+#### Run records
+
+Each run that sends a request writes `.humanize/skill/<timestamp>-<pid>-<hex>/` with `input.md`, a copy of the source, the raw `candidate.txt`, the delivered `output.md`, and `metadata.md` (`tool: gemini`, `mode: polish`, `backend: openrouter`, model, `effort_used`, status, outcome, reason, token counts, and cost). The cache directory under `~/.cache/humanize/` holds `gemini-run.cmd` (the request without the key), `gemini-run.out` (the response without reasoning text), and `gemini-run.log`. Polish runs appear in `humanize monitor gemini` and `humanize monitor skill`.
+
+#### Privacy and cost
+
+- **Privacy**: polishing is on by default, so in the three default scenarios the document text is sent to OpenRouter and on to Google. Local copies of each run are kept under `.humanize/skill/` (gitignored). Set `gemini_polish_enabled` to `false` to stop automatic polishing.
+- **Cost and time**: reasoning effort `xhigh` is slow and costs money, and the amount of reasoning varies from run to run. In tests on 2026-11-18, short documents (one to three paragraphs) took 12 seconds to 2 minutes and cost $0.02 to $0.14 (about 1,700 to 18,000 reasoning tokens), and a six-section document took about 2 minutes and cost about $0.15 (about 17,000 reasoning tokens). With `max_tokens` at 8,000, one request ran out of tokens before answering, which is why the default is 131,072. Lowering `gemini_polish_reasoning_effort` (for example to `high` or `medium`) reduces both time and cost.
+
+#### Environment variables
+
+| Variable | Purpose |
+|----------|---------|
+| `OPENROUTER_API_KEY` | API key (takes precedence over `gemini_polish_api_key_file`) |
+| `HUMANIZE_POLISH_BASE_URL` | Overrides `gemini_polish_base_url` (used by the offline tests) |
+| `HUMANIZE_POLISH_BLOCK_RATIO`, `HUMANIZE_POLISH_DOC_RATIO` | Length-ratio bounds as `LOW:HIGH` |
+| `HUMANIZE_POLISH_PYTHON` | Python 3 interpreter to use (default `python3`) |
+
 ## Configuration
 
 Humanize uses a 4-layer config hierarchy (lowest to highest priority):
@@ -272,6 +415,14 @@ Current built-in keys:
 | `agent_teams` | `false` | Project-level default for agent teams workflow |
 | `alternative_plan_language` | `""` | Optional translated plan variant language; supported values include `Chinese`, `Korean`, `Japanese`, `Spanish`, `French`, `German`, `Portuguese`, `Russian`, `Arabic`, or ISO codes like `zh` |
 | `gen_plan_mode` | `discussion` | Default plan-generation mode |
+| `gemini_polish_enabled` | `true` | Whether automatic (`--auto`) readability polishing runs |
+| `gemini_polish_model` | `google/gemini-4-hydrogen` | OpenRouter model used for polishing |
+| `gemini_polish_reasoning_effort` | `xhigh` | Reasoning effort for polishing (`xhigh`, `high`, `medium`, `low`) |
+| `gemini_polish_max_tokens` | `131072` | Completion budget for one polish request, reasoning included |
+| `gemini_polish_timeout` | `900` | Overall deadline for one polish request, in seconds |
+| `gemini_polish_max_bytes` | `262144` | Largest document that is sent for polishing |
+| `gemini_polish_api_key_file` | `""` | Optional file that holds the OpenRouter API key |
+| `gemini_polish_base_url` | `https://openrouter.ai/api/v1` | OpenRouter API base URL |
 
 ### Codex Model Configuration
 

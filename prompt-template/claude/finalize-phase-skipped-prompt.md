@@ -49,3 +49,27 @@ Your summary should include:
 - Files modified
 - Confirmation that tests still pass (if possible)
 - Any notes about manual verification performed
+
+## Polish the Finalize Summary
+
+The finalize summary is written for people, so polish it for readability after you write it:
+
+1. Run the command below. A run can take several minutes, so run it in the background (for example with the Bash tool's `run_in_background` option) and wait for it to finish:
+   ```bash
+   "{{POLISH_SCRIPT}}" --auto --input "{{FINALIZE_SUMMARY_FILE}}" --output "{{FINALIZE_SUMMARY_FILE}}"
+   ```
+2. Read the last stderr line: `polish-gemini: outcome=<...> reason=<...> delivered=<...>`.
+3. If the outcome is `polished`, review the summary against this checklist:
+   - same claims;
+   - same negations and caveats;
+   - same obligation strength;
+   - same language and variant;
+   - every gloss only explains a term already present;
+   - nothing added that is not a gloss;
+   - nothing dropped.
+
+   If any item fails, restore your original wording or correct the summary.
+4. For any other outcome the summary is unchanged. Mention the reason when you report completion.
+5. Re-read **{{FINALIZE_SUMMARY_FILE}}** before you report completion.
+
+Only the finalize summary is polished. Do not polish round summaries, the goal tracker, plans, or code.

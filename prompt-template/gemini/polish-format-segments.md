@@ -1,0 +1,1 @@
+The document is a list of independent text segments, one per line. Each line starts with an ID in double square brackets, such as `[[s1]]`, followed by one space and the segment text. Keep every ID exactly, in the same order, with exactly one line per ID. Edit only the text after the ID. Do not merge, split, add, or remove lines, and do not add line breaks inside a segment.

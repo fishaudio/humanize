@@ -99,6 +99,10 @@ TEST_SUITES=(
     "test-model-router.sh"
     # Skill monitor tests
     "test-skill-monitor.sh"
+    # Gemini polish tests (offline, loopback mock)
+    "test-polish-gemini.sh"
+    "test-polish-gemini-guard.sh"
+    "test-polish-gemini-integration.sh"
     # Robustness tests
     "robustness/test-state-file-robustness.sh"
     "robustness/test-session-robustness.sh"

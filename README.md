@@ -3,7 +3,7 @@
 
 # Humanize
 
-**Current Version: 1.16.0**
+**Current Version: 1.17.0**
 
 > Derived from the [GAAC (GitHub-as-a-Context)](https://github.com/SihaoLiu/gaac) project.
 
@@ -70,7 +70,13 @@ Requires [codex CLI](https://github.com/openai/codex) for review. See the full [
    /humanize:ask-gemini What are the latest best practices for X?
    ```
 
-6. **Monitor progress (in another terminal, not inside Claude Code)**:
+6. **Polish human-facing docs for readability** with Gemini on OpenRouter (copy editing only; needs an OpenRouter API key):
+   ```bash
+   /humanize:polish-gemini --input docs/guide.md --output docs/guide.md
+   ```
+   Claude also runs it on its own for documentation, web pages, and the RLCR finalize summary. If no key is set or the result fails the local checks, the original text is kept. See [Polish With Gemini](docs/usage.md#polish-gemini).
+
+7. **Monitor progress (in another terminal, not inside Claude Code)**:
    ```bash
    source <path/to/humanize>/scripts/humanize.sh # Or just add it into your .bashec or .zshrc
    humanize monitor rlcr       # RLCR loop

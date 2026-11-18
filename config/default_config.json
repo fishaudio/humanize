@@ -4,5 +4,13 @@
   "bitlesson_model": "haiku",
   "agent_teams": false,
   "alternative_plan_language": "",
-  "gen_plan_mode": "discussion"
+  "gen_plan_mode": "discussion",
+  "gemini_polish_enabled": true,
+  "gemini_polish_model": "google/gemini-4-hydrogen",
+  "gemini_polish_reasoning_effort": "xhigh",
+  "gemini_polish_max_tokens": 131072,
+  "gemini_polish_timeout": 900,
+  "gemini_polish_max_bytes": 262144,
+  "gemini_polish_api_key_file": "",
+  "gemini_polish_base_url": "https://openrouter.ai/api/v1"
 }

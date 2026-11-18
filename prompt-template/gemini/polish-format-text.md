@@ -1,0 +1,1 @@
+The document is plain text. Keep the same paragraphs, separated by blank lines as in the original, and keep any line that looks like a list item, heading, or code as that kind of line. Do not add Markdown formatting.

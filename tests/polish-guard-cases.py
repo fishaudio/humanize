@@ -1,0 +1,429 @@
+#!/usr/bin/env python3
+"""Unit cases for scripts/lib/polish_guard.py.
+
+Run by tests/test-polish-gemini-guard.sh. Prints one "PASS: name" or
+"FAIL: name: detail" line per case and exits 1 if any case failed.
+
+Multilingual fixtures use \\u escapes so this file stays ASCII-only.
+"""
+
+import os
+import sys
+
+sys.dont_write_bytecode = True
+HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(HERE, "..", "scripts", "lib"))
+
+import polish_guard as g  # noqa: E402
+
+FAILED = []
+
+
+def report(name, ok, detail=""):
+    if ok:
+        print("PASS: %s" % name)
+    else:
+        print("FAIL: %s: %s" % (name, detail))
+        FAILED.append(name)
+
+
+def accepts(name, source, candidate):
+    try:
+        g.check_document(source, candidate)
+        report(name, True)
+    except g.GuardReject as exc:
+        report(name, False, "rejected with %s (%s)" % (exc.reason, exc.detail))
+
+
+def rejects(name, source, candidate, reason=None):
+    try:
+        g.check_document(source, candidate)
+        report(name, False, "candidate was accepted")
+    except g.GuardReject as exc:
+        if reason and exc.reason != reason:
+            report(name, False, "expected %s, got %s (%s)" % (reason, exc.reason, exc.detail))
+        else:
+            report(name, True)
+
+
+BASE = """---
+title: Setup Guide
+version: 2
+---
+
+# Setup Guide
+
+The `polish-gemini.sh` runner calls OpenRouter with the `--auto` flag and sends 2 requests at most.
+See [the usage docs](https://example.com/docs/usage) for details about config.json and AC-1.
+
+## Steps
+
+1. Install the plugin.
+2. Run the setup command.
+
+- First item mentions snake_case_name.
+  - Nested item about the cache.
+- [ ] Open task about logging.
+- [x] Done task about records.
+
+> A quoted note that explains why the deadline matters for long documents.
+> > A nested quote about retries.
+
+| Key | Default |
+|-----|---------|
+| `gemini_polish_timeout` | 900 seconds |
+
+```bash
+echo "keep me exactly"
+```
+
+<!-- polish:off -->
+This text must never change, even if it is hard to read.
+<!-- polish:on -->
+
+<div class="note">Raw HTML block stays as it is.</div>
+
+Use <strong>bold HTML</strong> and ![an image](img/chart.png) in this paragraph, with *emphasis* too.
+
+$$
+E = mc^2
+$$
+
+Footnote reference here[^1].
+
+[^1]: The footnote text stays byte-identical.
+
+[ref]: https://example.com/ref
+"""
+
+# ----------------------------------------------------------------------------
+# Accepted rewrites
+# ----------------------------------------------------------------------------
+
+accepts("identical document", BASE, BASE)
+accepts("prose rewording",
+        BASE, BASE.replace("calls OpenRouter with", "sends a request to OpenRouter using"))
+accepts("sentence split inside the same paragraph",
+        BASE, BASE.replace("sends 2 requests at most.\nSee", "sends 2 requests at most. It never sends more.\nSee"))
+accepts("brief parenthetical gloss of an existing term",
+        BASE, BASE.replace("Nested item about the cache.", "Nested item about the cache (saved copies of results)."))
+accepts("line rewrap inside a paragraph",
+        BASE, BASE.replace("at most.\nSee [the usage docs]", "at most. See\n[the usage docs]"))
+accepts("link text reworded, target kept",
+        BASE, BASE.replace("[the usage docs](https://example.com/docs/usage)", "[the usage guide](https://example.com/docs/usage)"))
+accepts("image alt text reworded",
+        BASE, BASE.replace("![an image](img/chart.png)", "![a chart](img/chart.png)"))
+accepts("table cell reworded",
+        BASE, BASE.replace("| Key | Default |", "| Key | Default value |"))
+rejects("table cell unit changed",
+        BASE, BASE.replace("| 900 seconds |", "| 900 minutes |"), "protected_token")
+accepts("heading reworded",
+        BASE, BASE.replace("## Steps", "## How to Set It Up"))
+accepts("abbreviation e.g. is not protected",
+        "Pick a mode, e.g. the fast one, before you start the run.\n",
+        "Pick a mode, for example the fast one, before you start the run.\n")
+accepts("plain and/or is not a path",
+        "Use the first and/or the second option when you run the setup step.\n",
+        "Use the first option, the second option, or both when you run setup.\n")
+
+ZH_SRC = u"\u8fd9\u4e2a\u5de5\u5177\u4f1a\u628a\u6587\u6863\u53d1\u9001\u7ed9\u6a21\u578b\uff0c\u7136\u540e\u68c0\u67e5\u7ed3\u679c\u662f\u5426\u4fdd\u7559\u4e86\u539f\u6765\u7684\u7ed3\u6784\u548c 3 \u4e2a\u6570\u5b57\u3002\n"
+ZH_REWORD = u"\u8fd9\u4e2a\u5de5\u5177\u5148\u628a\u6587\u6863\u4ea4\u7ed9\u6a21\u578b\u6da6\u8272\uff0c\u518d\u786e\u8ba4\u7ed3\u679c\u662f\u5426\u4fdd\u7559\u4e86\u539f\u6709\u7ed3\u6784\u548c 3 \u4e2a\u6570\u5b57\u3002\n"
+EN_SRC = "This tool sends the document to the model and then checks that the result keeps the structure and 3 numbers.\n"
+accepts("Chinese rewording stays Chinese", ZH_SRC, ZH_REWORD)
+
+# ----------------------------------------------------------------------------
+# Rejected rewrites: code and protected tokens
+# ----------------------------------------------------------------------------
+
+rejects("changed fenced code", BASE, BASE.replace('echo "keep me exactly"', 'echo "changed"'), "region_changed")
+rejects("protected identifier moved to another paragraph",
+        BASE, BASE.replace("calls OpenRouter with the `--auto` flag", "calls OpenRouter with the flag")
+        .replace("Footnote reference here", "Footnote reference `--auto` here"), "protected_token")
+rejects("two numbers swapped within a paragraph",
+        "Run 2 workers and 5 retries before the final step of the setup.\n",
+        "Run 5 workers and 2 retries before the final step of the setup.\n", "protected_token")
+rejects("changed URL", BASE, BASE.replace("https://example.com/docs/usage", "https://example.com/docs/other"), "inline_markup")
+rejects("dropped link occurrence",
+        BASE, BASE.replace("See [the usage docs](https://example.com/docs/usage) for", "See the usage docs for"), "inline_markup")
+rejects("gloss that introduces a new number",
+        BASE, BASE.replace("Nested item about the cache.", "Nested item about the cache (kept for 30 days)."), "protected_token")
+rejects("gloss that introduces a new URL",
+        BASE, BASE.replace("Nested item about the cache.", "Nested item about the cache (see https://cache.example)."), "protected_token")
+rejects("changed identifier", BASE, BASE.replace("snake_case_name", "snake case name"), "protected_token")
+rejects("changed dotted name", BASE, BASE.replace("config.json", "the config file"), "protected_token")
+rejects("changed inline code", BASE, BASE.replace("`polish-gemini.sh`", "`polish.sh`"), "protected_token")
+rejects("changed AC ID", BASE, BASE.replace("AC-1", "AC-2"), "protected_token")
+
+# ----------------------------------------------------------------------------
+# Rejected rewrites: structure
+# ----------------------------------------------------------------------------
+
+rejects("extra heading", BASE, BASE.replace("## Steps", "## Steps\n\n### Extra"), "structure")
+rejects("heading level changed", BASE, BASE.replace("## Steps", "### Steps"), "structure")
+rejects("paragraph split in two", BASE, BASE.replace("at most.\nSee", "at most.\n\nSee"), "structure")
+rejects("list item dropped", BASE, BASE.replace("2. Run the setup command.\n", ""), "structure")
+rejects("nested list flattened", BASE, BASE.replace("  - Nested item", "- Nested item"), "structure")
+rejects("ordered list turned unordered", BASE, BASE.replace("1. Install", "- Install").replace("2. Run", "- Run"), "structure")
+rejects("unordered marker style changed", BASE, BASE.replace("- First item", "* First item"), "structure")
+rejects("task marker changed", BASE, BASE.replace("- [ ] Open task", "- [x] Open task"), "structure")
+rejects("blockquote level removed", BASE, BASE.replace("> > A nested quote", "> A nested quote"), "structure")
+rejects("changed frontmatter", BASE, BASE.replace("version: 2", "version: 3"), "region_changed")
+rejects("changed polish:off region", BASE, BASE.replace("must never change, even if", "must never change even if"), "region_changed")
+rejects("changed HTML block", BASE, BASE.replace("Raw HTML block stays", "Raw HTML block remains"), "region_changed")
+rejects("changed math block", BASE, BASE.replace("E = mc^2", "E = m c^2"), "region_changed")
+rejects("changed footnote definition", BASE, BASE.replace("The footnote text stays", "The footnote text remains"), "region_changed")
+rejects("changed reference definition", BASE, BASE.replace("https://example.com/ref", "https://example.com/r2"), "region_changed")
+rejects("table column added", BASE, BASE.replace("| 900 seconds |", "| 900 seconds | extra |"), "structure")
+rejects("table separator changed", BASE, BASE.replace("|-----|---------|", "|:----|---------|"), "region_changed")
+
+# ----------------------------------------------------------------------------
+# Rejected rewrites: inline markup
+# ----------------------------------------------------------------------------
+
+rejects("strong changed to em", BASE, BASE.replace("<strong>bold HTML</strong>", "<em>bold HTML</em>"), "inline_markup")
+rejects("image removed", BASE, BASE.replace(" and ![an image](img/chart.png) in", " in"), "inline_markup")
+rejects("link turned into plain text",
+        "Read [the guide](https://example.com/guide) before you start the setup.\n",
+        "Read the guide at example dot com before you start the setup.\n", "inline_markup")
+rejects("emphasis removed", BASE, BASE.replace("*emphasis*", "emphasis"), "inline_markup")
+rejects("hard line break removed",
+        "First line of the address  \nSecond line of the address\n",
+        "First line of the address Second line of the address\n", "inline_markup")
+rejects("character reference changed",
+        "Tom &amp; Jerry are in this sentence about the show.\n",
+        "Tom & Jerry are in this sentence about the show.\n", "protected_token")
+
+# ----------------------------------------------------------------------------
+# Rejected rewrites: language and length
+# ----------------------------------------------------------------------------
+
+rejects("English paragraph translated to Chinese", EN_SRC, ZH_SRC, "script_changed")
+rejects("Chinese paragraph translated to English", ZH_SRC, EN_SRC, "script_changed")
+rejects("block grows past the ratio bound",
+        "This sentence is long enough to be checked for its length ratio by the guard.\n",
+        "This sentence is long enough to be checked for its length ratio by the guard, and then it keeps "
+        "going with many more words that were never in the original sentence at all, which is not allowed.\n",
+        "length_ratio")
+rejects("block shrinks past the ratio bound",
+        "This sentence is long enough to be checked for its length ratio by the guard.\n",
+        "Checked by the guard.\n", "length_ratio")
+
+# ----------------------------------------------------------------------------
+# Segments
+# ----------------------------------------------------------------------------
+
+SEG = "[[s1]] Click the button to start 2 jobs.\n[[s2]] Save your work before you leave.\n"
+try:
+    out = g.check_segments(SEG, "[[s1]] Press the button to start 2 jobs.\n[[s2]] Save what you did before you leave.")
+    report("segments rewording passes", [s[0] for s in out] == ["s1", "s2"], repr(out))
+except g.GuardReject as exc:
+    report("segments rewording passes", False, exc.detail)
+
+for name, cand in (
+        ("segments missing ID", "[[s1]] Press the button to start 2 jobs."),
+        ("segments reordered IDs", "[[s2]] Save your work.\n[[s1]] Click the button to start 2 jobs."),
+        ("segments extra line", "[[s1]] Click the button to start 2 jobs.\n[[s2]] Save your work.\n[[s3]] More."),
+        ("segments line without ID", "Click the button to start 2 jobs.\n[[s2]] Save your work."),
+        ("segments emptied text", "[[s1]] \n[[s2]] Save your work before you leave.")):
+    try:
+        g.check_segments(SEG, cand)
+        report(name, False, "accepted")
+    except g.GuardReject as exc:
+        report(name, exc.reason == "segment_mismatch", "%s %s" % (exc.reason, exc.detail))
+
+try:
+    g.check_segments(SEG, "[[s1]] Click the button to start 3 jobs.\n[[s2]] Save your work before you leave.")
+    report("segments protected token changed", False, "accepted")
+except g.GuardReject as exc:
+    report("segments protected token changed", exc.reason == "protected_token", exc.reason)
+
+try:
+    g.parse_segments("no id here")
+    report("malformed segments input is detected", False, "parsed")
+except ValueError:
+    report("malformed segments input is detected", True)
+
+# ----------------------------------------------------------------------------
+# HTML adapter
+# ----------------------------------------------------------------------------
+
+PAGE = """<!DOCTYPE html>
+<html>
+<head>
+  <title>Usage Dashboard</title>
+  <meta name="description" content="Not eligible text">
+  <style>p { color: red; }</style>
+  <script>var s = "<p>not text</p>";</script>
+</head>
+<body>
+  <!-- a comment -->
+  <h1>Welcome to the dashboard</h1>
+  <p>
+    Tom &amp; Jerry&nbsp;used it 3 times.
+  </p>
+  <button aria-label="Start the job" class="primary">Start</button>
+  <img src="chart.png" alt="Chart of usage" title='Monthly "usage"'>
+  <input placeholder="Type here" value="not eligible">
+  <pre>preformatted text</pre>
+  <code>code text</code>
+  <kbd>Ctrl</kbd> <samp>sample</samp>
+  <textarea>area text</textarea>
+  <noscript>no script text</noscript>
+  <template><p>template text</p></template>
+  <svg><text>svg text</text></svg>
+  <math><mi>x</mi></math>
+  <p>Hello {{ name }}</p>
+  <p>   </p>
+</body>
+</html>
+"""
+
+spans, segs = g.html_extract(PAGE)
+seg_list = g.parse_segments(segs)
+texts = [t for _, t in seg_list]
+expected = ["Usage Dashboard", "Welcome to the dashboard", "Tom &amp; Jerry&nbsp;used it 3 times.",
+            "Start the job", "Start", "Chart of usage", 'Monthly "usage"', "Type here", "Ctrl"]
+# kbd is excluded; drop it from the expectation.
+expected = [e for e in expected if e != "Ctrl"]
+report("HTML extraction takes only eligible text and attributes", texts == expected, repr(texts))
+excluded_words = ("Not eligible", "not text", "preformatted", "code text", "sample", "area text",
+                  "no script", "template text", "svg text", "name", "not eligible", "color")
+report("HTML extraction skips excluded elements, template syntax and other attributes",
+       not any(w in segs for w in excluded_words), segs)
+
+polished = list(texts)
+polished[1] = "Welcome to your dashboard"
+polished[2] = "Tom &amp; Jerry&nbsp;have used it 3 times & counting."
+polished[6] = 'Monthly "usage" chart'
+out = g.html_splice(PAGE, spans, polished)
+try:
+    g.html_verify(PAGE, out)
+    report("HTML splice verifies", True)
+except g.GuardReject as exc:
+    report("HTML splice verifies", False, exc.detail)
+report("HTML splice keeps surrounding whitespace and escapes a bare ampersand",
+       "<p>\n    Tom &amp; Jerry&nbsp;have used it 3 times &amp; counting.\n  </p>" in out, out)
+report("HTML splice escapes quotes inside an attribute value",
+       "title='Monthly \"usage\" chart'" in out or "title='Monthly &quot;usage&quot; chart'" in out, out)
+report("HTML splice leaves unchanged spans byte-identical",
+       "<title>Usage Dashboard</title>" in out and 'aria-label="Start the job"' in out, out)
+
+for name, mutate in (
+        ("non-eligible attribute changed", lambda s: s.replace('class="primary"', 'class="secondary"')),
+        ("tag changed", lambda s: s.replace("<h1>Welcome to your dashboard</h1>", "<h2>Welcome to your dashboard</h2>")),
+        ("comment changed", lambda s: s.replace("a comment", "another comment")),
+        ("script changed", lambda s: s.replace("not text", "changed")),
+        ("excluded text changed", lambda s: s.replace("code text", "other code"))):
+    try:
+        g.html_verify(PAGE, mutate(out))
+        report("HTML verify rejects: %s" % name, False, "accepted")
+    except g.GuardReject as exc:
+        report("HTML verify rejects: %s" % name, exc.reason == "html_mismatch", exc.reason)
+
+try:
+    g.check_segments(segs, segs.replace("Start the job", "Start the <b>job</b>"), html_mode=True)
+    report("HTML segment with new markup is rejected", False, "accepted")
+except g.GuardReject as exc:
+    report("HTML segment with new markup is rejected", exc.reason == "markup_in_text", exc.reason)
+
+try:
+    g.check_segments(segs, segs.replace("Jerry&nbsp;used", "Jerry used"), html_mode=True)
+    report("HTML character reference dropped is rejected", False, "accepted")
+except g.GuardReject as exc:
+    report("HTML character reference dropped is rejected", exc.reason == "protected_token", exc.reason)
+
+for name, html_text in (
+        ("truncated end tag at end of file", "<div><p>Some text</p></div"),
+        ("truncated start tag at end of file", "<p>Some text</p><div class=")):
+    try:
+        g.html_extract(html_text)
+        report("unsupported HTML: %s" % name, False, "extracted")
+    except g.UnsupportedInput as exc:
+        report("unsupported HTML: %s" % name, exc.reason == "unsupported_html", exc.reason)
+
+frag_spans, frag_segs = g.html_extract("<p>Fragment paragraph text.</p>\n<button>Go</button>\n")
+report("HTML fragment without body is eligible", frag_segs == "[[s1]] Fragment paragraph text.\n[[s2]] Go", frag_segs)
+
+# ----------------------------------------------------------------------------
+# Regression cases from the adversarial review of the guard
+# ----------------------------------------------------------------------------
+
+# Tokens that used to slip through.
+rejects("slash path changed", "Open src/main now.\n", "Open src/test now.\n", "protected_token")
+rejects("leading-underscore name changed", "Use _cache here.\n", "Use _store here.\n", "protected_token")
+rejects("one-letter dotted name changed", "Call a.b now.\n", "Call a.c now.\n", "protected_token")
+rejects("acronym-prefixed name changed", "Call XMLParser now.\n", "Call JSONParser now.\n", "protected_token")
+rejects("collapsed reference target changed",
+        "Read [safe][].\n\n[safe]: /safe\n[evil]: /evil\n",
+        "Read [evil][].\n\n[safe]: /safe\n[evil]: /evil\n", "inline_markup")
+rejects("shortcut reference turned into text",
+        "Read [guide].\n\n[guide]: /safe\n", "Read guide.\n\n[guide]: /safe\n", "inline_markup")
+rejects("digit-leading inline math changed", "Use $2x$ here.\n", "Use $2x + y$ here.\n")
+rejects("whitespace inside an inline HTML attribute changed",
+        'See <a href="some  page">this page</a>.\n', 'See <a href="some page">this page</a>.\n',
+        "inline_markup")
+rejects("unit changed", "Wait 30 ms.\n", "Wait 30 s.\n", "protected_token")
+rejects("short block grows without bound", "Ready.\n", "Ready. Backups are erased automatically.\n",
+        "length_ratio")
+accepts("plain prose slash pair stays editable", "Use this and/or that.\n", "Use this one and/or that.\n")
+accepts("abbreviation stays editable", "Use a tool, e.g. a linter.\n", "Use a tool, e.g. a code linter.\n")
+accepts("underscore emphasis stays editable",
+        "This is _really important_ guidance.\n", "This is _very important_ guidance.\n")
+accepts("plural acronym stays editable", "Open two PRs today.\n", "Open two pull requests today.\n")
+accepts("price text stays editable", "It costs $5 or $10 a month.\n", "It costs $5 or $10 per month.\n")
+
+# Protected Markdown regions that used to be editable.
+rejects("indented code changed", "Example:\n\n    echo alpha\n", "Example:\n\n    echo beta\n", "region_changed")
+rejects("fence opened on a list marker changed",
+        "- ```sh\n  echo alpha\n  ```\n", "- ```sh\n  echo beta\n  ```\n", "region_changed")
+rejects("raw HTML block across blank lines changed",
+        '<script>\n\nalert("alpha")\n\n</script>\n', '<script>\n\nalert("beta")\n\n</script>\n',
+        "region_changed")
+rejects("multi-line reference title changed",
+        '[r]: /docs\n  "Old title"\n\nRead [r].\n', '[r]: /docs\n  "New title"\n\nRead [r].\n',
+        "region_changed")
+rejects("footnote continuation changed",
+        "Text[^a].\n\n[^a]: first\n\n    second part\n", "Text[^a].\n\n[^a]: first\n\n    changed part\n",
+        "region_changed")
+
+# Structures that used to compare equal.
+rejects("lazy thematic break turned into a quoted heading", "> Title\n---\n", "> Title\n> ---\n", "structure")
+rejects("sibling list item nested", "- a\n - b\n", "- a\n  - b\n", "structure")
+rejects("heading moved out of a list item", "- Parent\n\n  ## Heading\n", "- Parent\n\n## Heading\n",
+        "structure")
+rejects("pipe-free table row moved out of the table",
+        "A | B\n--- | ---\ncell\n", "A | B\n--- | ---\n\ncell\n", "structure")
+accepts("pipe-free table row padded with a pipe", "A | B\n--- | ---\ncell\n", "A | B\n--- | ---\ncell |\n")
+rejects("bare carriage return adds a heading", "Read the setup guide.\n", "Read the setup\r# guide.\n",
+        "structure")
+
+# Equivalent forms that used to be rejected.
+accepts("one-dash setext underline equals an ATX heading", "Title\n-\n", "## Title\n")
+accepts("prose after a one-line raw HTML block stays editable",
+        "<script></script>\nRead the old docs.\n", "<script></script>\nRead the new docs.\n")
+
+# HTML adapter holes.
+for name, html_text in (
+        ("self-closing script", '<script/>alert("alpha")</script><p>Read docs.</p>'),
+        ("attribute syntax the parser reads differently", "<div a\"b=c title=\"x\">Docs</div>"),
+        ("character reference without a semicolon", "<p>&copy old docs</p>")):
+    try:
+        g.html_extract(html_text)
+        report("unsupported HTML: %s" % name, False, "extracted")
+    except g.UnsupportedInput as exc:
+        report("unsupported HTML: %s" % name, exc.reason == "unsupported_html", exc.reason)
+
+inv_spans, inv_segs = g.html_extract("<div data-x=foo\"title='old'>Docs</div>")
+report("HTML unquoted value is not split into an invented attribute", inv_segs == "[[s1]] Docs", inv_segs)
+pre_spans, pre_segs = g.html_extract('<p style="white-space:pre">Read\n    old docs</p><p>Other text.</p>')
+report("HTML text with preserved whitespace is not eligible", pre_segs == "[[s1]] Other text.", pre_segs)
+nbsp_spans, nbsp_segs = g.html_extract("<p>Read\u00a0\u00a0old docs</p>")
+report("HTML extraction keeps NBSP", nbsp_segs == "[[s1]] Read\u00a0\u00a0old docs", repr(nbsp_segs))
+lt_page = "<p>Use the old form.</p>"
+lt_spans, _ = g.html_extract(lt_page)
+lt_out = g.html_splice(lt_page, lt_spans, ["Use the 1 > 0 form."])
+report("HTML splice escapes angle brackets", lt_out == "<p>Use the 1 &gt; 0 form.</p>", lt_out)
+nested_spans, nested_segs = g.html_extract("<pre><span>a</span> still pre</pre><p>Prose.</p>")
+report("HTML excluded region ends at its own closing tag", nested_segs == "[[s1]] Prose.", nested_segs)
+
+sys.exit(1 if FAILED else 0)

@@ -1327,6 +1327,15 @@ enter_finalize_phase() {
 
     local finalize_summary_file="$LOOP_DIR/finalize-summary.md"
     local finalize_prompt
+    local polish_script="$PLUGIN_ROOT/scripts/polish-gemini.sh"
+
+    # Readability polish of the finalize summary, shared by both inline fallback prompts.
+    local polish_step="
+
+## Polish the Finalize Summary
+After writing the summary, polish it for readability. A run can take several minutes, so run it in the background and wait for it to finish:
+    \"{{POLISH_SCRIPT}}\" --auto --input \"{{FINALIZE_SUMMARY_FILE}}\" --output \"{{FINALIZE_SUMMARY_FILE}}\"
+Read the final stderr line (polish-gemini: outcome=... reason=... delivered=...). If the outcome is polished, check the summary against this list: same claims; same negations and caveats; same obligation strength; same language and variant; every gloss only explains a term already present; nothing added that is not a gloss; nothing dropped. If any item fails, restore your original wording or correct it. For any other outcome the summary is unchanged; mention the reason in your report. Re-read the summary before you report completion. Do not polish round summaries, the goal tracker, plans or code."
 
     if [[ -n "$skip_reason" ]]; then
         local fallback="# Finalize Phase (Review Skipped)
@@ -1353,10 +1362,11 @@ If time permits, use the \`code-simplifier:code-simplifier\` agent via the Task 
 ## Before Exiting
 1. Complete all todos
 2. Commit your changes
-3. Write your finalize summary to: {{FINALIZE_SUMMARY_FILE}}"
+3. Write your finalize summary to: {{FINALIZE_SUMMARY_FILE}}${polish_step}"
 
         finalize_prompt=$(load_and_render_safe "$TEMPLATE_DIR" "claude/finalize-phase-skipped-prompt.md" "$fallback" \
             "FINALIZE_SUMMARY_FILE=$finalize_summary_file" \
+            "POLISH_SCRIPT=$polish_script" \
             "PLAN_FILE=$PLAN_FILE" \
             "GOAL_TRACKER_FILE=$GOAL_TRACKER_FILE" \
             "REVIEW_SKIP_REASON=$skip_reason" \
@@ -1381,10 +1391,11 @@ Focus on the code changes made during this RLCR session. Focus more on changes b
 ## Before Exiting
 1. Complete all todos
 2. Commit your changes
-3. Write your finalize summary to: {{FINALIZE_SUMMARY_FILE}}"
+3. Write your finalize summary to: {{FINALIZE_SUMMARY_FILE}}${polish_step}"
 
         finalize_prompt=$(load_and_render_safe "$TEMPLATE_DIR" "claude/finalize-phase-prompt.md" "$fallback" \
             "FINALIZE_SUMMARY_FILE=$finalize_summary_file" \
+            "POLISH_SCRIPT=$polish_script" \
             "PLAN_FILE=$PLAN_FILE" \
             "GOAL_TRACKER_FILE=$GOAL_TRACKER_FILE" \
             "BASE_BRANCH=$BASE_BRANCH" \
