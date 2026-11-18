@@ -1261,6 +1261,24 @@ for name, src, cand in [
         ("a lazy line that continues a paragraph inside a list item reworded",
          "- > Read the\n    prose here.\n", "- > See the\n    prose here.\n")]:
     accepts("R3 " + name, src, cand)
+# Round 3 second re-review: a table that starts on a list-marker line is
+# inside the list item.
+for name, src, cand in [
+        ("a nested item after a table on a list-marker line made a sibling",
+         "- | A | B |\n  |---|---|\n  - Item.\n", "- | A | B |\n  |---|---|\n- Item.\n"),
+        ("the marker of an item that starts with a table changed",
+         "- | A | B |\n  |---|---|\n  - Item.\n", "+ | A | B |\n  |---|---|\n  - Item.\n"),
+        ("a column dropped from a table on an ordered marker line",
+         "1. | Name | Note |\n   |---|---|\n   | a | Read this. |\n",
+         "1. | Name | Note |\n   |---|---|\n   | a Read this. |\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("a body row of a table on a list-marker line reworded",
+         "- | A | B |\n  |---|---|\n    Read this prose.\n", "- | A | B |\n  |---|---|\n    See this prose.\n"),
+        ("a cell of a table on an ordered marker line reworded",
+         "1. | Name | Note |\n   |---|---|\n   | a | Read this. |\n",
+         "1. | Name | Note |\n   |---|---|\n   | a | See this. |\n")]:
+    accepts("R3 " + name, src, cand)
 seg_check("R3 five emphasized references with one label in a segment reworded",
           "[[a]] Read [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].",
           "[[a]] See [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].",

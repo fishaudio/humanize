@@ -1082,6 +1082,70 @@ def supervised_start_cases():
                % (conn is not None, proc.returncode, dest, leftovers, helpers, lingering, took, err[-300:]))
 
 
+def ready_pipe_race_cases():
+    """R3: the readiness pipe's name replaced by a symlink to another file
+    between the wrapper's check and its open (a directory others may write
+    to). The wrapper must check the open descriptors, so nothing is written
+    to the other file, and the run still finishes normally."""
+    work = tempfile.mkdtemp(prefix="polish-runner-race-")
+    root = plugin_copy(work)
+    runner = os.path.join(root, "scripts", "polish-gemini.sh")
+    with open(runner) as fh:
+        text = fh.read()
+    check = '[[ -p "$name" && ! -L "$name" ]] && { exec 7<>"$name"; }'
+    pause = ('[[ -p "$name" && ! -L "$name" ]] && { [[ -e "$POLISH_TEST_PAUSE/go" ]] || '
+             '{ : > "$POLISH_TEST_PAUSE/at-open"; while [[ ! -e "$POLISH_TEST_PAUSE/go" ]]; do :; done; }; } '
+             '&& { exec 7<>"$name"; }')
+    count = text.count(check)
+    with open(runner, "w") as fh:
+        fh.write(text.replace(check, pause))
+    tmp_dir = os.path.join(work, "tmp")
+    os.mkdir(tmp_dir)
+    victim = os.path.join(work, "victim.txt")
+    with open(victim, "wb") as fh:
+        fh.write(b"VIC\n")
+    payload = b"Read the source text for the pipe race.\n"
+    proc = subprocess.Popen([runner, "--input", "-"],
+                            env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": sys.executable, "TMPDIR": tmp_dir,
+                                                    "POLISH_TEST_PAUSE": work}),
+                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            start_new_session=True)
+    deadline = time.monotonic() + 30
+    while (count == 1 and not os.path.exists(os.path.join(work, "at-open")) and proc.poll() is None
+           and time.monotonic() < deadline):
+        time.sleep(0.01)
+    swapped = False
+    for name in os.listdir(tmp_dir):
+        if name.startswith("polish-gemini-ready."):
+            path = os.path.join(tmp_dir, name)
+            os.unlink(path)
+            os.symlink(victim, path)
+            swapped = True
+    with open(os.path.join(work, "go"), "w"):
+        pass
+    timed_out = False
+    try:
+        stdout, err = proc.communicate(input=payload, timeout=30)
+    except subprocess.TimeoutExpired:
+        # A wrapper that read the other file waits for a helper that is never
+        # released; end both.
+        timed_out = True
+        os.killpg(proc.pid, signal.SIGKILL)
+        stdout, err = proc.communicate()
+    with open(victim, "rb") as fh:
+        victim_bytes = fh.read()
+    leftovers = os.listdir(tmp_dir)
+    shutil.rmtree(work, ignore_errors=True)
+    report("the readiness pipe replaced by a symlink before it is opened: the other file is untouched, "
+           "the run finishes normally",
+           count == 1 and swapped and not timed_out and victim_bytes == b"VIC\n" and proc.returncode == 0
+           and stdout == payload
+           and not leftovers and only_prefixed(err)
+           and outcome_lines(err) == [OUTCOME_PREFIX + "skipped reason=no_api_key delivered=yes"],
+           "count=%d swapped=%s timed_out=%s victim=%r rc=%s leftovers=%r %r"
+           % (count, swapped, timed_out, victim_bytes, proc.returncode, leftovers, err[-300:]))
+
+
 def interruption_window_cases():
     """A signal right after the run installs its handlers, or a second one
     while the interruption is handled, still gives one interrupted outcome."""
@@ -1146,6 +1210,7 @@ def main():
     shell_step_cases()
     startup_cases()
     supervised_start_cases()
+    ready_pipe_race_cases()
     interruption_window_cases()
     sys.exit(1 if FAILED else 0)
 

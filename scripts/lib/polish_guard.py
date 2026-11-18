@@ -1810,33 +1810,8 @@ def parse_blocks(text):
             i += 1
             continue
 
-        if ("|" in cbody and i + 1 < n and in_container(i + 1, quote, depth, base)
-                and _is_table_sep(_strip_quote(lines[i + 1], quote))):
-            # Body rows run until a blank line, the start of another block,
-            # or a line that leaves the table's quote or list item, with or
-            # without pipes.
-            rows = [i]
-            j = i + 2
-            while j < n and in_container(j, quote, depth, base):
-                if _starts_block(_past_container(_strip_quote(lines[j], quote), base), False):
-                    break
-                rows.append(j)
-                j += 1
-            has_html = any(HTML_TAG_RE.search(_strip_quote(lines[r], quote)) for r in rows)
-            for idx, r in enumerate(rows):
-                row_body = _strip_quote(lines[r], quote)
-                cells = _split_cells(row_body)
-                if has_html:
-                    blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
-                else:
-                    blocks.append(Block("table_row", attrs(cols=len(cells)), lines[r], cells, r + 1))
-                if idx == 0:
-                    sep = _strip_quote(lines[i + 1], quote)
-                    sep_norm = re.sub(r"[ \t]", "", sep).strip("|")
-                    blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
-            i = j
-            continue
-
+        # A list marker comes before a table: "- | A | B |" is a list item
+        # that holds a table, not a table whose first cell starts with "-".
         lm = LIST_ITEM_RE.match(ebody)
         if lm:
             marker = lm.group("marker")
@@ -1883,6 +1858,33 @@ def parse_blocks(text):
                     pad = 3
                 new_body = " " * pad + rest_raw
             lines[i] = ((_quote_prefix(line, quote) + " ") if quote else "") + new_body
+            continue
+
+        if ("|" in cbody and i + 1 < n and in_container(i + 1, quote, depth, base)
+                and _is_table_sep(_strip_quote(lines[i + 1], quote))):
+            # Body rows run until a blank line, the start of another block,
+            # or a line that leaves the table's quote or list item, with or
+            # without pipes.
+            rows = [i]
+            j = i + 2
+            while j < n and in_container(j, quote, depth, base):
+                if _starts_block(_past_container(_strip_quote(lines[j], quote), base), False):
+                    break
+                rows.append(j)
+                j += 1
+            has_html = any(HTML_TAG_RE.search(_strip_quote(lines[r], quote)) for r in rows)
+            for idx, r in enumerate(rows):
+                row_body = _strip_quote(lines[r], quote)
+                cells = _split_cells(row_body)
+                if has_html:
+                    blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
+                else:
+                    blocks.append(Block("table_row", attrs(cols=len(cells)), lines[r], cells, r + 1))
+                if idx == 0:
+                    sep = _strip_quote(lines[i + 1], quote)
+                    sep_norm = re.sub(r"[ \t]", "", sep).strip("|")
+                    blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
+            i = j
             continue
 
         # Paragraph, possibly a setext heading. An underline only counts when

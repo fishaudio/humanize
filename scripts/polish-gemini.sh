@@ -749,10 +749,20 @@ open_ready_pipe() {
                 continue
             fi
             TEMP_FILES+=("$name")
+            # The name can be replaced between any check and an open (in a
+            # directory others may write to), so the open descriptors are
+            # checked instead: both must be the same named pipe, owned by
+            # this user. Nothing is ever written through fd 7 by this shell,
+            # and the helper writes to it only after these checks passed.
             if [[ -p "$name" && ! -L "$name" ]] && { exec 7<>"$name"; } 2>/dev/null; then
-                if { exec 6<"$name"; } 2>/dev/null; then
-                    opened=0
-                else
+                if [[ -p /dev/fd/7 && -O /dev/fd/7 ]] && { exec 6<"$name"; } 2>/dev/null; then
+                    if [[ /dev/fd/6 -ef /dev/fd/7 ]]; then
+                        opened=0
+                    else
+                        exec 6<&-
+                    fi
+                fi
+                if (( opened != 0 )); then
                     exec 7>&-
                 fi
             fi
