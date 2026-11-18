@@ -978,4 +978,28 @@ for name, src, cand in [
         ("emphasis around a link moved", "Read *[the guide](x)* now.\n", "Now read *[the guide](x)*.\n")]:
     accepts(name, src, cand)
 
+# Round 2 fourth re-review: tabs in structural positions, overindented table
+# rows, and original bytes for raw blocks after quote relocation.
+LEAF = "> - Parent.\n>   - Child.\n>     - Leaf.\n>       >\t  OLD\n"
+QFENCE = "- Parent.\n  - Child.\n    > ```\n    > keep\n    > ```\n"
+for name, src, cand in [
+        ("indented code after a tab in a relocated quote changed", LEAF, LEAF.replace("OLD", "NEW")),
+        ("the prefix bytes of a fence in a relocated quote changed", QFENCE, QFENCE.replace("    >", "\t>")),
+        ("an indented code line written with a tab instead of spaces", "Text.\n\n\tcode\n", "Text.\n\n    code\n")]:
+    rejects(name, src, cand, "region_changed")
+for name, src, cand in [
+        ("a tab after a list marker inside a quote: sibling made a child", "> -\tParent.\n> - Child.\n",
+         "> -\tParent.\n>   - Child.\n"),
+        ("a table row indented into code", "> | Name |\n> | --- |\n> | Words |\n",
+         "> | Name |\n> | --- |\n>     | Words |\n"),
+        ("a table separator indented into code", "> | Name |\n> | --- |\n> | Words |\n",
+         "> | Name |\n>     | --- |\n> | Words |\n")]:
+    rejects(name, src, cand, "structure")
+for name, src, cand in [
+        ("quoted prose after a tab inside a nested item reworded", "- Parent.\n  - Child.\n    >\t Quoted words.\n",
+         "- Parent.\n  - Child.\n    >\t Clear words.\n"),
+        ("a list item after a tab inside a quote reworded", "> -\tParent.\n> - Child.\n",
+         "> -\tParent item.\n> - Child.\n")]:
+    accepts(name, src, cand)
+
 sys.exit(1 if FAILED else 0)

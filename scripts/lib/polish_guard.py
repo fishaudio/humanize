@@ -1073,6 +1073,35 @@ def _quote_marker_cols(line, depth):
     return _quote_walk(line, depth)[0]
 
 
+# The structural start of a line: indentation, quote markers and list
+# markers. CommonMark treats tabs there as spaces up to the next multiple of
+# four columns.
+STRUCT_PREFIX_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*")
+# Raw kinds whose text is a run of whole source lines.
+RAW_LINE_KINDS = ("frontmatter", "fence", "math", "html", "footnote_def", "refdef",
+                  "indented_code", "table_raw")
+
+
+def _expand_structure(line):
+    """``line`` with the tabs in its structural start replaced by spaces at
+    their true columns; the rest of the line keeps its bytes."""
+    m = STRUCT_PREFIX_RE.match(line)
+    head = m.group(0)
+    if "\t" not in head:
+        return line
+    out = []
+    col = 0
+    for ch in head:
+        if ch == "\t":
+            width = 4 - col % 4
+            out.append(" " * width)
+            col += width
+        else:
+            out.append(ch)
+            col += 1
+    return "".join(out) + line[m.end():]
+
+
 def parse_blocks(text):
     """Split Markdown or plain text into an ordered list of blocks.
 
@@ -1085,10 +1114,17 @@ def parse_blocks(text):
     outermost first, so a list that encloses a quote is still part of the
     ancestry of every block inside and after that quote.
     """
-    lines = text.split("\n")
+    # Column computations read ``lines``, whose structural tabs are expanded
+    # and whose quote and list prefixes may be moved; raw blocks and prose
+    # units read the original bytes in ``orig_lines``.
+    orig_lines = text.split("\n")
+    lines = [_expand_structure(line) for line in orig_lines]
     n = len(lines)
     blocks = []
     i = 0
+    # Lines whose rest was cut after a polish:on marker: their blocks keep the
+    # cut text.
+    cut_lines = set()
 
     if n > 1 and lines[0] in ("---", "+++"):
         closer = lines[0]
@@ -1127,7 +1163,9 @@ def parse_blocks(text):
         kb = _strip_quote(lines[k], quote)
         if depth > 0 and _indent_of(kb) < base:
             return False
-        return not _past_container(kb, base).startswith(">")
+        rel = _past_container(kb, base)
+        # Four columns past the container make the line indented code.
+        return _indent_of(rel) < 4 and not rel.startswith(">")
 
     def containers(quote, indent, qcols):
         del level_stacks[quote + 1:]
@@ -1190,6 +1228,7 @@ def parse_blocks(text):
             prefix = lines[j][:len(lines[j]) - len(after)]
             lead = after[:len(after) - len(after.lstrip(" \t"))]
             lines[j] = prefix + lead + rest.lstrip(" \t")
+            cut_lines.add(j)
             i = j
             continue
 
@@ -1451,7 +1490,7 @@ def parse_blocks(text):
                 break
             if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
-            content.append(_quote_rest(nxt, quote))
+            content.append(_quote_rest(nxt if j in cut_lines else orig_lines[j], quote))
             j += 1
         if setext_level:
             blocks.append(Block("heading", attrs(level=setext_level),
@@ -1461,6 +1500,13 @@ def parse_blocks(text):
                                 start_line))
         i = j
 
+    # Raw blocks are compared byte for byte against the original lines.
+    for block in blocks:
+        if block.kind in RAW_LINE_KINDS:
+            first = block.line - 1
+            last = first + block.raw.count("\n")
+            if not any(k in cut_lines for k in range(first, last + 1)):
+                block.raw = "\n".join(orig_lines[first:last + 1])
     return blocks
 
 

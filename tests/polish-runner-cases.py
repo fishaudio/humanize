@@ -127,6 +127,33 @@ def child(mode, work):
                 os.kill(os.getpid(), signal.SIGTERM)
 
         p.Runner.emit = emit_with_signal
+    if mode == "signal_in_except":
+        # A SIGTERM right after the handlers are installed, and a second one
+        # on the first line of the handler for the first.
+        import inspect
+        src, first = inspect.getsourcelines(p.Runner.run)
+        target_line = first + next(k for k, ln in enumerate(src) if "signum = exc.signum" in ln)
+        original_set = p._set_signal_handlers
+        fired = {"set": False, "line": False}
+
+        def set_then_signal(handler):
+            original_set(handler)
+            if not fired["set"]:
+                fired["set"] = True
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        def tracer(frame, event, arg):
+            if frame.f_code is p.Runner.run.__code__:
+                def line_tracer(frame, event, arg):
+                    if event == "line" and frame.f_lineno == target_line and not fired["line"]:
+                        fired["line"] = True
+                        os.kill(os.getpid(), signal.SIGTERM)
+                    return line_tracer
+                return line_tracer
+            return None
+
+        p._set_signal_handlers = set_then_signal
+        sys.settrace(tracer)
     if mode in ("signal_after_handlers", "signal_twice"):
         # A signal right after the run installs its handlers, and (signal_twice)
         # a second one before the interruption path defers signals.
@@ -778,7 +805,8 @@ def interruption_window_cases():
     """A signal right after the run installs its handlers, or a second one
     while the interruption is handled, still gives one interrupted outcome."""
     for mode, label in (("signal_after_handlers", "right after the handlers are installed"),
-                        ("signal_twice", "twice, the second before signals are deferred")):
+                        ("signal_twice", "twice, the second before signals are deferred"),
+                        ("signal_in_except", "twice, the second in the handler of the first")):
         r = run_child(mode)
         lines = r["err"].splitlines()
         report("SIGTERM %s: one interrupted outcome, exit 143, no raw stderr" % label,

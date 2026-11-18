@@ -142,7 +142,16 @@ class UsageError(Exception):
     pass
 
 
+_INTERRUPTING = []
+
+
 def _raise_interrupt(signum, frame):
+    # Raise once per process: a later signal is only recorded, so it cannot
+    # escape the handler of the first one.
+    if _INTERRUPTING:
+        _DEFERRED_SIGNALS.append(signum)
+        return
+    _INTERRUPTING.append(signum)
     raise Interrupted(signum)
 
 
