@@ -1266,12 +1266,17 @@ def _is_table_sep(line):
             and not LIST_ITEM_RE.match(line))
 
 
-def _is_table_start(header, sep):
+def _is_table_start(header, sep, lazy=False):
     """GFM: a table starts with a header row and a delimiter row that have
     the same number of cells; otherwise neither line is part of a table.
     The header row needs no pipe ("Name" above ":---" is a one-column
-    table)."""
-    return _is_table_sep(sep) and len(_split_cells(header)) == len(_split_cells(sep))
+    table). cmark-gfm keeps the leading whitespace of a lazy line, so a
+    lazy header row that starts with whitespace and then a pipe has an
+    empty first cell there."""
+    cells = len(_split_cells(header))
+    if lazy and header[:1] in (" ", "\t") and header.lstrip(" \t").startswith("|"):
+        cells += 1
+    return _is_table_sep(sep) and cells == len(_split_cells(sep))
 
 
 def _starts_block(body, in_paragraph):
@@ -1313,6 +1318,33 @@ def _starts_block(body, in_paragraph):
     return False
 
 
+def _paragraph_left_open(text):
+    """Whether a line whose content is ``text`` (past its containers) leaves
+    a paragraph open, so that the next line may continue it lazily. Text in
+    a quote or a list item does; a blank line, indented code, a fence, an
+    HTML block, a heading, a thematic break, an empty list item or an empty
+    quote does not."""
+    for _ in range(64):
+        depth, _ = _quote_depth(text)
+        if depth:
+            text = _strip_quote(text, depth)
+            continue
+        if not text.strip() or _indent_of(text) >= 4 or HR_RE.match(text):
+            return False
+        lm = LIST_ITEM_RE.match(text)
+        if lm:
+            after = text[lm.end("marker"):]
+            if lm.group("task"):
+                after = lm.group("rest")
+            elif _indent_of(after) >= 5:
+                # Indented code inside the item (or an empty item).
+                return False
+            text = after.lstrip(" \t")
+            continue
+        return not (_is_fence_open(text) or ATX_RE.match(text) or _is_html_start(text))
+    return False
+
+
 FENCE_CLOSE_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*$")
 
 
@@ -1345,14 +1377,16 @@ def _html_end_marker(body):
     return None
 
 
-def _read_definitions(content):
+def _read_definitions(content, parsed_only=False):
     """Read the reference definitions at the start of a paragraph whose
     lines are ``content`` (leading whitespace is ignored), as CommonMark
     does when the paragraph closes. Return a list of (first, end, label,
     parsed) entries in line indices, and the index of the first line after
     them. A line that starts like a definition this parser cannot read is
     kept with the lines up to the next one that starts a definition, as an
-    unparsed definition."""
+    unparsed definition. With ``parsed_only``, reading stops there instead
+    (cmark-gfm checks a setext underline against the definitions it can
+    read; a line it cannot read as one is paragraph text)."""
     parts = [line.lstrip(" \t") for line in content]
     out = []
     k = 0
@@ -1368,7 +1402,7 @@ def _read_definitions(content):
             out.append((k, end, label, True))
             k = end
             continue
-        if not REFDEF_RE.match(parts[k]):
+        if parsed_only or not REFDEF_RE.match(parts[k]):
             break
         end = k + 1
         while (end < len(parts) and not REFDEF_RE.match(parts[end])
@@ -1715,7 +1749,8 @@ def parse_blocks(text, spec_blank_items=False):
         return j
 
     # Paragraph lines that head a table and are read with the paragraph's
-    # containers, by line index: (quote, depth, base, ancestry, lazy).
+    # containers, by line index: (quote, depth, base, ancestry, mark), where
+    # mark is "lazy", "indented" or "".
     table_headers = {}
 
     while i < n:
@@ -1753,8 +1788,8 @@ def parse_blocks(text, spec_blank_items=False):
             # paragraph's containers. Other parsers (markdown-it) read
             # neither as a header row, so a header that becomes or stops
             # being lazy or indented is also a structure change.
-            quote, depth, base, ancestry, lazy = forced
-            marks = {"lazy_header": True} if lazy else {"indented_header": True}
+            quote, depth, base, ancestry, mark = forced
+            marks = {mark + "_header": True} if mark else {}
             i = emit_table(i, quote, depth, base, lambda **extra: attrs(**dict(marks, **extra)))
             continue
         ebody = _strip_quote(line, quote)
@@ -1832,8 +1867,9 @@ def parse_blocks(text, spec_blank_items=False):
             # marker's true column for the container check, and read the
             # lines again, so the quote is parsed like any other and stays
             # inside its list items. Lazy lines in between are left alone; a
-            # line after a marker line with nothing after the marker is not
-            # lazy (no paragraph is open), so the quote ends there.
+            # line after a marker line that leaves no paragraph open (an
+            # empty quote, an HTML block, a fence, a heading) is not lazy, so
+            # the quote ends there.
             k = i
             text_open = False
             while k < n and lines[k].strip() and _quote_depth(lines[k])[0] == quote:
@@ -1846,7 +1882,7 @@ def parse_blocks(text, spec_blank_items=False):
                     marker_quote_col.setdefault(k, {})[quote] = kind
                     lines[k] = ((_quote_prefix(lines[k], quote) + " ") if quote else "") \
                         + " " * min(kind, 3) + kb.lstrip(" ")
-                    text_open = bool(rel.lstrip(" ")[1:].strip())
+                    text_open = _paragraph_left_open(rel)
                 elif not text_open or rel.lstrip(" ").startswith(">") or _starts_block(rel, False):
                     break
                 k += 1
@@ -1877,42 +1913,57 @@ def parse_blocks(text, spec_blank_items=False):
             i = end + 1
             continue
 
-        if FOOTNOTE_DEF_RE.match(cbody):
+        fm = FOOTNOTE_DEF_RE.match(cbody)
+        if fm:
             # cmark-gfm reads a footnote definition as a container whose
             # lines are indented four columns past its own container (blank
-            # lines in between too). A less indented line right after one
-            # of its lines continues its paragraph lazily, unless it starts a
-            # block of its own (a fence, HTML, a list item, a heading and so
-            # on): that block ends the definition. A fence inside it has no
-            # lazy lines, and when the definition ends inside a fence, the
-            # blank lines before its end are code too.
+            # lines in between too). While a paragraph is open inside it, a
+            # line with less indentation or fewer quote markers continues
+            # that paragraph lazily, unless it starts a block of its own (a
+            # fence, HTML, a list item, a heading and so on) or leaves an
+            # enclosing list item: then the definition ends. A fence inside
+            # it has no lazy lines, and when the definition ends inside a
+            # fence, the blank lines before its end are code too.
             j = i
             k = i + 1
             open_fence = None
+            para_open = _paragraph_left_open(cbody[fm.end():].lstrip(" \t"))
             while k < n:
-                kq, _ = _quote_depth(lines[k])
-                if kq != quote:
-                    break
-                kb = _strip_quote(lines[k], quote)
-                if not kb.strip():
+                if not lines[k].strip():
+                    if quote:
+                        break
+                    para_open = False
                     k += 1
                     continue
-                if _indent_of(kb) - base >= 4:
+                kq = relocate_quotes(k, quote)
+                if kq > quote:
+                    break
+                if kq > 0 and _leaves_list_item(qcols_of(k, kq), kq, level_stacks):
+                    break
+                kb = _strip_quote(lines[k], kq)
+                if kq == quote and not kb.strip():
+                    # Only quote markers: a blank line inside the quote.
+                    para_open = False
+                    k += 1
+                    continue
+                if kq == quote and _indent_of(kb) - base >= 4:
                     rel = _past_container(kb, base + 4)
                     if open_fence:
                         cm = FENCE_CLOSE_RE.match(rel.lstrip(" "))
                         if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == open_fence[0]
                                 and len(cm.group(1)) >= len(open_fence)):
                             open_fence = None
-                    elif _indent_of(rel) < 4:
-                        open_fence = _is_fence_open(rel)
+                    elif not (para_open and not _starts_quote(rel) and not SETEXT_RE.match(rel)
+                              and not _starts_block(rel, True)):
+                        # Not a continuation line of the open paragraph: a
+                        # block of its own starts here.
+                        open_fence = _is_fence_open(rel) if _indent_of(rel) < 4 else None
+                        para_open = not open_fence and _paragraph_left_open(rel)
                     j = k
                     k += 1
                     continue
-                if k == j + 1 and not open_fence:
-                    # (A lazy line keeps the definition open: a line
-                    # indented four columns after it is inside again.)
-                    lazy = past_matched(kb, quote)
+                if para_open and not open_fence:
+                    lazy = past_matched(kb, kq)
                     if not (_starts_quote(lazy) or _starts_block(lazy, False)):
                         j = k
                         k += 1
@@ -2054,29 +2105,42 @@ def parse_blocks(text, spec_blank_items=False):
                 break
             sm = SETEXT_RE.match(nbc)
             if sm and same_container:
-                if _read_definitions(content)[1] < len(content):
+                if _read_definitions(content, parsed_only=True)[1] < len(content):
                     setext_level = 1 if sm.group(1)[0] == "=" else 2
                     j += 1
                     break
             elif _starts_block(nbc, same_container):
                 break
-            if (sep_after(j)
-                    and _is_table_start(nbc, _past_container(_strip_quote(lines[j + 1], quote), base))):
-                if tables_off:
-                    # Other parsers (markdown-it) start a table here; the
-                    # paragraph is kept byte for byte below.
-                    table_elsewhere = True
-                    content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
-                    j += 1
-                    continue
+            sep_text = (_past_container(_strip_quote(lines[j + 1], quote), base)
+                        if sep_after(j) else None)
+            gfm_table = (sep_text is not None and not tables_off
+                         and _is_table_start(nbc, sep_text, lazy=not same_container))
+            if sep_text is not None and not gfm_table and _is_table_start(nbc, sep_text):
+                # Other parsers (markdown-it) start a table here and
+                # cmark-gfm does not (one try per paragraph, or the empty
+                # first cell of a lazy header row): the paragraph is kept
+                # byte for byte below. (cmark-gfm tried a table at the next
+                # line, so no later line of the paragraph starts one.)
+                table_elsewhere = True
+                tables_off = True
+                content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
+                j += 1
+                continue
+            if gfm_table:
                 # A delimiter row that matches the paragraph's containers
                 # turns this line into a table's header row. One that does
-                # not is lazy paragraph text, and so is this line. A header
-                # row that is a lazy line, or that is indented four columns
-                # (no code block can start inside a paragraph), is read as
-                # one with the paragraph's containers.
-                if not same_container or _indent_of(nbc) >= 4:
-                    table_headers[j] = (quote, depth, base, ancestry, not same_container)
+                # not is lazy paragraph text, and so is this line. The header
+                # row is read as one with the paragraph's containers, also
+                # when it is a lazy line, is indented four columns (no code
+                # block can start inside a paragraph), or looks like a list
+                # item that cannot interrupt the paragraph ("2. Header.").
+                if not same_container:
+                    mark = "lazy"
+                elif _indent_of(nbc) >= 4:
+                    mark = "indented"
+                else:
+                    mark = ""
+                table_headers[j] = (quote, depth, base, ancestry, mark)
                 break
             # The original bytes after the line's quote markers, also when a
             # marker was moved for parsing: a tab inside a code span or math
@@ -2085,7 +2149,7 @@ def parse_blocks(text, spec_blank_items=False):
             if sep_after(j):
                 tables_off = True
             j += 1
-        defs, rest = _read_definitions(content)
+        defs, rest = _read_definitions(content, parsed_only=bool(setext_level))
         for first, last, label, parsed in defs:
             ref = (normalize_label(label), parsed) if label is not None else None
             blocks.append(Block("refdef", attrs(), "\n".join(lines[i + first:i + last]), [],

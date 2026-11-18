@@ -1425,4 +1425,52 @@ for name, src, cand in [
          'Intro.\n[ref]: /url\n\n*first [inside][ref]* last\n')]:
     accepts("R3 " + name, src, cand)
 
+# Final re-review of e62269d: an underline below an unreadable definition makes a
+# heading; a quote ends after an HTML block line; a table header found inside a
+# paragraph is read as one even when it looks like a list item; a footnote's
+# lazy lines may have fewer quote markers, need an open paragraph, and stop where
+# a quote marker leaves the enclosing list item.
+for name, src, cand in [
+        ('code after a heading whose text only starts like a definition edited',
+         '[ref]:\n===\n    codewords\n',
+         '[ref]:\n===\n    codeother\n'),
+        ('paragraph text after an HTML block in a quoted list item turned into a quote',
+         '- Item.\n    > <div></div>\nOutside.\n    > Next.\n',
+         '- Item.\n    > <div></div>\nOutside.\n  > Next.\n'),
+        ('code after a one-column table whose header looks like an ordered item edited',
+         'Intro.\n2. Header.\n:---\n    codewords\n',
+         'Intro.\n2. Header.\n:---\n    codeother\n'),
+        ("a list after a footnote's lazy line outside its quote absorbed into the footnote",
+         'See[^1].\n\n> [^1]: note\nTail.\n2. Item.\n',
+         'See[^1].\n\n> [^1]: note\nTail.\n      2. Item.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a heading inside a footnote reworded',
+         'See[^1].\n\n[^1]: note\n    # Heading\nRead prose.\n',
+         'See[^1].\n\n[^1]: note\n    # Heading\nSee prose.\n'),
+        ('prose after a closed fence inside a footnote reworded',
+         'See[^1].\n\n[^1]: note\n    ```\n    code\n    ```\nRead prose.\n',
+         'See[^1].\n\n[^1]: note\n    ```\n    code\n    ```\nSee prose.\n'),
+        ('a quote outside the list that holds a quoted footnote reworded',
+         '- Item.\n\n  > [^1]: note\n> Read prose.\n',
+         '- Item.\n\n  > [^1]: note\n> See prose.\n')]:
+    accepts("R3 " + name, src, cand)
+
+# cmark-gfm keeps the leading whitespace of a lazy line: a lazy header row that
+# starts with whitespace and a pipe has an empty first cell there.
+for name, src, cand in [
+        ("a delimiter row moved out of an item under a lazy header with a leading space",
+         '2. Header.\n  | a |\n    |---|---|\n  <img src="x">\n', '2. Header.\n  | a |\n|---|---|\n  <img src="x">\n'),
+        ("the leading space of a lazy header row removed",
+         "- x\n | a |\n  |---|---|\n", "- x\n| a |\n  |---|---|\n"),
+        ("the leading space of a lazy header row in a quote removed, making a table",
+         "> x\n | a | b\n> |---|---|\n", "> x\n| a | b\n> |---|---|\n")]:
+    rejects("R3 " + name, src, cand)
+accepts("R3 a lazy header row with a leading space reworded",
+        "- x\n | Read |\n  |---|---|\n", "- x\n | See |\n  |---|---|\n")
+
+rejects("R3 a delimiter row indented under a lazy header that only markdown-it reads as a table",
+        "  - a | b\n  - | a | b |\n  | a | b |\n  |---|---|\n  - | text two |\na | b\n",
+        "  - a | b\n  - | a | b |\n  | a | b |\n    |---|---|\n  - | text two |\na | b\n")
+
 sys.exit(1 if FAILED else 0)
