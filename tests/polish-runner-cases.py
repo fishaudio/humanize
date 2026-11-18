@@ -19,7 +19,11 @@ Covered here (the loopback mock cannot produce these reliably):
 - SIGINT that was ignored when the run started stays ignored on both paths;
 - shell fallback edges: a failed stdin copy, SIGTERM during the output mode
   lookup, SIGTERM right before a usage error exits, SIGTERM in the moment
-  before a delivery step ignores signals, and mv killed after the rename.
+  before a delivery step ignores signals, and mv killed after the rename;
+- the fallback's stderr holds only polish-gemini lines (a TMPDIR carrying a
+  fake outcome line, a file size limit, a missing output directory);
+- a group SIGTERM before each temporary file is created, and after it is
+  created but before its path is registered, leaves no file behind.
 
 No network is used: the HTTP call is replaced in the child process.
 """
@@ -442,6 +446,96 @@ def fallback_edge_cases():
            "rc=%s %r exact=%s" % (proc.returncode, outcome_lines(proc.stderr), exact))
 
 
+def only_prefixed(err):
+    lines = err.decode("utf-8", "replace").splitlines()
+    return all(ln.startswith("polish-gemini: ") for ln in lines)
+
+
+def fallback_stderr_cases():
+    """The fallback's stderr holds only polish-gemini lines, one outcome last."""
+    failed_no = [OUTCOME_PREFIX + "failed reason=delivery_error delivered=no"]
+    work = tempfile.mkdtemp(prefix="polish-runner-err-")
+    fake = OUTCOME_PREFIX + "polished reason=ok delivered=yes"
+    bad_tmp = os.path.join(work, "missing") + "\n" + fake + "\n"
+    proc = subprocess.run([RUNNER, "--input", "-"], input=b"Original prose.\n",
+                          env=fallback_env(work, {"TMPDIR": bad_tmp}),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    report("a TMPDIR carrying a newline and a fake outcome: only prefixed lines, one outcome, exit 4",
+           proc.returncode == 4 and only_prefixed(proc.stderr) and outcome_lines(proc.stderr) == failed_no
+           and proc.stderr.decode("utf-8", "replace").splitlines()[-1] == failed_no[0] and proc.stdout == b"",
+           "rc=%s %r" % (proc.returncode, proc.stderr))
+    big = b"Read the source text.\n" * 70000
+    limit = lambda: resource.setrlimit(resource.RLIMIT_FSIZE, (8192, 8192))
+    proc = subprocess.run([RUNNER, "--input", "-"], input=big, env=fallback_env(work),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, preexec_fn=limit, timeout=60)
+    report("a stdin copy stopped by the file size limit: no job status line on stderr",
+           only_prefixed(proc.stderr) and outcome_lines(proc.stderr) == failed_no, proc.stderr)
+    source = os.path.join(work, "input.md")
+    with open(source, "wb") as fh:
+        fh.write(b"Original prose.\n")
+    out = os.path.join(work, "no-such-dir", "out.md")
+    proc = subprocess.run([RUNNER, "--input", source, "--output", out], env=fallback_env(work),
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    report("an output in a missing directory: only prefixed lines, delivery_error, exit 4",
+           proc.returncode == 4 and only_prefixed(proc.stderr) and outcome_lines(proc.stderr) == failed_no,
+           "rc=%s %r" % (proc.returncode, proc.stderr))
+    shutil.rmtree(work, ignore_errors=True)
+
+
+def temp_file_signal_cases():
+    """A group SIGTERM around the creation of each temporary file leaves none behind."""
+    payload = b"Read the source text for the fallback path.\n"
+    boundaries = (("before it is created", '":"*'), ("after it is created, before it is registered", '"rc=\\$?"'))
+    for prefix, label in (("polish-gemini-config.", "the config message file"),
+                          ("polish-gemini-in.", "the stdin copy"),
+                          (".polish-gemini-", "the output file")):
+        for when, pattern in boundaries:
+            work = tempfile.mkdtemp(prefix="polish-runner-tmp-")
+            tmp_dir = os.path.join(work, "tmp")
+            out_dir = os.path.join(work, "out")
+            os.mkdir(tmp_dir)
+            os.mkdir(out_dir)
+            source = os.path.join(work, "input.md")
+            out = os.path.join(out_dir, "out.md")
+            with open(source, "wb") as fh:
+                fh.write(payload)
+            with open(out, "wb") as fh:
+                fh.write(b"old\n")
+            flag = os.path.join(work, "fired")
+            env_file = os.path.join(work, "bash-env.sh")
+            with open(env_file, "w") as fh:
+                fh.write("set -o functrace\n"
+                         "trap 'if [[ ! -e \"%s\" && \"${FUNCNAME[0]:-}\" == make_temp"
+                         " && \"${prefix:-}\" == \"%s\" && \"$BASH_COMMAND\" == %s ]];"
+                         " then : >| \"%s\"; kill -TERM 0; fi' DEBUG\n" % (flag, prefix, pattern, flag))
+            env = fallback_env(work, {"BASH_ENV": env_file, "TMPDIR": tmp_dir})
+            if prefix == "polish-gemini-in.":
+                args, stdin = [RUNNER, "--input", "-"], payload
+            elif prefix == ".polish-gemini-":
+                args, stdin = [RUNNER, "--input", source, "--output", out], None
+            else:
+                args, stdin = [RUNNER, "--input", source], None
+            proc = subprocess.Popen(args, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, start_new_session=True)
+            stdout, err = proc.communicate(input=stdin, timeout=60)
+            fired = os.path.exists(flag)
+            leftovers = [f for f in os.listdir(tmp_dir)] + [f for f in os.listdir(out_dir) if f != "out.md"]
+            with open(out, "rb") as fh:
+                dest = fh.read()
+            shutil.rmtree(work, ignore_errors=True)
+            if prefix == ".polish-gemini-":
+                # Delivery is under way: it finishes, then the signal is reported.
+                expected = [OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"]
+                delivered_ok = dest == payload
+            else:
+                expected = [OUTCOME_PREFIX + "failed reason=interrupted delivered=no"]
+                delivered_ok = stdout == b"" and dest == b"old\n"
+            report("SIGTERM %s for %s: no temporary file left, truthful outcome, exit 143" % (when, label),
+                   fired and proc.returncode == 143 and not leftovers and delivered_ok
+                   and outcome_lines(err) == expected and only_prefixed(err),
+                   "fired=%s rc=%s leftovers=%r %r" % (fired, proc.returncode, leftovers, outcome_lines(err)))
+
+
 def ignored_signal_cases():
     """SIGINT ignored when the run starts (a background job) stays ignored."""
     payload = b"Read the source text.\n" * 50000
@@ -486,6 +580,8 @@ def main():
     blocked_stdout_cases()
     ignored_signal_cases()
     fallback_edge_cases()
+    fallback_stderr_cases()
+    temp_file_signal_cases()
     sys.exit(1 if FAILED else 0)
 
 

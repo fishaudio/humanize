@@ -147,14 +147,14 @@ def check_scripts(src_text, cand_text, where):
 
 CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)
 # Inline math, using the Pandoc rule: "$" opens when followed by a non-space,
-# and closes when preceded by a non-space and not followed by a word
-# character. So "$2 x + y$" is math, while in "$5 or $10" the second "$" is
+# and closes when preceded by a non-space and not followed by a digit. The
+# math may continue over soft line breaks inside one prose unit. So "$2 x + y$" is math, while in "$5 or $10" the second "$" is
 # preceded by a space and cannot close, and the text stays prose. "$$...$$"
 # inside a line is math too; "\(...\)" and "\[...\]" are found by the inline
 # scanner.
 INLINE_MATH_RE = re.compile(
     r"\$\$[^$]*?[^\s$][^$]*?\$\$"
-    r"|(?<![\\$])\$(?=[^\s$])[^$\n]*?(?<=[^\s\\])\$(?!\d)")
+    r"|(?<![\\$])\$(?=[^\s$])[^$]*?(?<=[^\s\\])\$(?!\d)")
 # Text between inline polish:off and polish:on markers, or from a polish:off
 # marker to the end of the unit when the region continues past it.
 INLINE_PROTECTED_RE = re.compile(r"<!--\s*polish:off\s*-->.*?(?:<!--\s*polish:on\s*-->|\Z)", re.S)
@@ -171,28 +171,36 @@ POLISH_OFF_RE = re.compile(r"<!--\s*polish:off\s*-->")
 ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 AUTOLINK_RE = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*|[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>")
-LINK_RE = re.compile(
-    r"(!?)\[((?:\\.|[^\[\]\\]|\[(?:\\.|[^\[\]\\])*\])*)\]"
-    r"\(\s*(<[^<>\n]*>|(?:\\.|[^\s()\\]|\((?:\\.|[^\s()\\])*\))*)"
-    r"(\s+(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\)))?\s*\)")
+# Inline links and images are found by _scan_links, which balances brackets
+# and parentheses to any depth up to this limit.
+LINK_NESTING_LIMIT = 32
 REF_LINK_RE = re.compile(r"(!?)\[((?:\\.|[^\[\]\\])+)\]\[((?:\\.|[^\[\]\\])*)\]")
 FOOTNOTE_REF_RE = re.compile(r"\[\^[^\]\s]+\]")
 # Any other bracketed text may be a shortcut reference link whose label is
 # its text, so it is protected as a whole.
 SHORTCUT_REF_RE = re.compile(r"!?\[(?:\\.|[^\[\]\\])+\](?![(\[])")
+# HTML tags by the CommonMark grammar: a ">" inside a quoted attribute value
+# does not end the tag. A tag that does not fit the grammar falls back to the
+# looser form, which ends at the first ">".
+_HTML_ATTR = (r"\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
+              r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?")
+HTML_OPEN_TAG = r"<[A-Za-z][A-Za-z0-9-]*(?:" + _HTML_ATTR + r")*\s*/?>"
+HTML_CLOSE_TAG = r"</[A-Za-z][A-Za-z0-9-]*\s*>"
 HTML_TAG_RE = re.compile(
-    r"<!--.*?-->|</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>", re.S)
+    r"<!--.*?-->|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
+    + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>", re.S)
 ENTITY_RE = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});")
 URL_RE = re.compile(r"\b(?:https?|ftp|file)://[^\s<>\"'`]+|\bwww\.[^\s<>\"'`]+")
 
 WORD_TOKEN_RE = re.compile(
     r"""
-      (?P<path>(?<![\w./~-])(?:~|\.{1,2})?/?[\w@+.-]+(?:/[\w@+.-]*)+)
+      (?P<path>(?<![\w./~-])(?:(?:~[\w.-]*|\.{1,2})?/[\w@+.-]+(?:/[\w@+.-]*)*
+                                |[\w@+.-]+(?:/[\w@+.-]*)+))
     | (?P<call>[A-Za-z_][\w.]*\(\))
     | (?P<scope>[A-Za-z_]\w*(?:::\w+)+)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
-    | (?P<ident>__\w+__|\w+(?:_\w+)+|(?<!\w)_+[A-Za-z0-9]+(?:_[A-Za-z0-9]+)*(?!\w))
+    | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
     | (?P<qty>(?<![\w.])\d+(?:\.\d+)?
         (?:[ ]?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
                  |months?|years?|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz)
@@ -233,6 +241,130 @@ def _strip_url(url):
     while url.endswith(")") and url.count(")") > url.count("("):
         url = url[:-1].rstrip(".,;:!?'\"")
     return url
+
+
+def _skip_space(text, i):
+    while i < len(text) and text[i] in " \t\n":
+        i += 1
+    return i
+
+
+def _label_end(text, start):
+    """Index of the "]" closing the label opened at ``start``, or -1 (-2 when nested too deep)."""
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch == "[":
+            depth += 1
+            if depth > LINK_NESTING_LIMIT:
+                return -2
+        elif ch == "]":
+            depth -= 1
+            if depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def _link_tail(text, open_paren):
+    """Parse "(destination title)" starting at ``open_paren``.
+
+    Returns (end, target) for a link, (None, False) when the text is not a
+    link, and (None, True) when it is nested beyond LINK_NESTING_LIMIT.
+    """
+    n = len(text)
+    i = _skip_space(text, open_paren + 1)
+    dest_start = i
+    if i < n and text[i] == "<":
+        i += 1
+        while i < n and text[i] not in "<>\n":
+            i += 2 if (text[i] == "\\" and i + 1 < n) else 1
+        if i >= n or text[i] != ">":
+            return None, False
+        i += 1
+    else:
+        depth = 0
+        while i < n:
+            ch = text[i]
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == "(":
+                depth += 1
+                if depth > LINK_NESTING_LIMIT:
+                    return None, True
+            elif ch == ")":
+                if depth == 0:
+                    break
+                depth -= 1
+            elif ch in " \t\n" or ord(ch) < 32:
+                break
+            i += 1
+        if depth:
+            return None, False
+    dest_end = i
+    j = _skip_space(text, i)
+    if j < n and j > dest_end and text[j] in "\"'(":
+        close = ")" if text[j] == "(" else text[j]
+        k = j + 1
+        while k < n and text[k] != close:
+            if text[k] == "\\" and k + 1 < n:
+                k += 2
+                continue
+            if close == ")" and text[k] == "(":
+                return None, False
+            k += 1
+        if k >= n:
+            return None, False
+        j = _skip_space(text, k + 1)
+    if j < n and text[j] == ")":
+        return j + 1, text[dest_start:j].strip()
+    return None, False
+
+
+def _scan_links(text):
+    """Find inline links and images, with balanced brackets and parentheses.
+
+    Returns (links, unmodeled): ``links`` holds (start, label_start, label_end,
+    end, kind, target) tuples, where ``target`` is the destination with its
+    optional title; ``unmodeled`` is True when a link-shaped construct is
+    nested beyond LINK_NESTING_LIMIT.
+    """
+    links = []
+    unmodeled = False
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch != "[":
+            i += 1
+            continue
+        close = _label_end(text, i)
+        if close == -2:
+            unmodeled = True
+            break
+        if close < 0 or close + 1 >= n or text[close + 1] != "(":
+            i += 1
+            continue
+        end, info = _link_tail(text, close + 1)
+        if end is None:
+            if info:
+                unmodeled = True
+                break
+            i += 1
+            continue
+        start = i - 1 if i > 0 and text[i - 1] == "!" else i
+        links.append((start, i + 1, close, end, "image" if start < i else "link", info))
+        i = end
+    return links, unmodeled
 
 
 def _scan_inline(text):
@@ -327,15 +459,12 @@ def extract_tokens(text):
         found.append((m.start(), "autolink", m.group(0)))
         _mask(chars, m.start(), m.end())
 
-    for m in LINK_RE.finditer(current()):
-        kind = "image" if m.group(1) else "link"
-        target = m.group(3) + (m.group(4) or "")
-        found.append((m.start(), kind, target.strip()))
+    links, _ = _scan_links(current())
+    for start, label_start, label_end, end, kind, target in links:
+        found.append((start, kind, target))
         # Keep the link text editable; mask the syntax and the target.
-        text_start = m.start(2)
-        text_end = m.end(2)
-        _mask(chars, m.start(), text_start)
-        _mask(chars, text_end, m.end())
+        _mask(chars, start, label_start)
+        _mask(chars, label_end, end)
 
     for m in REF_LINK_RE.finditer(current()):
         kind = "reflink"
@@ -407,8 +536,12 @@ def extract_tokens(text):
     # Link destinations, autolinks and URLs are read again from the original
     # text: code-span, math or escape syntax inside a destination is part of
     # the destination, so masking it above must not leave the rest editable.
-    for m in LINK_RE.finditer(text):
-        found.append((m.start(), "dest", (m.group(3) + (m.group(4) or "")).strip()))
+    links, unmodeled = _scan_links(text)
+    for start, _, _, _, _, target in links:
+        found.append((start, "dest", target))
+    if unmodeled:
+        # A link nested beyond the scanner's limit: the whole unit is frozen.
+        found.append((0, "frozen", text))
     for m in AUTOLINK_RE.finditer(text):
         found.append((m.start(), "dest", m.group(0)))
     for m in URL_RE.finditer(text):
@@ -519,7 +652,18 @@ LIST_ITEM_RE = re.compile(
     r"(?P<task>\[[ xX]\](?:[ \t]+|$))?(?P<rest>.*)$")
 TABLE_SEP_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{1,}:?[ \t]*(?:\|[ \t]*:?-{1,}:?[ \t]*)*\|?[ \t]*$")
 FOOTNOTE_DEF_RE = re.compile(r"^[ ]{0,3}\[\^[^\]]+\]:")
-REFDEF_RE = re.compile(r"^[ ]{0,3}\[[^\]^][^\]]*\]:[ \t]*\S")
+# The start of a link reference definition: a label and a colon. The
+# destination may be on the next line.
+REFDEF_RE = re.compile(r"^[ ]{0,3}\[[^\]^][^\]]*\]:")
+# A complete definition: label, colon, destination (on the same or the next
+# line) and an optional title, which may start on the next line and continue
+# over several lines. It must end at the end of a line.
+REFDEF_FULL_RE = re.compile(
+    r"[ ]{0,3}\[(?:\\.|[^\[\]\\])+\]:[ \t]*\n?[ \t]*"
+    r"(?:<(?:\\.|[^<>\n\\])*>|(?!<)(?:\\.|[^\s()\\]|\((?:\\.|[^\s()\\])*\))+)"
+    r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
+    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\)))?"
+    r"[ \t]*(?:\n|$)")
 HTML_BLOCK_TAGS = (
     "address|article|aside|blockquote|body|caption|center|col|colgroup|dd|details|dialog|"
     "dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|"
@@ -531,7 +675,9 @@ HTML_BLOCK_RE = re.compile(
     re.I)
 HTML_TYPE1_RE = re.compile(r"<(?:script|pre|style|textarea)(?:\s|>|$)", re.I)
 HTML_TYPE1_END_RE = re.compile(r"</(?:script|pre|style|textarea)\s*>", re.I)
-HTML_LINE_TAG_RE = re.compile(r"^[ ]{0,3}</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>[ \t]*$")
+HTML_LINE_TAG_RE = re.compile(
+    r"^[ ]{0,3}(?:" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
+    + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>)[ \t]*$")
 
 
 class Block(object):
@@ -701,7 +847,9 @@ def parse_blocks(text):
     item. The rest of the marker line is then read again as the first line of
     the item's content, so headings, code, HTML, quotes, definitions and
     nested items that start on a marker line are classified like any other
-    block, with ``container`` giving the number of enclosing list items.
+    block. ``container`` gives the open list items at each blockquote level,
+    outermost first, so a list that encloses a quote is still part of the
+    ancestry of every block inside and after that quote.
     """
     lines = text.split("\n")
     n = len(lines)
@@ -716,20 +864,21 @@ def parse_blocks(text):
                 i = j + 1
                 break
 
-    # Open list items as (marker_indent, content_column), tracked within one
-    # blockquote depth. A block belongs to every open item whose content
-    # column it reaches.
-    list_stack = []
-    stack_quote = [0]
+    # Open list items per blockquote level, as (marker_indent, content_column)
+    # measured in that level's text. A block belongs to every open item at its
+    # own level whose content column it reaches. Entering a deeper quote keeps
+    # the lists that enclose it; leaving a quote closes what was opened inside.
+    level_stacks = [[]]
 
     def containers(quote, indent):
-        if quote != stack_quote[0]:
-            del list_stack[:]
-            stack_quote[0] = quote
-        while list_stack and indent < list_stack[-1][1]:
-            list_stack.pop()
-        base = list_stack[-1][1] if list_stack else 0
-        return len(list_stack), base
+        del level_stacks[quote + 1:]
+        while len(level_stacks) <= quote:
+            level_stacks.append([])
+        stack = level_stacks[quote]
+        while stack and indent < stack[-1][1]:
+            stack.pop()
+        base = stack[-1][1] if stack else 0
+        return len(stack), base, tuple(len(level) for level in level_stacks)
 
     while i < n:
         line = lines[i]
@@ -740,14 +889,14 @@ def parse_blocks(text):
         start_line = i + 1
         ebody = _expand_indent(body)
         indent = len(ebody) - len(ebody.lstrip(" "))
-        depth, base = containers(quote, indent)
+        depth, base, ancestry = containers(quote, indent)
         cbody = ebody[base:] if indent >= base else ebody.lstrip(" ")
         # Column of the first quote marker, so a quote moved into or out of a
         # list item is visible.
         qcol = (len(line) - len(line.lstrip(" "))) if quote else 0
 
         def attrs(**extra):
-            out = {"quote": quote, "qcol": qcol, "container": depth}
+            out = {"quote": quote, "qcol": qcol, "container": ancestry}
             out.update(extra)
             return out
 
@@ -866,20 +1015,28 @@ def parse_blocks(text):
             continue
 
         if REFDEF_RE.match(cbody):
-            # A title may continue on the following lines.
-            j = i
-            while j + 1 < n:
-                nq, _ = _quote_depth(lines[j + 1])
-                nb = _strip_quote(lines[j + 1], quote)
-                if nq != quote or not nb.strip():
+            # The definition's lines up to the next blank line, with quote and
+            # container prefixes removed.
+            parts = [cbody]
+            k = i + 1
+            while k < n:
+                kq, _ = _quote_depth(lines[k])
+                kb = _strip_quote(lines[k], quote)
+                if kq != quote or not kb.strip():
                     break
-                nbc = _past_container(nb, base)
-                if REFDEF_RE.match(nbc) or FOOTNOTE_DEF_RE.match(nbc):
-                    break
-                if nbc[:1] in (" ", "\t") or nbc.lstrip()[:1] in ("\"", "'", "("):
+                parts.append(_past_container(kb, base))
+                k += 1
+            joined = "\n".join(parts)
+            dm = REFDEF_FULL_RE.match(joined)
+            if dm:
+                j = i + joined[:dm.end()].rstrip("\n").count("\n")
+            else:
+                # Not a definition this parser can model: keep its lines byte
+                # for byte up to the next blank line or the next definition.
+                j = i
+                while (j + 1 < k and not REFDEF_RE.match(parts[j + 1 - i])
+                       and not FOOTNOTE_DEF_RE.match(parts[j + 1 - i])):
                     j += 1
-                    continue
-                break
             blocks.append(Block("refdef", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
             i = j + 1
             continue
@@ -936,11 +1093,12 @@ def parse_blocks(text):
             # loose). Recorded for every item, so adding or removing one is
             # visible however the previous block is nested.
             blank_before = bool(blocks and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
-            list_stack.append((indent, content_col))
+            level_stacks[quote].append((indent, content_col))
             blocks.append(Block("list_item", {
                 "quote": quote,
                 "qcol": qcol,
                 "depth": depth,
+                "container": ancestry,
                 "ordered": marker[-1] in ".)",
                 "marker": marker,
                 "task": task.strip().lower() if task else "",
@@ -1393,12 +1551,14 @@ def _analyze_html(source):
                     "self-closing <%s/> on a non-void element near offset %d" % (lowered, off))
             attr_sig = []
             regex_attrs = []
-            # Attribute eligibility does not depend on the text context: the
-            # body element's own attributes count, and so do unquoted values.
+            # Attribute eligibility does not depend on where text nodes are
+            # eligible: the eligible attributes count on any element that is
+            # not excluded or inside an excluded element or a polish:off
+            # region, including <html>, <body> and elements in <head>.
+            # Unquoted values count too.
             tag_eligible = (not excluded and not state["protected"]
                             and lowered not in EXCLUDED_ELEMENTS
-                            and not state["title"]
-                            and (lowered == "body" or eligible_context()))
+                            and not state["title"])
             raw_tag = payload or ""
             name_match = re.match(r"<[^\s/>]+", raw_tag)
             pos = name_match.end() if name_match else 0

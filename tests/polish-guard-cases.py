@@ -540,8 +540,32 @@ _, excl_segs = g.html_extract('<body><code title="Not eligible">x</code><pre><ab
                               '<p title=Shown>Text.</p></body>')
 report("HTML attributes under excluded elements are not extracted",
        excl_segs == "[[s1]] Shown\n[[s2]] Text.", excl_segs)
-_, head_segs = g.html_extract('<html><head><link rel="alternate" title="Feed"></head><body><p>Hi there.</p></body></html>')
-report("HTML attributes in head are not extracted", head_segs == "[[s1]] Hi there.", head_segs)
+# AC-7: eligible attributes count on any element that is not excluded,
+# including <html> and elements in <head>; only text nodes are limited to
+# <body> and <title>.
+SCOPE_PAGE = ('<html title="Page title"><head><link rel="alternate" title="Feed title"></head>'
+              '<body><p>Visible text.</p></body></html>')
+scope_spans, scope_segs = g.html_extract(SCOPE_PAGE)
+report("HTML attributes on <html> and in <head> are extracted",
+       scope_segs == "[[s1]] Page title\n[[s2]] Feed title\n[[s3]] Visible text.", scope_segs)
+scope_out = g.html_splice(SCOPE_PAGE, scope_spans, ["Title of the page", "Title of the feed", "Text you can see."])
+try:
+    g.html_verify(SCOPE_PAGE, scope_out)
+    scope_ok = scope_out == ('<html title="Title of the page"><head><link rel="alternate" title="Title of the feed">'
+                             '</head><body><p>Text you can see.</p></body></html>')
+except g.GuardReject as exc:
+    scope_ok = False
+    scope_out = exc.reason
+report("HTML attributes outside the body splice back and verify", scope_ok, scope_out)
+_, head_excl = g.html_extract('<html><head><script title="x">var a;</script><style title="y">p{}</style>'
+                              '<meta name="d" content="c"><noscript><img alt="No"></noscript></head>'
+                              '<body><code title="Code">x</code><p>Hi there.</p></body></html>')
+report("HTML attributes on or inside excluded elements in <head> stay excluded",
+       head_excl == "[[s1]] Hi there.", head_excl)
+_, head_off = g.html_extract('<html><head><!-- polish:off --><link title="Keep"><!-- polish:on -->'
+                             '<link title="Feed"></head><body><p>Hi.</p></body></html>')
+report("HTML attributes in a polish:off region in <head> stay excluded",
+       head_off == "[[s1]] Feed\n[[s2]] Hi.", head_off)
 
 # Round 1 re-review follow-ups.
 rejects("a tab inside inline code changed to spaces", "Use `a\tb` carefully.\n", "Use `a  b` carefully.\n",
@@ -641,5 +665,139 @@ accepts("a marker inside indented code is just text", "    <!-- polish:off -->\n
 accepts("a marker inside a fence behind two list markers is just text",
         "- - ```html\n    <!-- polish:off -->\n    ```\n\nRead carefully.\n",
         "- - ```html\n    <!-- polish:off -->\n    ```\n\nRead with care.\n")
+
+# Round 2: list ancestry across blockquotes (a list item that contains a quote
+# still contains the blocks after it).
+for name, src, cand in [
+        ("nested item after a quoted item flattened", "- > Quoted message.\n  - Child item.\n",
+         "- > Quoted message.\n- Child item.\n"),
+        ("paragraph after a quoted item moved out of the item", "- > Quoted message.\n\n  Following paragraph.\n",
+         "- > Quoted message.\n\nFollowing paragraph.\n"),
+        ("heading after a quoted item moved out of the item", "- > Quoted message.\n\n  # Heading\n",
+         "- > Quoted message.\n\n# Heading\n"),
+        ("nested item after a quoted item inside a quote flattened", "> - > Quoted message.\n>   - Child item.\n",
+         "> - > Quoted message.\n> - Child item.\n"),
+        ("ordered nested item after a quoted item flattened", "1. > Quoted message.\n   1. Child item.\n",
+         "1. > Quoted message.\n1. Child item.\n"),
+        ("nested item after a blank line and a quoted item flattened", "- > Quoted message.\n\n  - Child item.\n",
+         "- > Quoted message.\n\n- Child item.\n"),
+        ("grandchild after a quoted child flattened", "- Parent.\n  - > Quoted.\n    - Grandchild.\n",
+         "- Parent.\n  - > Quoted.\n  - Grandchild.\n")]:
+    rejects(name, src, cand, "structure")
+accepts("prose rewrites inside a quoted item and its child", "- > Quoted message here.\n  - Child item here.\n",
+        "- > Quoted message is here.\n  - Child item is here.\n")
+accepts("prose rewrite of a paragraph that stays in the quoted item",
+        "- > Quoted message.\n\n  Following paragraph here.\n", "- > Quoted message.\n\n  The following paragraph here.\n")
+accepts("prose rewrite of a nested item inside a quote", "> - > Quoted message.\n>   - Child item here.\n",
+        "> - > Quoted message.\n>   - The child item here.\n")
+accepts("prose rewrites around a quote after a list", "- Item one.\n\n> A note after the list.\n\nNext paragraph here.\n",
+        "- Item one.\n\n> A note that follows the list.\n\nThe next paragraph here.\n")
+
+# Round 2: balanced link destinations.
+for name, src, cand in [
+        ("two-level destination changed", "Read [guide](folder(alpha(beta))tail) carefully.\n",
+         "Read [guide](folder(alpha(beta))evil) carefully.\n"),
+        ("two-level image destination changed", "See ![photo](folder(alpha(beta))tail) carefully.\n",
+         "See ![photo](folder(alpha(beta))evil) carefully.\n"),
+        ("three-level destination changed", "Read [guide](a(b(c(d)))e) carefully.\n",
+         "Read [guide](a(b(c(d)))f) carefully.\n"),
+        ("destination with escaped parentheses changed", "Read [guide](a\\(b\\)c) carefully.\n",
+         "Read [guide](a\\(b\\)d) carefully.\n"),
+        ("title with parentheses changed", "Read [guide](/x \"Old (title)\") carefully.\n",
+         "Read [guide](/x \"New (title)\") carefully.\n"),
+        ("nested-destination link turned into text", "Read [guide](folder(alpha(beta))tail) carefully.\n",
+         "Read guide carefully.\n")]:
+    rejects(name, src, cand)
+accepts("label of a two-level destination link reworded", "Read [the guide](folder(alpha(beta))tail) carefully.\n",
+        "Read [the full guide](folder(alpha(beta))tail) with care.\n")
+accepts("alt text of a nested-destination image reworded", "See ![a photo](a(b(c))d) here today.\n",
+        "See ![the photo](a(b(c))d) here now.\n")
+try:
+    g.check_segments("[[s1]] Read [guide](folder(alpha(beta))tail) carefully.",
+                     "[[s1]] Read [guide](folder(alpha(beta))evil) carefully.")
+    report("segments: two-level destination changed", False, "accepted")
+except g.GuardReject as exc:
+    report("segments: two-level destination changed", True, exc.reason)
+DEEP = "Read [x](" + "(" * 40 + "a" + ")" * 40 + ") now.\n"
+rejects("a link nested beyond the scanner limit freezes its block", DEEP, DEEP.replace("now", "today"))
+accepts("a link nested beyond the scanner limit is accepted unchanged", DEEP, DEEP)
+
+# Round 2: quote-aware HTML tags.
+for name, src, cand in [
+        ("quoted > in an inline tag attribute changed", "Read <span title=\"a > old\">the guide</span> carefully.\n",
+         "Read <span title=\"a > new\">the guide</span> carefully.\n"),
+        ("single-quoted > in an inline tag attribute changed", "Read <span title='a > old'>the guide</span> carefully.\n",
+         "Read <span title='a > new'>the guide</span> carefully.\n"),
+        ("multi-line inline tag attribute changed", "Read <span\n  title=\"a > old\">the guide</span> carefully.\n",
+         "Read <span\n  title=\"a > new\">the guide</span> carefully.\n"),
+        ("HTML block after a custom tag with a quoted > changed", "<custom title=\"a > b\">\nKeep text.\n\nRead more.\n",
+         "<custom title=\"a > b\">\nEdit text.\n\nRead more.\n"),
+        ("HTML block after a hyphenated tag with a single-quoted > changed",
+         "<custom-el data-x='a > b'>\nKeep text.\n\nRead more.\n",
+         "<custom-el data-x='a > b'>\nEdit text.\n\nRead more.\n")]:
+    rejects(name, src, cand)
+accepts("text around a tag with a quoted > reworded", "Read <span title=\"a > old\">the guide</span> carefully.\n",
+        "Read <span title=\"a > old\">the full guide</span> with care.\n")
+accepts("paragraph after a custom HTML block reworded", "<custom title=\"a > b\">\nKeep text.\n\nRead more of it.\n",
+        "<custom title=\"a > b\">\nKeep text.\n\nRead more of this.\n")
+accepts("comparison signs in prose stay prose", "If a < b and c > d holds, stop.\n",
+        "If a < b and c > d holds, then stop.\n")
+
+# Round 2: reference definitions across lines.
+for name, src, cand in [
+        ("destination on the line after the label changed", "[ref]:\n  /old \"Title\"\n\nRead [ref].\n",
+         "[ref]:\n  /new \"Title\"\n\nRead [ref].\n"),
+        ("title on the line after the label changed", "[ref]:\n  /guide \"Old title\"\n\nRead [ref].\n",
+         "[ref]:\n  /guide \"New title\"\n\nRead [ref].\n"),
+        ("unindented title continuation changed", "[ref]: /guide \"Old\ntitle here\"\n\nRead [ref].\n",
+         "[ref]: /guide \"Old\nother text\"\n\nRead [ref].\n"),
+        ("title on its own unindented line changed", "[ref]: /guide\n\"Old title\"\n\nRead [ref].\n",
+         "[ref]: /guide\n\"New title\"\n\nRead [ref].\n"),
+        ("definition inside a quote changed", "> [ref]:\n> /old \"Title\"\n", "> [ref]:\n> /new \"Title\"\n"),
+        ("definition inside a list item changed", "- [ref]:\n  /old \"Title\"\n", "- [ref]:\n  /new \"Title\"\n")]:
+    rejects(name, src, cand, "region_changed")
+accepts("prose after a multi-line definition reworded", "[ref]:\n  /old \"Title\"\n\nRead [ref] for the details.\n",
+        "[ref]:\n  /old \"Title\"\n\nRead [ref] for more details.\n")
+accepts("paragraph right after a definition stays editable",
+        "[ref]: /guide \"Old\ntitle here\"\nThe paragraph after it goes on.\n",
+        "[ref]: /guide \"Old\ntitle here\"\nThe paragraph after it continues.\n")
+
+# Round 2: single-dollar math across lines, paths and identifiers.
+rejects("operator in single-dollar math across lines changed", "Use $x +\ny$ carefully.\n", "Use $x -\ny$ carefully.\n",
+        "protected_token")
+rejects("continuation whitespace in single-dollar math changed", "Use $x +\n  y$ carefully.\n",
+        "Use $x +\ny$ carefully.\n", "protected_token")
+accepts("prose around unchanged single-dollar math across lines reworded", "Use $x +\ny$ carefully in the end.\n",
+        "Use $x +\ny$ with care in the end.\n")
+accepts("prices on different lines stay prose", "It costs $5 a month, and\nthe big plan costs $10 a month.\n",
+        "It costs $5 a month, while\nthe big plan costs $10 a month.\n")
+for name, src, cand in [
+        ("rooted path changed", "Read /etc carefully.\n", "Read /var carefully.\n"),
+        ("home-relative path changed", "Use ~/file today.\n", "Use ~/other today.\n"),
+        ("identifier with a trailing underscore changed", "Run tool_ here.\n", "Run other_ here.\n"),
+        ("multi-component rooted path changed", "Read /etc/hosts carefully.\n", "Read /etc/passwd carefully.\n"),
+        ("multi-component home path changed", "Use ~/a/b today.\n", "Use ~/a/c today.\n"),
+        ("relative script path changed", "Open ./run.sh now.\n", "Open ./go.sh now.\n"),
+        ("identifier with two trailing underscores changed", "Set x__ there.\n", "Set y__ there.\n")]:
+    rejects(name, src, cand, "protected_token")
+for name, src, cand in [
+        ("prose around a rooted path reworded", "Read /etc carefully now.\n", "Read /etc with care now.\n"),
+        ("prose around a home path reworded", "Use ~/file today please.\n", "Use ~/file today, please.\n"),
+        ("prose around a trailing-underscore identifier reworded", "Run tool_ here and now.\n",
+         "Run tool_ right here and now.\n"),
+        ("underscore emphasis reworded", "This is _really_ important to know.\n", "This is _truly_ important to know.\n"),
+        ("and/or stays prose", "Read it and/or skim it today.\n", "Read it and/or skim it now.\n"),
+        ("a tilde before a number stays prose", "It takes ~5 minutes to finish.\n",
+         "It takes about ~5 minutes to finish.\n")]:
+    accepts(name, src, cand)
+for name, src, cand in [
+        ("segments: rooted path changed", "[[a]] Read /etc carefully.", "[[a]] Read /var carefully."),
+        ("segments: home path changed", "[[a]] Use ~/file today.", "[[a]] Use ~/other today."),
+        ("segments: trailing-underscore identifier changed", "[[a]] Run tool_ here.", "[[a]] Run other_ here.")]:
+    try:
+        g.check_segments(src, cand)
+        report(name, False, "accepted")
+    except g.GuardReject as exc:
+        report(name, exc.reason == "protected_token", exc.reason)
 
 sys.exit(1 if FAILED else 0)

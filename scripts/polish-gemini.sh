@@ -35,6 +35,19 @@
 # No "set -e": every failure path must still print the outcome line.
 set -uo pipefail
 
+# Every line this script writes to stderr goes through diag or emit_outcome,
+# which write to file descriptor 9, a copy of the caller's stderr. Anything
+# else on stderr (a utility's error message, a job status line from bash) goes
+# to /dev/null, so it can neither break the one-line format nor fake an
+# outcome line. The Python helper gets the caller's stderr back before exec.
+if ! exec 9>&2; then
+    exec 9>/dev/null
+fi
+exec 2>/dev/null
+OUT_FD=9
+# The caller's umask, read once, for files created later.
+ORIG_UMASK="$(umask)"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
@@ -61,7 +74,7 @@ diag() {
     case "$msg" in
         outcome=*) msg="note: $msg" ;;
     esac
-    printf 'polish-gemini: %s\n' "$msg" >&2
+    printf 'polish-gemini: %s\n' "$msg" >&"$OUT_FD"
 }
 
 OUTCOME_EMITTED=false
@@ -75,7 +88,7 @@ emit_outcome() {
     if [[ "$OUTCOME_EMITTED" == "true" ]]; then
         return 0
     fi
-    printf 'polish-gemini: outcome=%s reason=%s delivered=%s\n' "$1" "$2" "$3" >&2
+    printf 'polish-gemini: outcome=%s reason=%s delivered=%s\n' "$1" "$2" "$3" >&"$OUT_FD"
     OUTCOME_EMITTED=true
 }
 
@@ -160,6 +173,45 @@ shielded() {
         fi
         return "$status"
     done
+}
+
+# make_temp DIR PREFIX: create a new empty file, readable only by the user,
+# with a unique name in DIR, register it for cleanup, and set TEMP_PATH.
+# The shell creates the file itself (noclobber, so an existing name is never
+# reused), with no child process that a signal could stop between creating
+# the file and reporting its name. Signals are only recorded until the path
+# is registered, so an interruption cannot leave the file behind; a signal
+# recorded here is honored right after, unless delivery is already under way.
+# Returns 1 when no file can be created in DIR.
+make_temp() {
+    local dir="$1" prefix="$2" name attempt rc deferred="$IN_DELIVERY"
+    TEMP_PATH=""
+    IN_DELIVERY=true
+    for attempt in 1 2 3 4 5 6 7 8; do
+        name="$dir/$prefix$$.$RANDOM$RANDOM"
+        if [[ -e "$name" || -L "$name" ]]; then
+            continue
+        fi
+        umask 077
+        set -C
+        { : > "$name"; } 2>/dev/null
+        rc=$?
+        set +C
+        umask "$ORIG_UMASK"
+        if (( rc == 0 )) && [[ -f "$name" && ! -L "$name" ]]; then
+            TEMP_FILES+=("$name")
+            TEMP_PATH="$name"
+            break
+        fi
+        if [[ ! -e "$name" && ! -L "$name" ]]; then
+            break
+        fi
+    done
+    IN_DELIVERY="$deferred"
+    if [[ "$deferred" != "true" && -n "$PENDING_SIGNAL" ]]; then
+        on_signal "$PENDING_SIGNAL"
+    fi
+    [[ -n "$TEMP_PATH" ]]
 }
 
 usage_error() {
@@ -348,9 +400,9 @@ PROJECT_ROOT="$(resolve_project_root 2>/dev/null)" || PROJECT_ROOT=""
 
 CONFIG_OK=false
 MERGED_CONFIG=""
-CONFIG_ERR_FILE="$(mktemp "${TMPDIR:-/tmp}/polish-gemini-config.XXXXXX" 2>/dev/null)" || CONFIG_ERR_FILE=""
-if [[ -n "$CONFIG_ERR_FILE" ]]; then
-    TEMP_FILES+=("$CONFIG_ERR_FILE")
+CONFIG_ERR_FILE=""
+if make_temp "${TMPDIR:-/tmp}" "polish-gemini-config."; then
+    CONFIG_ERR_FILE="$TEMP_PATH"
 fi
 CONFIG_ERR_SINK="${CONFIG_ERR_FILE:-/dev/null}"
 
@@ -464,15 +516,16 @@ file_mode() {
 deliver_original() {
     local reason="$1"
     local src="$INPUT"
-    local tmp_out="" mode="" same_file=false
+    local tmp_out="" mode="" same_file=false out_dir
 
     if [[ "$INPUT" == "-" ]]; then
-        src="$(mktemp "${TMPDIR:-/tmp}/polish-gemini-in.XXXXXX")" || {
+        if ! make_temp "${TMPDIR:-/tmp}" "polish-gemini-in."; then
+            diag "could not create a temporary file for standard input"
             cleanup_temps
             emit_outcome failed delivery_error no
             exit "${PENDING_SIGNAL:-4}"
-        }
-        TEMP_FILES+=("$src")
+        fi
+        src="$TEMP_PATH"
         if ! cat > "$src"; then
             diag "could not copy standard input to a temporary file"
             cleanup_temps
@@ -490,8 +543,7 @@ deliver_original() {
         elif [[ -e "$OUTPUT" ]]; then
             mode="$(file_mode "$OUTPUT")"
         else
-            mode="$(umask)"
-            mode="$(printf '%o' $(( 0666 & ~0$mode )))"
+            mode="$(printf '%o' $(( 0666 & ~0$ORIG_UMASK )))"
         fi
         if [[ "$same_file" != "true" ]] && ! [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
             diag "could not read the file mode for $OUTPUT"
@@ -505,11 +557,17 @@ deliver_original() {
     # nothing delivered. From here on, signals wait until delivery is done.
     IN_DELIVERY=true
     if [[ -n "$OUTPUT" && "$same_file" != "true" ]]; then
-        if [[ -d "$OUTPUT" ]] || ! tmp_out="$(mktemp "$(dirname "$OUTPUT")/.polish-gemini-XXXXXX" 2>/dev/null)"; then
+        out_dir="${OUTPUT%/*}"
+        if [[ "$out_dir" == "$OUTPUT" ]]; then
+            out_dir="."
+        elif [[ -z "$out_dir" ]]; then
+            out_dir="/"
+        fi
+        if [[ -d "$OUTPUT" ]] || ! make_temp "$out_dir" ".polish-gemini-"; then
             diag "could not write $OUTPUT"
             finish_delivery failed delivery_error no 4
         fi
-        TEMP_FILES+=("$tmp_out")
+        tmp_out="$TEMP_PATH"
         if ! shielded cat "$src" > "$tmp_out" || ! shielded chmod "$mode" "$tmp_out"; then
             diag "could not write $OUTPUT"
             finish_delivery failed delivery_error no 4
@@ -568,6 +626,10 @@ PY_ARGS=(
 [[ "$STRICT" == "true" ]] && PY_ARGS+=(--strict)
 
 cleanup_temps
-# exec resets the traps; Python installs its own handlers. A signal before the
-# exec still ends the run through on_signal with one outcome line.
+# Give the Python helper the caller's stderr. exec resets the traps; Python
+# installs its own handlers. A signal before the exec still ends the run
+# through on_signal with one outcome line.
+exec 2>&9
+OUT_FD=2
+exec 9>&-
 exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"
