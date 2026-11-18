@@ -800,4 +800,84 @@ for name, src, cand in [
     except g.GuardReject as exc:
         report(name, exc.reason == "protected_token", exc.reason)
 
+# Round 2 re-review: nested quotes keep their columns inside list items.
+for name, src, cand in [
+        ("quote inside an ordered item in a quote moved out", "> 1. Parent.\n>    > Quoted text.\n",
+         "> 1. Parent.\n> > Quoted text.\n"),
+        ("quote inside a bullet item in a quote moved out", "> - Parent.\n>   > Quoted text.\n",
+         "> - Parent.\n> > Quoted text.\n"),
+        ("quote inside a nested item moved to the outer item", "- Parent.\n  - Child.\n    > Quoted text.\n",
+         "- Parent.\n  - Child.\n  > Quoted text.\n"),
+        ("quote opened on an ordered marker line moved out", "> 1.  > Quoted text.\n>     > More text.\n",
+         "> 1.  > Quoted text.\n> > More text.\n")]:
+    rejects(name, src, cand, "structure")
+accepts("prose in a quote inside an ordered item in a quote reworded", "> 1. Parent.\n>    > Quoted text.\n",
+        "> 1. Parent.\n>    > Quoted words.\n")
+accepts("paragraph after a sibling quote at the item column reworded",
+        "- Parent.\n\n> Quote.\n\n  Read the useful guide.\n", "- Parent.\n\n> Quote.\n\n  Read the helpful guide.\n")
+accepts("quote after a list at column zero reworded", "- Item one.\n\n> Quoted text here.\n",
+        "- Item one.\n\n> Quoted words here.\n")
+
+# Round 2 re-review: links and images inside link labels.
+for name, src, cand in [
+        ("image destination inside a link changed", "Read [![photo](old)](folder(alpha(beta))tail) carefully.\n",
+         "Read [![photo](new)](folder(alpha(beta))tail) carefully.\n"),
+        ("image destination inside a plain link changed", "Read [![photo](old.png)](page) now.\n",
+         "Read [![photo](new.png)](page) now.\n"),
+        ("image title inside a link changed", "Read [![photo](a.png \"Old\")](page) now.\n",
+         "Read [![photo](a.png \"New\")](page) now.\n"),
+        ("outer destination around an image changed", "Read [![photo](a.png)](old) now.\n",
+         "Read [![photo](a.png)](new) now.\n")]:
+    rejects(name, src, cand, "inline_markup")
+accepts("prose around an image inside a link reworded", "Read [![photo](a.png)](page) carefully.\n",
+        "Read [![photo](a.png)](page) with care.\n")
+
+# Round 2 re-review: reference definition labels with escapes or line breaks.
+for name, src, cand in [
+        ("definition with an escaped bracket in its label: title changed",
+         "[a\\]b]: old \"Old title\"\n\nRead [a\\]b].\n", "[a\\]b]: old \"New title\"\n\nRead [a\\]b].\n"),
+        ("definition with an escaped bracket in its label: destination changed",
+         "[a\\]b]: old\n\nRead [a\\]b].\n", "[a\\]b]: new\n\nRead [a\\]b].\n"),
+        ("definition with a label over two lines: destination changed",
+         "[a\nb]: old \"Title\"\n\nRead [a b].\n", "[a\nb]: new \"Title\"\n\nRead [a b].\n"),
+        ("definition with a label over two lines: title changed",
+         "[a\nb]: /x \"Old\"\n\nRead [a b].\n", "[a\nb]: /x \"New\"\n\nRead [a b].\n")]:
+    rejects(name, src, cand, "region_changed")
+accepts("a bracketed sentence that is not a definition stays prose", "[Note] This is the useful part.\n",
+        "[Note] This is the helpful part.\n")
+accepts("a bracket over two lines that is not a definition stays prose",
+        "[a\nb] is the useful part.\n", "[a\nb] is the helpful part.\n")
+
+# Round 2 re-review: math or code characters inside tag attributes.
+for name, src, cand in [
+        ("quoted > after dollar signs in attributes changed",
+         "Read <span title=\"$a\" data-x='$b > old'>the guide</span>.\n",
+         "Read <span title=\"$a\" data-x='$b > new'>the guide</span>.\n"),
+        ("backtick in an attribute value changed", "Read <span title=\"`a\" data-x='b > old`'>the guide</span>.\n",
+         "Read <span title=\"`a\" data-x='b > new`'>the guide</span>.\n")]:
+    rejects(name, src, cand, "inline_markup")
+accepts("prose around a tag with dollar signs in attributes reworded",
+        "Read <span title=\"$a\">the guide</span> carefully.\n", "Read <span title=\"$a\">the guide</span> with care.\n")
+
+# Round 2 re-review: emphasis markers keep their opening and closing sides.
+for name, src, cand in [
+        ("emphasis turned into literal asterisks", "Read *useful* words today.\n", "Read * useful * words today.\n"),
+        ("strong emphasis turned into literal asterisks", "Read **useful** words.\n", "Read ** useful ** words.\n"),
+        ("underscore emphasis turned into literal underscores", "Read _useful_ words.\n", "Read _ useful _ words.\n"),
+        ("strikethrough turned into literal tildes", "Old ~~text~~ here.\n", "Old ~~ text ~~ here.\n"),
+        ("emphasis around a link removed", "Read *[guide](x)* today.\n", "Read [guide](x) today.\n"),
+        ("strong emphasis made regular", "Read **useful** words.\n", "Read *useful* words.\n")]:
+    rejects(name, src, cand, "inline_markup")
+for name, src, cand in [
+        ("emphasis moved with its words", "Read *useful* words today.\n", "Today, read *helpful* words.\n"),
+        ("emphasis inside parentheses", "Read *useful* words.\n", "Read words (*useful* ones).\n"),
+        ("underscore emphasis reworded around", "Read _useful_ words.\n", "Read _helpful_ words now.\n"),
+        ("an underscore inside a word stays text", "Use snake_case names.\n", "Prefer snake_case names.\n")]:
+    accepts(name, src, cand)
+try:
+    g.check_segments("[[a]] Read *useful* words.", "[[a]] Read * useful * words.")
+    report("segments: emphasis turned into literal asterisks", False, "accepted")
+except g.GuardReject as exc:
+    report("segments: emphasis turned into literal asterisks", exc.reason == "inline_markup", exc.reason)
+
 sys.exit(1 if FAILED else 0)

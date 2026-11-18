@@ -536,6 +536,108 @@ def temp_file_signal_cases():
                    "fired=%s rc=%s leftovers=%r %r" % (fired, proc.returncode, leftovers, outcome_lines(err)))
 
 
+def shell_step_cases():
+    """Delivery steps run once, cleanup survives a group signal, and a failed
+    exec of Python still delivers the original."""
+    payload = b"Read the source text for the fallback path.\n"
+    path = os.environ["PATH"]
+
+    # A step whose command writes and then exits with 143 is a failure, never
+    # run a second time.
+    for target in ("stdout", "file"):
+        work = tempfile.mkdtemp(prefix="polish-runner-step-")
+        source = os.path.join(work, "input.md")
+        out = os.path.join(work, "out.md")
+        with open(source, "wb") as fh:
+            fh.write(payload)
+        with open(out, "wb") as fh:
+            fh.write(b"old\n")
+        shim = os.path.join(work, "bin")
+        os.mkdir(shim)
+        flag = os.path.join(work, "cat.flag")
+        write_script(os.path.join(shim, "cat"),
+                     "#!/bin/bash\nif [[ ! -e '%s' ]]; then : > '%s'; '%s' \"$@\"; exit 143; fi\n"
+                     "exec '%s' \"$@\"\n" % (flag, flag, shutil.which("cat"), shutil.which("cat")))
+        args = [RUNNER, "--input", source] + (["--output", out] if target == "file" else [])
+        proc = subprocess.run(args, env=fallback_env(work, {"PATH": shim + os.pathsep + path}),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        with open(out, "rb") as fh:
+            dest = fh.read()
+        leftovers = [f for f in os.listdir(work) if f.startswith(".polish-gemini-")]
+        shutil.rmtree(work, ignore_errors=True)
+        if target == "stdout":
+            written_once = proc.stdout == payload
+        else:
+            written_once = proc.stdout == b"" and dest == b"old\n" and not leftovers
+        report("a %s copy that writes and exits 143 is not run again: delivery_error, exit 4" % target,
+               proc.returncode == 4 and written_once and only_prefixed(proc.stderr)
+               and outcome_lines(proc.stderr) == [OUTCOME_PREFIX + "failed reason=delivery_error delivered=no"],
+               "rc=%s %d bytes leftovers=%r %r" % (proc.returncode, len(proc.stdout), leftovers,
+                                                  outcome_lines(proc.stderr)))
+
+    # A group SIGTERM while cleanup removes a temporary file: the removal
+    # still runs and no temporary file is left. After a fallback delivery the
+    # outcome reports the delivered original; in the cleanup right before the
+    # Python handoff the run ends as interrupted with nothing delivered.
+    for prefix, python, expected, want_out in (
+            ("polish-gemini-config.", None, "skipped reason=missing_dependency delivered=yes", payload),
+            ("polish-gemini-in.", None, "skipped reason=missing_dependency delivered=yes", payload),
+            ("polish-gemini-config.", sys.executable, "failed reason=interrupted delivered=no", b"")):
+        work = tempfile.mkdtemp(prefix="polish-runner-step-")
+        tmp_dir = os.path.join(work, "tmp")
+        os.mkdir(tmp_dir)
+        shim = os.path.join(work, "bin")
+        os.mkdir(shim)
+        flag = os.path.join(work, "rm.flag")
+        write_script(os.path.join(shim, "rm"),
+                     "#!/bin/bash\nif [[ ! -e '%s' && \"${2:-}\" == */%s* ]]; then : > '%s'; kill -TERM 0; fi\n"
+                     "exec '%s' \"$@\"\n" % (flag, prefix, flag, shutil.which("rm")))
+        proc = subprocess.Popen([RUNNER, "--input", "-"],
+                                env=fallback_env(work, dict({"PATH": shim + os.pathsep + path, "TMPDIR": tmp_dir},
+                                                            **({"HUMANIZE_POLISH_PYTHON": python} if python else {}))),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        stdout, err = proc.communicate(input=payload, timeout=60)
+        fired = os.path.exists(flag)
+        leftovers = os.listdir(tmp_dir)
+        shutil.rmtree(work, ignore_errors=True)
+        report("a group SIGTERM while cleanup removes %s (%s): no temporary file left, %s, exit 143"
+               % (prefix + "*", "before the Python handoff" if python else "after delivery",
+                  expected.split(" ")[0]),
+               fired and proc.returncode == 143 and stdout == want_out and not leftovers and only_prefixed(err)
+               and outcome_lines(err) == [OUTCOME_PREFIX + expected],
+               "fired=%s rc=%s leftovers=%r %r" % (fired, proc.returncode, leftovers, outcome_lines(err)))
+
+    # The Python interpreter passes the version check and is gone when the
+    # wrapper execs it: the original is delivered with one outcome line and
+    # no raw shell error.
+    for target in ("stdout", "file"):
+        work = tempfile.mkdtemp(prefix="polish-runner-step-")
+        source = os.path.join(work, "input.md")
+        out = os.path.join(work, "out.md")
+        with open(source, "wb") as fh:
+            fh.write(payload)
+        vanishing = os.path.join(work, "vanishing-python3")
+        write_script(vanishing, "#!/bin/bash\nrm -f \"$0\"\nexec '%s' \"$@\"\n" % sys.executable)
+        args = [RUNNER, "--input", source] + (["--output", out] if target == "file" else [])
+        proc = subprocess.run(args, env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": vanishing}),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        if target == "stdout":
+            delivered = proc.stdout == payload
+        else:
+            delivered = os.path.exists(out) and proc.stdout == b""
+            if delivered:
+                with open(out, "rb") as fh:
+                    delivered = fh.read() == payload
+        lines = proc.stderr.decode("utf-8", "replace").splitlines()
+        report("a Python interpreter gone at exec (%s): original delivered, one outcome, exit 0" % target,
+               proc.returncode == 0 and delivered and only_prefixed(proc.stderr) and lines
+               and lines[-1] == OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"
+               and len(outcome_lines(proc.stderr)) == 1,
+               "rc=%s %r" % (proc.returncode, proc.stderr))
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def ignored_signal_cases():
     """SIGINT ignored when the run starts (a background job) stays ignored."""
     payload = b"Read the source text.\n" * 50000
@@ -582,6 +684,7 @@ def main():
     fallback_edge_cases()
     fallback_stderr_cases()
     temp_file_signal_cases()
+    shell_step_cases()
     sys.exit(1 if FAILED else 0)
 
 

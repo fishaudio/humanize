@@ -92,12 +92,25 @@ emit_outcome() {
     OUTCOME_EMITTED=true
 }
 
+# cleanup_temps: remove the registered temporary files. Signals are recorded
+# while it runs and each removal runs to completion (see shielded); a path that
+# still exists afterwards stays registered. A signal recorded here is honored
+# right after, unless delivery is already under way.
 cleanup_temps() {
-    local f
+    local f deferred="$IN_DELIVERY"
+    local left=()
+    IN_DELIVERY=true
     for f in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
-        rm -f "$f" 2>/dev/null
+        shielded rm -f "$f"
+        if [[ -e "$f" || -L "$f" ]]; then
+            left+=("$f")
+        fi
     done
-    TEMP_FILES=()
+    TEMP_FILES=(${left[@]+"${left[@]}"})
+    IN_DELIVERY="$deferred"
+    if [[ "$deferred" != "true" && -n "$PENDING_SIGNAL" ]]; then
+        on_signal "$PENDING_SIGNAL"
+    fi
 }
 
 # While the fallback copy is being delivered, and once the outcome line is
@@ -147,13 +160,20 @@ trap 'on_signal 143' TERM
 #
 # wait returns 130 or 143 when a trapped signal interrupts it; waiting again
 # then gives the step's own status (or 127 once that status was collected).
-# A step that itself ended with 130 or 143 was signalled in the moment before
-# it could ignore the signal, so it had not started the command yet and is
-# run again.
+# The step reports a command's own exit status 130 or 143 as 1, so a step
+# that ends with 130 or 143 was signalled in the moment before it could ignore
+# the signal: it had not started the command yet and is run again. A command
+# that ran is never run twice.
 shielded() {
     local pid status again seen attempt=0
     while :; do
-        ( trap '' INT TERM; exec "$@" ) &
+        ( trap '' INT TERM
+          "$@"
+          rc=$?
+          if (( rc == 130 || rc == 143 )); then
+              rc=1
+          fi
+          exit "$rc" ) &
         pid=$!
         seen="$SIGNALS_SEEN"
         wait "$pid"
@@ -626,10 +646,15 @@ PY_ARGS=(
 [[ "$STRICT" == "true" ]] && PY_ARGS+=(--strict)
 
 cleanup_temps
-# Give the Python helper the caller's stderr. exec resets the traps; Python
-# installs its own handlers. A signal before the exec still ends the run
-# through on_signal with one outcome line.
-exec 2>&9
-OUT_FD=2
-exec 9>&-
+# exec resets the traps; Python installs its own handlers. A signal before the
+# exec still ends the run through on_signal with one outcome line. Standard
+# error stays on /dev/null through the exec, so a failed exec prints nothing
+# raw; the Python helper takes the caller's stderr from fd 9 when it starts
+# (HUMANIZE_POLISH_STDERR_FD). When the exec fails (execfail keeps this shell
+# running), the original is delivered.
+shopt -s execfail
+export HUMANIZE_POLISH_STDERR_FD="$OUT_FD"
 exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"
+unset HUMANIZE_POLISH_STDERR_FD
+diag "could not start $PYTHON_BIN; delivering the original"
+deliver_original "${SKIP_REASON:-missing_dependency}"

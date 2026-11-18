@@ -22,10 +22,35 @@ import sys
 
 sys.dont_write_bytecode = True
 
+
+def _adopt_stderr():
+    """Take the caller's standard error from the descriptor the shell wrapper
+    kept it on (HUMANIZE_POLISH_STDERR_FD). The wrapper holds its own standard
+    error on /dev/null through the exec, so a failed start prints nothing raw.
+    """
+    import os
+    value = os.environ.pop("HUMANIZE_POLISH_STDERR_FD", None)
+    if value is None or not re.fullmatch(r"[0-9]+", value) or int(value) < 3:
+        return
+    fd = int(value)
+    try:
+        os.dup2(fd, 2)
+    except OSError:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+import re  # noqa: E402
+
+if __name__ == "__main__":
+    _adopt_stderr()
+
 import email.utils  # noqa: E402
 import json  # noqa: E402
 import os  # noqa: E402
-import re  # noqa: E402
 import secrets  # noqa: E402
 import signal  # noqa: E402
 import socket  # noqa: E402

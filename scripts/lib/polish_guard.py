@@ -30,6 +30,7 @@ import html
 import html.entities
 import html.parser
 import re
+import unicodedata
 
 # ----------------------------------------------------------------------------
 # Tunables
@@ -186,6 +187,7 @@ _HTML_ATTR = (r"\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
               r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?")
 HTML_OPEN_TAG = r"<[A-Za-z][A-Za-z0-9-]*(?:" + _HTML_ATTR + r")*\s*/?>"
 HTML_CLOSE_TAG = r"</[A-Za-z][A-Za-z0-9-]*\s*>"
+HTML_STRICT_TAG_RE = re.compile(r"<!--.*?-->|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
 HTML_TAG_RE = re.compile(
     r"<!--.*?-->|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
     + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>", re.S)
@@ -219,7 +221,7 @@ PROSE_SLASH_PAIRS = frozenset(["and/or", "either/or", "he/she", "his/her", "him/
 PROSE_ABBREVIATIONS = frozenset(["e.g", "i.e", "a.k.a", "n.b", "p.s", "a.m", "p.m", "u.s", "u.k"])
 # Emphasis delimited by underscores, such as "_word_" or "__two words__".
 UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_])(?:(?!\1).)+?(?<=[^\s_])\1(?!\w)")
-MARKUP_TOKEN_KINDS = ("tag", "link", "image", "reflink", "autolink", "footnote", "escape")
+MARKUP_TOKEN_KINDS = ("tag", "rawtag", "link", "image", "reflink", "autolink", "footnote", "escape")
 
 
 def _mask(chars, start, end):
@@ -363,6 +365,14 @@ def _scan_links(text):
             continue
         start = i - 1 if i > 0 and text[i - 1] == "!" else i
         links.append((start, i + 1, close, end, "image" if start < i else "link", info))
+        # Links and images inside the label (an image inside a link, for
+        # example) have destinations of their own.
+        inner, inner_unmodeled = _scan_links(text[i + 1:close])
+        for (a, b, c, d, kind, target) in inner:
+            links.append((a + i + 1, b + i + 1, c + i + 1, d + i + 1, kind, target))
+        if inner_unmodeled:
+            unmodeled = True
+            break
         i = end
     return links, unmodeled
 
@@ -544,6 +554,10 @@ def extract_tokens(text):
         found.append((0, "frozen", text))
     for m in AUTOLINK_RE.finditer(text):
         found.append((m.start(), "dest", m.group(0)))
+    # HTML tags that fit the strict grammar, read from the original text too,
+    # so code or math masking elsewhere in the unit cannot split a tag.
+    for m in HTML_STRICT_TAG_RE.finditer(text):
+        found.append((m.start(), "rawtag", _normalize_tag(m.group(0))))
     for m in URL_RE.finditer(text):
         found.append((m.start(), "dest", _strip_url(m.group(0))))
 
@@ -552,13 +566,46 @@ def extract_tokens(text):
     return tokens, "".join(chars)
 
 
-def emphasis_counts(masked):
-    strong = len(re.findall(r"\*\*|__", masked))
-    rest = re.sub(r"\*\*|__", "  ", masked)
-    em_star = rest.count("*")
-    em_under = len(re.findall(r"(?<!\w)_|_(?!\w)", rest))
-    strike = masked.count("~~")
-    return (strong, em_star, em_under, strike)
+EMPHASIS_RUN_RE = re.compile(r"\*+|_+|~+")
+
+
+def _flank_class(ch):
+    if ch is None or ch.isspace():
+        return "space"
+    if unicodedata.category(ch)[0] in "PS":
+        return "punct"
+    return "other"
+
+
+def emphasis_signature(original, masked):
+    """Sorted emphasis delimiter runs with whether each can open or close.
+
+    Runs are found in ``masked`` (so markers inside code, math or URLs are
+    text) and classified with the CommonMark flanking rules against the
+    neighbouring characters of ``original``. Moving a marker away from its
+    word, which turns emphasis into literal asterisks, changes the signature
+    even though the number of markers stays the same.
+    """
+    ref = original if len(original) == len(masked) else masked
+    runs = []
+    for m in EMPHASIS_RUN_RE.finditer(masked):
+        ch, size = m.group(0)[0], len(m.group(0))
+        if ch == "~" and size != 2:
+            continue
+        before = _flank_class(ref[m.start() - 1] if m.start() > 0 else None)
+        after = _flank_class(ref[m.end()] if m.end() < len(ref) else None)
+        left = after != "space" and (after != "punct" or before != "other")
+        right = before != "space" and (before != "punct" or after != "other")
+        if ch == "_":
+            if before == "other" and after == "other":
+                # An underscore inside a word is text.
+                continue
+            can_open = left and (not right or before == "punct")
+            can_close = right and (not left or after == "punct")
+        else:
+            can_open, can_close = left, right
+        runs.append((ch, size, can_open, can_close))
+    return sorted(runs)
 
 
 def hard_break_count(text):
@@ -625,7 +672,7 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
         raise GuardReject(
             reason,
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
-    if emphasis_counts(src_masked) != emphasis_counts(cand_masked):
+    if emphasis_signature(src, src_masked) != emphasis_signature(cand, cand_masked):
         raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
     if hard_break_count(src) != hard_break_count(cand):
         raise GuardReject("inline_markup", "%s: hard line breaks changed" % where)
@@ -654,7 +701,9 @@ TABLE_SEP_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{1,}:?[ \t]*(?:\|[ \t]*:?-{1,}:?[
 FOOTNOTE_DEF_RE = re.compile(r"^[ ]{0,3}\[\^[^\]]+\]:")
 # The start of a link reference definition: a label and a colon. The
 # destination may be on the next line.
-REFDEF_RE = re.compile(r"^[ ]{0,3}\[[^\]^][^\]]*\]:")
+REFDEF_RE = re.compile(r"^[ ]{0,3}\[(?!\^)(?:\\.|[^\[\]\\])+\]:")
+# A line that may start a definition whose label continues on the next line.
+REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # A complete definition: label, colon, destination (on the same or the next
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line.
@@ -839,6 +888,20 @@ def _past_container(text, base):
     return expanded[min(base, _indent_of(expanded)):]
 
 
+def _quote_marker_cols(line, depth):
+    """Column of each of the first ``depth`` quote markers, each measured in
+    the text that remains after the markers before it."""
+    cols = []
+    rest = line
+    for _ in range(depth):
+        m = re.match(r"^([ ]{0,3})>[ ]?", rest)
+        if not m:
+            break
+        cols.append(len(m.group(1)))
+        rest = rest[m.end():]
+    return cols
+
+
 def parse_blocks(text):
     """Split Markdown or plain text into an ordered list of blocks.
 
@@ -869,11 +932,21 @@ def parse_blocks(text):
     # own level whose content column it reaches. Entering a deeper quote keeps
     # the lists that enclose it; leaving a quote closes what was opened inside.
     level_stacks = [[]]
+    # The true column of a quote marker that a list marker line opens, when
+    # it was moved left to stay within reach of the quote prefix parser:
+    # line index -> (level, column).
+    marker_quote_col = {}
 
-    def containers(quote, indent):
+    def containers(quote, indent, qcols):
         del level_stacks[quote + 1:]
         while len(level_stacks) <= quote:
             level_stacks.append([])
+        # A quote marker closes the list items at its level whose content
+        # column it does not reach.
+        for level in range(quote):
+            outer = level_stacks[level]
+            while outer and qcols[level] < outer[-1][1]:
+                outer.pop()
         stack = level_stacks[quote]
         while stack and indent < stack[-1][1]:
             stack.pop()
@@ -889,11 +962,16 @@ def parse_blocks(text):
         start_line = i + 1
         ebody = _expand_indent(body)
         indent = len(ebody) - len(ebody.lstrip(" "))
-        depth, base, ancestry = containers(quote, indent)
+        # Column of each quote marker in the text of its level, so a quote
+        # moved into or out of a list item is visible at every level.
+        qcols = _quote_marker_cols(line, quote)
+        if i in marker_quote_col:
+            level, col = marker_quote_col[i]
+            if level < len(qcols):
+                qcols[level] = col
+        qcol = tuple(qcols)
+        depth, base, ancestry = containers(quote, indent, qcols)
         cbody = ebody[base:] if indent >= base else ebody.lstrip(" ")
-        # Column of the first quote marker, so a quote moved into or out of a
-        # list item is visible.
-        qcol = (len(line) - len(line.lstrip(" "))) if quote else 0
 
         def attrs(**extra):
             out = {"quote": quote, "qcol": qcol, "container": ancestry}
@@ -1014,9 +1092,11 @@ def parse_blocks(text):
             i = j + 1
             continue
 
-        if REFDEF_RE.match(cbody):
-            # The definition's lines up to the next blank line, with quote and
-            # container prefixes removed.
+        parts = None
+        if REFDEF_START_RE.match(cbody):
+            # The lines up to the next blank line, with quote and container
+            # prefixes removed: a definition's label, destination and title
+            # may each continue on the next line.
             parts = [cbody]
             k = i + 1
             while k < n:
@@ -1028,6 +1108,9 @@ def parse_blocks(text):
                 k += 1
             joined = "\n".join(parts)
             dm = REFDEF_FULL_RE.match(joined)
+            if not dm and not REFDEF_RE.match(cbody):
+                parts = None
+        if parts is not None:
             if dm:
                 j = i + joined[:dm.end()].rstrip("\n").count("\n")
             else:
@@ -1110,10 +1193,11 @@ def parse_blocks(text):
                 new_body = " " * content_col + lm.group("rest")
             else:
                 pad = col0 + ws
-                if ws < 5 and rest_raw.startswith(">"):
+                if ws < 5 and rest_raw.startswith(">") and pad > 3:
                     # Keep a quote that opens on the marker line within reach
-                    # of the quote prefix parser.
-                    pad = min(pad, 3)
+                    # of the quote prefix parser, and remember its column.
+                    marker_quote_col[i] = (quote, pad)
+                    pad = 3
                 new_body = " " * pad + rest_raw
             lines[i] = line[:len(line) - len(body)] + new_body
             continue
