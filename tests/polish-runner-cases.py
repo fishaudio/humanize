@@ -638,6 +638,98 @@ def shell_step_cases():
         shutil.rmtree(work, ignore_errors=True)
 
 
+def plugin_copy(work):
+    """A scratch copy of the plugin files the wrapper needs."""
+    root = os.path.join(work, "plugin")
+    for name in ("scripts", "config", "prompt-template"):
+        shutil.copytree(os.path.join(ROOT, name), os.path.join(root, name))
+    return root
+
+
+def startup_cases():
+    """Cleanup retries, a missing helper, and signals while Python starts."""
+    payload = b"Read the source text for the startup path.\n"
+    path = os.environ["PATH"]
+
+    # A removal that fails once is tried again: no temporary file is left,
+    # after a fallback delivery or before the Python handoff.
+    for prefix, python, expected in (
+            ("polish-gemini-in.", None, "skipped reason=missing_dependency delivered=yes"),
+            ("polish-gemini-config.", sys.executable, "skipped reason=no_api_key delivered=yes")):
+        work = tempfile.mkdtemp(prefix="polish-runner-start-")
+        tmp_dir = os.path.join(work, "tmp")
+        os.mkdir(tmp_dir)
+        shim = os.path.join(work, "bin")
+        os.mkdir(shim)
+        flag = os.path.join(work, "rm.flag")
+        write_script(os.path.join(shim, "rm"),
+                     "#!/bin/bash\nif [[ ! -e '%s' && \"${2:-}\" == */%s* ]]; then : > '%s'; exit 1; fi\n"
+                     "exec '%s' \"$@\"\n" % (flag, prefix, flag, shutil.which("rm")))
+        extra = {"PATH": shim + os.pathsep + path, "TMPDIR": tmp_dir}
+        if python:
+            extra["HUMANIZE_POLISH_PYTHON"] = python
+        proc = subprocess.run([RUNNER, "--input", "-"], env=fallback_env(work, extra), input=payload,
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        fired = os.path.exists(flag)
+        leftovers = os.listdir(tmp_dir)
+        shutil.rmtree(work, ignore_errors=True)
+        report("a removal of %s that fails once is retried: no temporary file left, exit 0" % (prefix + "*"),
+               fired and proc.returncode == 0 and proc.stdout == payload and not leftovers
+               and only_prefixed(proc.stderr) and outcome_lines(proc.stderr) == [OUTCOME_PREFIX + expected],
+               "fired=%s rc=%s leftovers=%r %r" % (fired, proc.returncode, leftovers, outcome_lines(proc.stderr)))
+
+    # The Python helper is missing from the plugin: the wrapper delivers the
+    # original itself.
+    work = tempfile.mkdtemp(prefix="polish-runner-start-")
+    root = plugin_copy(work)
+    os.unlink(os.path.join(root, "scripts", "lib", "polish_gemini.py"))
+    proc = subprocess.run([os.path.join(root, "scripts", "polish-gemini.sh"), "--input", "-"],
+                          env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": sys.executable}), input=payload,
+                          stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    shutil.rmtree(work, ignore_errors=True)
+    report("a missing Python helper: original delivered, missing_dependency, exit 0",
+           proc.returncode == 0 and proc.stdout == payload and only_prefixed(proc.stderr)
+           and outcome_lines(proc.stderr) == [OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"],
+           "rc=%s %r" % (proc.returncode, proc.stderr))
+
+    # A signal while Python imports its modules (before the run installs its
+    # handlers) still ends with one interrupted outcome and exit 130 or 143.
+    for signame, code in (("SIGTERM", 143), ("SIGINT", 130)):
+        work = tempfile.mkdtemp(prefix="polish-runner-start-")
+        root = plugin_copy(work)
+        guard_py = os.path.join(root, "scripts", "lib", "polish_guard.py")
+        with open(guard_py) as fh:
+            body = fh.read()
+        with open(guard_py, "w") as fh:
+            fh.write("import os as _o, signal as _s\n_o.kill(_o.getpid(), _s.%s)\n" % signame + body)
+        source = os.path.join(work, "input.md")
+        with open(source, "wb") as fh:
+            fh.write(payload)
+        proc = subprocess.run([os.path.join(root, "scripts", "polish-gemini.sh"), "--input", source],
+                              env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": sys.executable,
+                                                      "OPENROUTER_API_KEY": DUMMY_KEY}),
+                              stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        shutil.rmtree(work, ignore_errors=True)
+        report("%s while Python starts: one interrupted outcome, nothing delivered, exit %d" % (signame, code),
+               proc.returncode == code and proc.stdout == b"" and only_prefixed(proc.stderr)
+               and outcome_lines(proc.stderr) == [OUTCOME_PREFIX + "failed reason=interrupted delivered=no"],
+               "rc=%s %r" % (proc.returncode, proc.stderr))
+
+    # A SIGTERM in the moment the wrapper execs Python is ignored rather than
+    # ending the run without an outcome line.
+    work = tempfile.mkdtemp(prefix="polish-runner-start-")
+    shim = os.path.join(work, "python-shim")
+    write_script(shim, "#!/bin/bash\nif [[ \"${3:-}\" == */polish_gemini.py ]]; then kill -TERM $$; fi\n"
+                       "exec '%s' \"$@\"\n" % sys.executable)
+    proc = subprocess.run([RUNNER, "--input", "-"], env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": shim}),
+                          input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    shutil.rmtree(work, ignore_errors=True)
+    report("a SIGTERM during the exec of Python: exactly one outcome line",
+           proc.stdout == payload and only_prefixed(proc.stderr) and len(outcome_lines(proc.stderr)) == 1
+           and proc.returncode == 0,
+           "rc=%s %r" % (proc.returncode, proc.stderr))
+
+
 def ignored_signal_cases():
     """SIGINT ignored when the run starts (a background job) stays ignored."""
     payload = b"Read the source text.\n" * 50000
@@ -685,6 +777,7 @@ def main():
     fallback_stderr_cases()
     temp_file_signal_cases()
     shell_step_cases()
+    startup_cases()
     sys.exit(1 if FAILED else 0)
 
 

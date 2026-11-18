@@ -216,7 +216,11 @@ WORD_TOKEN_RE = re.compile(
 )
 
 # Slash pairs that are ordinary prose rather than paths.
-PROSE_SLASH_PAIRS = frozenset(["and/or", "either/or", "he/she", "his/her", "him/her", "s/he"])
+# Word pairs with a slash that are ordinary prose, not paths.
+PROSE_SLASH_PAIRS = frozenset([
+    "and/or", "either/or", "he/she", "his/her", "him/her", "s/he", "yes/no", "read/write",
+    "true/false", "on/off", "input/output", "before/after", "pros/cons", "start/stop",
+    "open/close", "online/offline", "if/then", "if/else", "plus/minus"])
 # Dotted abbreviations made of one-letter segments that are ordinary prose.
 PROSE_ABBREVIATIONS = frozenset(["e.g", "i.e", "a.k.a", "n.b", "p.s", "a.m", "p.m", "u.s", "u.k"])
 # Emphasis delimited by underscores, such as "_word_" or "__two words__".
@@ -577,15 +581,10 @@ def _flank_class(ch):
     return "other"
 
 
-def emphasis_signature(original, masked):
-    """Sorted emphasis delimiter runs with whether each can open or close.
-
-    Runs are found in ``masked`` (so markers inside code, math or URLs are
-    text) and classified with the CommonMark flanking rules against the
-    neighbouring characters of ``original``. Moving a marker away from its
-    word, which turns emphasis into literal asterisks, changes the signature
-    even though the number of markers stays the same.
-    """
+def _delimiter_runs(original, masked):
+    """Emphasis delimiter runs in ``masked`` (so markers inside code, math or
+    URLs are text), each with whether it can open or close emphasis by the
+    CommonMark flanking rules, read against the characters of ``original``."""
     ref = original if len(original) == len(masked) else masked
     runs = []
     for m in EMPHASIS_RUN_RE.finditer(masked):
@@ -604,8 +603,99 @@ def emphasis_signature(original, masked):
             can_close = right and (not left or after == "punct")
         else:
             can_open, can_close = left, right
-        runs.append((ch, size, can_open, can_close))
-    return sorted(runs)
+        runs.append({"ch": ch, "pos": m.start(), "orig": size, "count": size,
+                     "open": can_open, "close": can_close})
+    return runs
+
+
+def emphasis_structure(original, masked):
+    """The emphasis a prose unit renders, independent of the words inside.
+
+    Delimiter runs are paired with the CommonMark "process emphasis" rules
+    (including the rule of three), and ``~~`` pairs as strikethrough. The
+    result is the nesting of the spans (em, strong, del), with siblings in
+    sorted order so emphasis can move with its words, plus the delimiters
+    that stay literal. Moving a marker away from its word, or regrouping
+    markers so that spans nest differently, changes the result.
+    """
+    stack = _delimiter_runs(original, masked)
+    spans = []
+    literal = {}
+
+    def drop(run):
+        if run["count"]:
+            key = run["ch"] if run["ch"] != "~" else "~~"
+            literal[key] = literal.get(key, 0) + (run["count"] if run["ch"] != "~" else 1)
+
+    ci = 0
+    while ci < len(stack):
+        closer = stack[ci]
+        if not closer["close"]:
+            ci += 1
+            continue
+        found = None
+        for oi in range(ci - 1, -1, -1):
+            opener = stack[oi]
+            if opener["ch"] != closer["ch"] or not opener["open"]:
+                continue
+            if closer["ch"] == "~":
+                found = oi
+                break
+            if ((opener["close"] or closer["open"])
+                    and (opener["orig"] + closer["orig"]) % 3 == 0
+                    and not (opener["orig"] % 3 == 0 and closer["orig"] % 3 == 0)):
+                continue
+            found = oi
+            break
+        if found is None:
+            if not closer["open"]:
+                drop(closer)
+                del stack[ci]
+            else:
+                ci += 1
+            continue
+        opener = stack[found]
+        if closer["ch"] == "~":
+            use, kind = 2, "del"
+        elif opener["count"] >= 2 and closer["count"] >= 2:
+            use, kind = 2, "strong"
+        else:
+            use, kind = 1, "em"
+        span_start = opener["pos"] + opener["count"] - use
+        span_end = closer["pos"] + (closer["orig"] - closer["count"]) + use
+        spans.append((span_start, span_end, kind))
+        opener["count"] -= use
+        closer["count"] -= use
+        for run in stack[found + 1:ci]:
+            drop(run)
+        del stack[found + 1:ci]
+        ci = found + 1
+        if opener["count"] == 0:
+            del stack[found]
+            ci -= 1
+        if closer["count"] == 0:
+            del stack[ci]
+    for run in stack:
+        drop(run)
+
+    # Spans nest properly; build the forest and describe it without order.
+    spans.sort(key=lambda sp: (sp[0], -sp[1]))
+    children = {None: []}
+    open_spans = []
+    for idx, (a, b, kind) in enumerate(spans):
+        while open_spans and not (a >= spans[open_spans[-1]][0] and b <= spans[open_spans[-1]][1]):
+            open_spans.pop()
+        parent = open_spans[-1] if open_spans else None
+        children.setdefault(parent, []).append(idx)
+        children[idx] = []
+        open_spans.append(idx)
+
+    def describe(idx):
+        inner = sorted(describe(c) for c in children[idx])
+        return spans[idx][2] + "(" + ",".join(inner) + ")"
+
+    forest = sorted(describe(c) for c in children[None])
+    return forest, sorted(literal.items())
 
 
 def hard_break_count(text):
@@ -672,7 +762,7 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
         raise GuardReject(
             reason,
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
-    if emphasis_signature(src, src_masked) != emphasis_signature(cand, cand_masked):
+    if emphasis_structure(src, src_masked) != emphasis_structure(cand, cand_masked):
         raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
     if hard_break_count(src) != hard_break_count(cand):
         raise GuardReject("inline_markup", "%s: hard line breaks changed" % where)
@@ -701,17 +791,17 @@ TABLE_SEP_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{1,}:?[ \t]*(?:\|[ \t]*:?-{1,}:?[
 FOOTNOTE_DEF_RE = re.compile(r"^[ ]{0,3}\[\^[^\]]+\]:")
 # The start of a link reference definition: a label and a colon. The
 # destination may be on the next line.
-REFDEF_RE = re.compile(r"^[ ]{0,3}\[(?!\^)(?:\\.|[^\[\]\\])+\]:")
+REFDEF_RE = re.compile(r"^[ ]{0,3}\[(?!\^)(?:\\[\s\S]|[^\[\]\\])+\]:")
 # A line that may start a definition whose label continues on the next line.
 REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # A complete definition: label, colon, destination (on the same or the next
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line.
 REFDEF_FULL_RE = re.compile(
-    r"[ ]{0,3}\[(?:\\.|[^\[\]\\])+\]:[ \t]*\n?[ \t]*"
+    r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*\n?[ \t]*"
     r"(?:<(?:\\.|[^<>\n\\])*>|(?!<)(?:\\.|[^\s()\\]|\((?:\\.|[^\s()\\])*\))+)"
     r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
-    r"(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|\((?:\\.|[^()\\])*\)))?"
+    r"(?:\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^()\\])*\)))?"
     r"[ \t]*(?:\n|$)")
 HTML_BLOCK_TAGS = (
     "address|article|aside|blockquote|body|caption|center|col|colgroup|dd|details|dialog|"
@@ -888,6 +978,18 @@ def _past_container(text, base):
     return expanded[min(base, _indent_of(expanded)):]
 
 
+def _leaves_list_item(line, quote, level_stacks):
+    """True when a quote marker of ``line`` (at the same quote depth) does not
+    reach the content column of a list item that encloses the deeper quote, so
+    the line closes that item instead of continuing inside it."""
+    cols = _quote_marker_cols(line, quote)
+    for level in range(min(quote, len(cols), len(level_stacks))):
+        stack = level_stacks[level]
+        if stack and cols[level] < stack[-1][1]:
+            return True
+    return False
+
+
 def _quote_marker_cols(line, depth):
     """Column of each of the first ``depth`` quote markers, each measured in
     the text that remains after the markers before it."""
@@ -962,19 +1064,20 @@ def parse_blocks(text):
         start_line = i + 1
         ebody = _expand_indent(body)
         indent = len(ebody) - len(ebody.lstrip(" "))
-        # Column of each quote marker in the text of its level, so a quote
-        # moved into or out of a list item is visible at every level.
+        # Column of each quote marker in the text of its level: a quote
+        # marker that does not reach a list item's content column closes that
+        # item, so a quote moved into or out of a list item changes the
+        # container tuple at every level.
         qcols = _quote_marker_cols(line, quote)
         if i in marker_quote_col:
             level, col = marker_quote_col[i]
             if level < len(qcols):
                 qcols[level] = col
-        qcol = tuple(qcols)
         depth, base, ancestry = containers(quote, indent, qcols)
         cbody = ebody[base:] if indent >= base else ebody.lstrip(" ")
 
         def attrs(**extra):
-            out = {"quote": quote, "qcol": qcol, "container": ancestry}
+            out = {"quote": quote, "container": ancestry}
             out.update(extra)
             return out
 
@@ -1102,9 +1205,16 @@ def parse_blocks(text):
             while k < n:
                 kq, _ = _quote_depth(lines[k])
                 kb = _strip_quote(lines[k], quote)
-                if kq != quote or not kb.strip():
+                if not kb.strip() or kq not in (0, quote):
                     break
-                parts.append(_past_container(kb, base))
+                if kq != quote:
+                    # A lazy continuation line: it continues the definition
+                    # unless it starts a block of its own.
+                    if _starts_block(kb, False) or kb.lstrip(" ").startswith(">"):
+                        break
+                    parts.append(kb.lstrip(" "))
+                else:
+                    parts.append(_past_container(kb, base))
                 k += 1
             joined = "\n".join(parts)
             dm = REFDEF_FULL_RE.match(joined)
@@ -1179,7 +1289,6 @@ def parse_blocks(text):
             level_stacks[quote].append((indent, content_col))
             blocks.append(Block("list_item", {
                 "quote": quote,
-                "qcol": qcol,
                 "depth": depth,
                 "container": ancestry,
                 "ordered": marker[-1] in ".)",
@@ -1221,8 +1330,14 @@ def parse_blocks(text):
             nbody = _strip_quote(nxt, quote)
             if not nbody.strip():
                 break
+            if nq == quote and _leaves_list_item(nxt, quote, level_stacks):
+                break
             same_container = nq == quote and (depth == 0 or _indent_of(nbody) >= base)
             nbc = _past_container(nbody, base)
+            if nbc.startswith(">"):
+                # A quote marker indented into a list item starts a quote,
+                # which interrupts the paragraph.
+                break
             sm = SETEXT_RE.match(nbc)
             if sm and same_container:
                 setext_level = 1 if sm.group(1)[0] == "=" else 2

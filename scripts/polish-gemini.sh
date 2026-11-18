@@ -93,15 +93,21 @@ emit_outcome() {
 }
 
 # cleanup_temps: remove the registered temporary files. Signals are recorded
-# while it runs and each removal runs to completion (see shielded); a path that
-# still exists afterwards stays registered. A signal recorded here is honored
-# right after, unless delivery is already under way.
+# while it runs and each removal runs to completion (see shielded); a removal
+# that fails is tried again, and a path that still exists afterwards stays
+# registered. A signal recorded here is honored right after, unless delivery
+# is already under way.
 cleanup_temps() {
-    local f deferred="$IN_DELIVERY"
+    local f attempt deferred="$IN_DELIVERY"
     local left=()
     IN_DELIVERY=true
     for f in ${TEMP_FILES[@]+"${TEMP_FILES[@]}"}; do
-        shielded rm -f "$f"
+        for attempt in 1 2 3; do
+            shielded rm -f "$f"
+            if [[ ! -e "$f" && ! -L "$f" ]]; then
+                break
+            fi
+        done
         if [[ -e "$f" || -L "$f" ]]; then
             left+=("$f")
         fi
@@ -646,15 +652,30 @@ PY_ARGS=(
 [[ "$STRICT" == "true" ]] && PY_ARGS+=(--strict)
 
 cleanup_temps
-# exec resets the traps; Python installs its own handlers. A signal before the
-# exec still ends the run through on_signal with one outcome line. Standard
-# error stays on /dev/null through the exec, so a failed exec prints nothing
-# raw; the Python helper takes the caller's stderr from fd 9 when it starts
-# (HUMANIZE_POLISH_STDERR_FD). When the exec fails (execfail keeps this shell
-# running), the original is delivered.
+if [[ ! -r "$SCRIPT_DIR/lib/polish_gemini.py" || ! -r "$SCRIPT_DIR/lib/polish_guard.py" ]]; then
+    diag "the polish helper is missing; delivering the original"
+    deliver_original "${SKIP_REASON:-missing_dependency}"
+fi
+# The signals this shell handles; a signal ignored when the run started has
+# no trap and stays ignored.
+HANDOFF_SIGNALS=""
+[[ -n "$(trap -p INT)" ]] && HANDOFF_SIGNALS="INT"
+[[ -n "$(trap -p TERM)" ]] && HANDOFF_SIGNALS="${HANDOFF_SIGNALS:+$HANDOFF_SIGNALS,}TERM"
+# A signal before this point ends the run through on_signal with one outcome
+# line. From here the handled signals are ignored across the exec (an ignored
+# signal stays ignored through exec) and the Python helper catches them from
+# its first statements on (HUMANIZE_POLISH_SIGNALS), so no signal can end the
+# run before an outcome line is possible. Standard error stays on /dev/null
+# through the exec, so a failed exec prints nothing raw; the helper takes the
+# caller's stderr from fd 9 (HUMANIZE_POLISH_STDERR_FD). When the exec fails
+# (execfail keeps this shell running), the original is delivered.
 shopt -s execfail
 export HUMANIZE_POLISH_STDERR_FD="$OUT_FD"
+export HUMANIZE_POLISH_SIGNALS="$HANDOFF_SIGNALS"
+trap '' INT TERM
 exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"
-unset HUMANIZE_POLISH_STDERR_FD
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+unset HUMANIZE_POLISH_STDERR_FD HUMANIZE_POLISH_SIGNALS
 diag "could not start $PYTHON_BIN; delivering the original"
 deliver_original "${SKIP_REASON:-missing_dependency}"

@@ -880,4 +880,51 @@ try:
 except g.GuardReject as exc:
     report("segments: emphasis turned into literal asterisks", exc.reason == "inline_markup", exc.reason)
 
+# Round 2 second re-review: quote continuation lines, lazy definitions,
+# backslashes in labels, and the emphasis structure.
+NESTED = "- Parent.\n  - Child.\n    - Grandchild.\n"
+for name, src, cand in [
+        ("quote continuation line moved out of an ordered item",
+         "> 1. Parent.\n>    > Quoted words.\n>    > More words.\n",
+         "> 1. Parent.\n>    > Quoted words.\n> > More words.\n"),
+        ("quote after a nested item moved to the outer item", NESTED + "      > Quote text.\n",
+         NESTED + "    > Quote text.\n"),
+        ("quote after a blank line moved to the outer item", NESTED + "\n      > Quote text.\n",
+         NESTED + "\n    > Quote text.\n")]:
+    rejects(name, src, cand, "structure")
+for name, src, cand in [
+        ("definition with a lazy label line in a quote: destination changed",
+         "> [a\nb]: old\n\nRead [a b].\n", "> [a\nb]: new\n\nRead [a b].\n"),
+        ("definition with a backslash before the label line break: destination changed",
+         "[a\\\nb]: old\n\nRead [a\\\nb].\n", "[a\\\nb]: new\n\nRead [a\\\nb].\n"),
+        ("the same definition in a quote", "> [a\\\n> b]: old\n\nRead.\n", "> [a\\\n> b]: new\n\nRead.\n"),
+        ("the same definition in a list item", "- [a\\\n  b]: old\n\nRead.\n", "- [a\\\n  b]: new\n\nRead.\n")]:
+    rejects(name, src, cand, "region_changed")
+for name, src, cand in [
+        ("emphasis regrouped into nested spans", "Read *one* and **two** carefully.\n",
+         "Read *one and **two* carefully**.\n"),
+        ("strong emphasis split from its emphasis", "Read ***key*** words.\n", "Read **key** words.\n"),
+        ("nested emphasis taken apart", "Read **a *b* c**.\n", "Read **a** *b* **c**.\n"),
+        ("a literal asterisk removed", "Compute 2 * 3 here.\n", "Compute 2 times 3 here.\n")]:
+    rejects(name, src, cand, "inline_markup")
+for name, src, cand in [
+        ("quote continuation line inside an ordered item reworded",
+         "> 1. Parent.\n>    > Quoted words.\n>    > More words.\n",
+         "> 1. Parent.\n>    > Quoted words.\n>    > More text.\n"),
+        ("extra space between nested quote markers", "> > Read the useful guide.\n",
+         ">  > Read the helpful guide.\n"),
+        ("lazy paragraph line in a quote reworded", "> Read the useful\nguide today.\n",
+         "> Read the helpful\nguide today.\n"),
+        ("punctuation inside emphasis dropped", "Read *\u201cthe useful guide\u201d*.\n", "Read *the helpful guide*.\n"),
+        ("nested emphasis closing together", "Read **the *useful* guide**.\n",
+         "Read **the guide that is *helpful***.\n"),
+        ("nested underscore emphasis closing together", "Read **the _useful_ guide**.\n",
+         "Read **the guide that is _helpful_**.\n"),
+        ("emphasis spans swapped with their words", "Use *a* and **b** here.\n", "Use **b** and *a* here.\n"),
+        ("strikethrough moved with its words", "Old ~~text~~ here.\n", "Here is ~~old text~~.\n"),
+        ("yes/no reworded as prose", "The yes/no choice is useful.\n", "The yes or no choice is helpful.\n")]:
+    accepts(name, src, cand)
+rejects("a real path next to the prose pairs still protected", "Use src/main here.\n", "Use src/other here.\n",
+        "protected_token")
+
 sys.exit(1 if FAILED else 0)

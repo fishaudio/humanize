@@ -23,12 +23,19 @@ import sys
 sys.dont_write_bytecode = True
 
 
+import os  # noqa: E402
+import re  # noqa: E402
+import signal  # noqa: E402
+
+# SIGINT and SIGTERM received before the run installs its own handlers.
+_STARTUP_SIGNALS = []
+
+
 def _adopt_stderr():
     """Take the caller's standard error from the descriptor the shell wrapper
     kept it on (HUMANIZE_POLISH_STDERR_FD). The wrapper holds its own standard
     error on /dev/null through the exec, so a failed start prints nothing raw.
     """
-    import os
     value = os.environ.pop("HUMANIZE_POLISH_STDERR_FD", None)
     if value is None or not re.fullmatch(r"[0-9]+", value) or int(value) < 3:
         return
@@ -43,16 +50,35 @@ def _adopt_stderr():
         pass
 
 
-import re  # noqa: E402
+def _record_startup_signal(signum, frame):
+    _STARTUP_SIGNALS.append(signum)
+
+
+def _catch_startup_signals():
+    """Record SIGINT and SIGTERM from the first statements on; the run acts on
+    them once its own handlers are in place, so an interruption while Python
+    starts still ends with one outcome line. The shell wrapper ignores both
+    signals across the exec and names the ones this process must handle in
+    HUMANIZE_POLISH_SIGNALS; a signal it does not name was ignored when the
+    run started and stays ignored. Without the wrapper, every signal that is
+    not ignored is caught."""
+    names = os.environ.pop("HUMANIZE_POLISH_SIGNALS", None)
+    table = {"INT": signal.SIGINT, "TERM": signal.SIGTERM}
+    if names is None:
+        wanted = [s for s in table.values() if signal.getsignal(s) != signal.SIG_IGN]
+    else:
+        wanted = [table[x] for x in names.split(",") if x in table]
+    for signum in wanted:
+        signal.signal(signum, _record_startup_signal)
+
 
 if __name__ == "__main__":
     _adopt_stderr()
+    _catch_startup_signals()
 
 import email.utils  # noqa: E402
 import json  # noqa: E402
-import os  # noqa: E402
 import secrets  # noqa: E402
-import signal  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
 import tempfile  # noqa: E402
@@ -515,6 +541,8 @@ class Runner(object):
     def run(self):
         _set_signal_handlers(_raise_interrupt)
         try:
+            if _STARTUP_SIGNALS:
+                raise Interrupted(_STARTUP_SIGNALS[0])
             return self._run()
         except Interrupted as exc:
             return self._interrupted(exc.signum)
@@ -1096,7 +1124,8 @@ def main(argv):
     except UsageError as exc:
         sys.stderr.write("%s %s\n" % (PREFIX, one_line(exc)))
         sys.stderr.write("%s outcome=failed reason=usage_error delivered=no\n" % PREFIX)
-        return EXIT_USAGE
+        sys.stderr.flush()
+        return _exit_code_for(_STARTUP_SIGNALS[0]) if _STARTUP_SIGNALS else EXIT_USAGE
     rc = Runner(opts).run()
     if _DEFERRED_SIGNALS and rc in (EXIT_OK, EXIT_STRICT, EXIT_DELIVERY):
         # A signal that arrived after the outcome line was printed.
