@@ -941,7 +941,10 @@ def supervised_start_cases():
 
     # During work: the helper waits on a request that never gets an answer;
     # a signal to the runner PID is passed on, a group signal reaches both.
-    for signame, code, group in (("SIGTERM", 143, False), ("SIGINT", 130, False), ("SIGINT", 130, True)):
+    # SIGKILL ends the wrapper alone: the helper notices it lost its parent,
+    # delivers nothing and ends as interrupted.
+    for signame, code, group in (("SIGTERM", 143, False), ("SIGINT", 130, False), ("SIGINT", 130, True),
+                                 ("SIGKILL", -9, False)):
         work = tempfile.mkdtemp(prefix="polish-runner-sup-")
         source = os.path.join(work, "input.md")
         out = os.path.join(work, "out.md")
@@ -964,11 +967,23 @@ def supervised_start_cases():
         except socket.timeout:
             conn = None
         time.sleep(0.2)
+        helpers = subprocess.run(["pgrep", "-P", str(proc.pid)], stdout=subprocess.PIPE).stdout.split()
         if group:
             os.killpg(proc.pid, getattr(signal, signame))
         else:
             proc.send_signal(getattr(signal, signame))
+        started = time.monotonic()
+        # Standard error stays open until the helper, which holds a copy,
+        # has ended too.
         stdout, err = proc.communicate(timeout=60)
+        took = time.monotonic() - started
+        lingering = []
+        for pid in helpers:
+            try:
+                os.kill(int(pid), 0)
+                lingering.append(int(pid))
+            except OSError:
+                pass
         if conn is not None:
             conn.close()
         server.close()
@@ -976,12 +991,13 @@ def supervised_start_cases():
             dest = fh.read()
         leftovers = [f for f in os.listdir(work) if f.startswith(".polish-gemini-")]
         shutil.rmtree(work, ignore_errors=True)
-        report("%s to %s during the request: exit %d, one interrupted outcome, destination untouched"
-               % (signame, "the process group" if group else "the runner PID", code),
+        report("%s to %s during the request: exit %d, one interrupted outcome, destination untouched, "
+               "no helper left" % (signame, "the process group" if group else "the runner PID", code),
                conn is not None and proc.returncode == code and dest == b"old\n" and not leftovers
-               and only_prefixed(err) and outcome_lines(err) == interrupted,
-               "accepted=%s rc=%s dest=%r leftovers=%r %r" % (conn is not None, proc.returncode, dest, leftovers,
-                                                              err[-300:]))
+               and only_prefixed(err) and outcome_lines(err) == interrupted and len(helpers) == 1
+               and not lingering and took < 10,
+               "accepted=%s rc=%s dest=%r leftovers=%r helpers=%r lingering=%r took=%.1f %r"
+               % (conn is not None, proc.returncode, dest, leftovers, helpers, lingering, took, err[-300:]))
 
 
 def interruption_window_cases():

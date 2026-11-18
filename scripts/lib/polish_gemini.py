@@ -83,6 +83,18 @@ def _record_release(signum, frame):
     _RELEASED.append(signum)
 
 
+# How often a supervised run checks that its wrapper still exists while it
+# waits for a reply.
+SUPERVISOR_POLL = 0.5
+
+
+def _supervisor_gone():
+    """True when the supervising wrapper has ended (for example killed with
+    SIGKILL): this process was given another parent. The run then ends as
+    interrupted and delivers nothing, as the runner's own process is gone."""
+    return bool(_SUPERVISOR) and _SUPERVISOR[0] is not None and os.getppid() != _SUPERVISOR[0][0]
+
+
 def _ignore_signal(signum, frame):
     pass
 
@@ -893,8 +905,16 @@ class Runner(object):
         thread = threading.Thread(target=worker, name="polish-request")
         thread.daemon = True
         thread.start()
-        if not done.wait(remaining):
-            return "timeout", None
+        if not _SUPERVISOR:
+            if not done.wait(remaining):
+                return "timeout", None
+        else:
+            end = time.monotonic() + remaining
+            while not done.wait(min(SUPERVISOR_POLL, max(0.0, end - time.monotonic()))):
+                if _supervisor_gone():
+                    _raise_interrupt(signal.SIGTERM, None)
+                if time.monotonic() >= end:
+                    return "timeout", None
         if "error" in holder:
             return "error", holder["error"]
         return "ok", holder["result"]
@@ -1064,6 +1084,8 @@ class Runner(object):
 
     def finish(self, outcome, reason, payload):
         _block_signals()
+        if not _DEFERRED_SIGNALS and _supervisor_gone():
+            _DEFERRED_SIGNALS.append(signal.SIGTERM)
         if _DEFERRED_SIGNALS:
             # Interrupted before delivery began: deliver nothing.
             return self._interrupted(_DEFERRED_SIGNALS[0])
