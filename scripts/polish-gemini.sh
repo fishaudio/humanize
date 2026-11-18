@@ -669,38 +669,29 @@ HANDOFF_SIGNALS=""
 # ----------------------------------------
 # This shell stays the runner's process and keeps handling SIGINT and SIGTERM
 # while the helper starts. The helper installs its own handlers, reports that
-# it is ready with READY_SIG, and waits for RELEASE_SIG before it reads any
-# input. A signal that reaches this shell before then is recorded; at
-# readiness it is passed on to the helper, which ends the run as interrupted
-# with nothing delivered. After the release, signals are passed on and the
-# helper owns the one outcome line; this shell exits with its status. When
-# the helper ends before it is ready, this shell finishes the run: as
-# interrupted when a signal came, or by delivering the original when the
-# helper could not start.
+# it is ready by writing one byte to a pipe, and waits for SIGUSR1 (the
+# release) before it reads any input. A signal that reaches this shell before
+# then is recorded; at readiness it is passed on to the helper, which ends the
+# run as interrupted with nothing delivered. After the release, signals are
+# passed on and the helper owns the one outcome line; this shell exits with
+# its status. When the helper ends before it is ready (the pipe reaches end
+# of file), this shell finishes the run: as interrupted when a signal came, or
+# by delivering the original when the helper could not start.
+#
+# Readiness comes through a pipe rather than a signal: in bash 3.2 a trapped
+# signal other than SIGINT that interrupts the wait builtin leaves SIGINT
+# handled only inside wait, so a SIGINT that came while this shell acted on a
+# readiness signal was lost. The read builtin runs the traps as signals
+# arrive and goes on reading (newer bash versions end the read with a status
+# above 128 instead; it is then read again).
 HELPER_PID=""
 HELPER_READY=false
-HELPER_READY_EARLY=false
 HELPER_PENDING=""
 HELPER_PENDING_NAME=""
 HELPER_FORWARDED=""
 HELPER_TRAPS=0
 HELPER_STATUS=0
-
-helper_ready() {
-    HELPER_TRAPS=$((HELPER_TRAPS + 1))
-    if [[ -z "$HELPER_PID" ]]; then
-        HELPER_READY_EARLY=true
-        return 0
-    fi
-    if [[ "$HELPER_READY" == "true" ]]; then
-        return 0
-    fi
-    HELPER_READY=true
-    if [[ -n "$HELPER_PENDING_NAME" ]]; then
-        kill -"$HELPER_PENDING_NAME" "$HELPER_PID" 2>/dev/null
-    fi
-    kill -"$RELEASE_SIG" "$HELPER_PID" 2>/dev/null
-}
+HELPER_TOKEN=""
 
 # helper_signal CODE NAME: a SIGINT or SIGTERM while the helper runs.
 helper_signal() {
@@ -734,22 +725,49 @@ wait_helper() {
     done
 }
 
-# The readiness and release signals: SIGUSR1 and SIGUSR2, the other way
-# round when SIGUSR1 was ignored when the run started (an ignored signal
-# cannot be trapped).
-READY_SIG=""
-RELEASE_SIG=""
-trap 'helper_ready' USR1
-if [[ -n "$(trap -p USR1)" ]]; then
-    READY_SIG=USR1
-    RELEASE_SIG=USR2
-else
-    trap 'helper_ready' USR2
-    if [[ -n "$(trap -p USR2)" ]]; then
-        READY_SIG=USR2
-        RELEASE_SIG=USR1
+# open_ready_pipe: make a named pipe, open it on fd 6 (read only) and fd 7
+# (read and write, so neither open waits for the other side), and remove the
+# name again; the open descriptors keep the pipe. As in make_temp, signals
+# are only recorded while the name exists, so an interruption cannot leave it
+# behind; a signal recorded here is honored right after. Returns 1 when no
+# pipe can be made.
+open_ready_pipe() {
+    local dir name attempt deferred="$IN_DELIVERY" opened=1
+    IN_DELIVERY=true
+    for dir in "${TMPDIR:-}" /tmp; do
+        if [[ -z "$dir" || ! -d "$dir" ]]; then
+            continue
+        fi
+        for attempt in 1 2 3 4; do
+            name="${dir%/}/polish-gemini-ready.$$.$RANDOM$RANDOM"
+            if [[ -e "$name" || -L "$name" ]]; then
+                continue
+            fi
+            if ! shielded mkfifo -m 600 "$name"; then
+                # mkfifo creates nothing when it fails; a name that exists now
+                # belongs to someone else.
+                continue
+            fi
+            TEMP_FILES+=("$name")
+            if [[ -p "$name" && ! -L "$name" ]] && { exec 7<>"$name"; } 2>/dev/null; then
+                if { exec 6<"$name"; } 2>/dev/null; then
+                    opened=0
+                else
+                    exec 7>&-
+                fi
+            fi
+            cleanup_temps
+            if (( opened == 0 )); then
+                break 2
+            fi
+        done
+    done
+    IN_DELIVERY="$deferred"
+    if [[ "$deferred" != "true" && -n "$PENDING_SIGNAL" ]]; then
+        on_signal "$PENDING_SIGNAL"
     fi
-fi
+    return "$opened"
+}
 
 # Standard error stays on /dev/null for the helper until it is released, so
 # a failed start prints nothing raw; it then takes the caller's stderr from
@@ -757,15 +775,33 @@ fi
 # as an asynchronous command would otherwise read /dev/null.
 export HUMANIZE_POLISH_STDERR_FD="$OUT_FD"
 export HUMANIZE_POLISH_SIGNALS="$HANDOFF_SIGNALS"
-if [[ -n "$READY_SIG" ]]; then
+if open_ready_pipe; then
     trap 'helper_signal 130 INT' INT
     trap 'helper_signal 143 TERM' TERM
-    export HUMANIZE_POLISH_SUPERVISOR="$$:$READY_SIG:$RELEASE_SIG"
-    "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}" <&0 &
+    export HUMANIZE_POLISH_SUPERVISOR="$$:7:USR1"
+    "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}" 6<&- <&0 &
     HELPER_PID=$!
+    # Only the helper holds the write end now, so the pipe reaches end of
+    # file when the helper ends.
+    exec 7>&-
     unset HUMANIZE_POLISH_STDERR_FD HUMANIZE_POLISH_SIGNALS HUMANIZE_POLISH_SUPERVISOR
-    if [[ "$HELPER_READY_EARLY" == "true" ]]; then
-        helper_ready
+    while :; do
+        HELPER_TOKEN=""
+        read -r -n 1 HELPER_TOKEN <&6
+        if (( $? <= 128 )); then
+            break
+        fi
+    done
+    exec 6<&-
+    if [[ "$HELPER_TOKEN" == "R" ]]; then
+        # A signal from here on is passed on at once; one recorded before is
+        # passed on now. The release comes after it, so the helper has
+        # recorded that signal before it goes on.
+        HELPER_READY=true
+        if [[ -n "$HELPER_PENDING_NAME" ]]; then
+            kill -"$HELPER_PENDING_NAME" "$HELPER_PID" 2>/dev/null
+        fi
+        kill -USR1 "$HELPER_PID" 2>/dev/null
     fi
     wait_helper
     if [[ "$HELPER_READY" == "true" ]]; then
@@ -784,12 +820,11 @@ if [[ -n "$READY_SIG" ]]; then
         exit "${HELPER_PENDING:-$HELPER_STATUS}"
     fi
 else
-    # Neither SIGUSR1 nor SIGUSR2 can be trapped (both were ignored when the
-    # run started), so the start cannot be supervised. The helper replaces
-    # this shell instead; the handled signals are ignored for the moment of
-    # the exec and caught from the helper's first statements on. When the
-    # exec fails (execfail keeps this shell running), the original is
-    # delivered below.
+    # No pipe could be made (no usable temporary directory), so the start
+    # cannot be supervised. The helper replaces this shell instead; the
+    # handled signals are ignored for the moment of the exec and caught from
+    # the helper's first statements on. When the exec fails (execfail keeps
+    # this shell running), the original is delivered below.
     shopt -s execfail
     trap '' INT TERM
     exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"

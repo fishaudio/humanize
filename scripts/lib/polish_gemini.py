@@ -30,7 +30,8 @@ import signal  # noqa: E402
 # SIGINT and SIGTERM received before the run installs its own handlers.
 _STARTUP_SIGNALS = []
 # Set when the shell wrapper supervises the start (HUMANIZE_POLISH_SUPERVISOR):
-# (wrapper pid, signal that reports readiness, signal that releases the run).
+# (wrapper pid, descriptor that reports readiness, signal that releases the
+# run); None when the setting cannot be used.
 _SUPERVISOR = []
 _RELEASED = []
 # Seconds to wait for the release before giving up; the wrapper then
@@ -100,21 +101,32 @@ def _ignore_signal(signum, frame):
 
 
 def _read_supervisor():
-    """Read HUMANIZE_POLISH_SUPERVISOR ("PID:READY:RELEASE", signal names
-    USR1 and USR2) and catch the release signal from here on, so it cannot
-    end the process."""
+    """Read HUMANIZE_POLISH_SUPERVISOR ("PID:FD:RELEASE": the wrapper's
+    process ID, the write end of the pipe that reports readiness, and the
+    release signal, USR1 or USR2) and catch the release signal from here on,
+    so it cannot end the process."""
     value = os.environ.pop("HUMANIZE_POLISH_SUPERVISOR", None)
     if value is None:
         return
     names = {"USR1": signal.SIGUSR1, "USR2": signal.SIGUSR2}
-    m = re.fullmatch(r"([0-9]+):(USR1|USR2):(USR1|USR2)", value)
-    if not m or m.group(2) == m.group(3):
+    m = re.fullmatch(r"([0-9]{1,9}):([0-9]{1,4}):(USR1|USR2)", value)
+    if not m or int(m.group(2)) < 3:
         # A wrapper that asked for supervision but cannot be answered: the
         # run must not go ahead unsupervised.
         _SUPERVISOR.append(None)
         return
-    _SUPERVISOR.append((int(m.group(1)), names[m.group(2)], names[m.group(3)]))
+    _SUPERVISOR.append((int(m.group(1)), int(m.group(2)), names[m.group(3)]))
     signal.signal(names[m.group(3)], _record_release)
+
+
+def _close_ready_pipe():
+    """Close the readiness pipe, so the wrapper sees end of file if it still
+    waits for readiness."""
+    if _SUPERVISOR and _SUPERVISOR[0] is not None:
+        try:
+            os.close(_SUPERVISOR[0][1])
+        except OSError:
+            pass
 
 
 def _await_release(handled):
@@ -122,9 +134,10 @@ def _await_release(handled):
 
     The wrapper keeps its SIGINT and SIGTERM traps while this process starts.
     Once its handlers are in place (``handled`` are the signals it catches),
-    this process blocks them, tells the wrapper it is ready, and waits for
-    the release before it reads any input. A SIGINT or SIGTERM that arrives
-    meanwhile is recorded, and the run then ends as interrupted; the wrapper
+    this process blocks them, tells the wrapper it is ready (one byte on the
+    readiness pipe), and waits for the release before it reads any input. A
+    SIGINT or SIGTERM that arrives meanwhile is recorded, and the run then
+    ends as interrupted; the wrapper
     sends a signal it received before readiness the same way, followed by
     the release. Returns False when the wrapper is gone or does not answer:
     the process must then end without delivering anything.
@@ -133,15 +146,20 @@ def _await_release(handled):
         return True
     if _SUPERVISOR[0] is None:
         return False
-    pid, ready, release = _SUPERVISOR[0]
+    pid, ready_fd, release = _SUPERVISOR[0]
     if os.getppid() != pid:
+        _close_ready_pipe()
         return False
     waited = set(handled) | {release, signal.SIGALRM}
     old_alarm = signal.signal(signal.SIGALRM, _ignore_signal)
     signal.pthread_sigmask(signal.SIG_BLOCK, waited)
     ok = True
     try:
-        os.kill(pid, ready)
+        try:
+            if os.write(ready_fd, b"R") != 1:
+                raise OSError("short write")
+        finally:
+            _close_ready_pipe()
         deadline = time.monotonic() + RELEASE_WAIT_LIMIT
         signal.setitimer(signal.ITIMER_REAL, 0.5, 0.5)
         while not _RELEASED:

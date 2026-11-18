@@ -33,6 +33,7 @@ import json
 import os
 import re
 import resource
+import select
 import shutil
 import signal
 import socket
@@ -846,9 +847,9 @@ def supervised_start_cases():
                        "rc=%s out=%r dest=%r leftovers=%r %r" % (proc.returncode, stdout[:40], dest, leftovers,
                                                                   err[-300:]))
 
-    # SIGUSR1 ignored when the run starts: the two user signals swap roles
-    # and the start is still supervised. Both ignored: the helper replaces
-    # the wrapper with exec and the run still finishes normally.
+    # SIGUSR1 or SIGUSR2 ignored when the run starts: readiness comes through
+    # a pipe and the helper catches the release signal itself, so the start
+    # is still supervised and the run finishes normally.
     def ignoring(*signums):
         def setup():
             for signum in signums:
@@ -858,6 +859,8 @@ def supervised_start_cases():
     for label, ignored, body, code, expected in (
             ("SIGUSR1 ignored on entry, SIGTERM before the helper is ready", (signal.SIGUSR1,),
              "kill -TERM $PPID", 143, interrupted),
+            ("SIGUSR1 and SIGUSR2 ignored on entry, SIGINT before the helper is ready",
+             (signal.SIGUSR1, signal.SIGUSR2), "kill -INT $PPID", 130, interrupted),
             ("SIGUSR1 ignored on entry", (signal.SIGUSR1,), ":", 0,
              [OUTCOME_PREFIX + "skipped reason=no_api_key delivered=yes"]),
             ("SIGUSR1 and SIGUSR2 ignored on entry", (signal.SIGUSR1, signal.SIGUSR2), ":", 0,
@@ -880,64 +883,143 @@ def supervised_start_cases():
     # The helper's side of the handshake, with this process as a fake
     # supervisor: nothing happens before the release, a signal before the
     # release ends the run as interrupted, the release lets the run go on,
-    # and a supervisor that is not the parent stops the helper.
-    ready = []
-    old_usr1 = signal.signal(signal.SIGUSR1, lambda signum, frame: ready.append(signum))
-    try:
-        for mode in ("signal_before_release", "release", "not_parent", "malformed"):
+    # and a supervisor that is not the parent, or a setting that cannot be
+    # used, stops the helper without a ready byte.
+    for mode in ("signal_before_release", "release", "not_parent", "malformed"):
+        work = tempfile.mkdtemp(prefix="polish-runner-sup-")
+        source = os.path.join(work, "input.md")
+        out = os.path.join(work, "out.md")
+        with open(source, "wb") as fh:
+            fh.write(b"Read the source text.\n")
+        with open(out, "wb") as fh:
+            fh.write(b"old\n")
+        env = fallback_env(work, {"HUMANIZE_POLISH_SIGNALS": "INT,TERM"})
+        env.pop("HUMANIZE_POLISH_PYTHON", None)
+        ready_r, ready_w = os.pipe()
+        supervisor = {"not_parent": "1:%d:USR1" % ready_w, "malformed": "%d:%d:USR3" % (os.getpid(), ready_w)}
+        env["HUMANIZE_POLISH_SUPERVISOR"] = supervisor.get(mode, "%d:%d:USR1" % (os.getpid(), ready_w))
+        proc = subprocess.Popen(
+            [sys.executable, "-I", "-B", os.path.join(ROOT, "scripts", "lib", "polish_gemini.py"),
+             "--input", source, "--output", out, "--model", "google/gemini-4-hydrogen", "--effort", "xhigh",
+             "--timeout", "30", "--max-tokens", "1000", "--max-bytes", "100000",
+             "--base-url", "http://127.0.0.1:9", "--template-dir", os.path.join(ROOT, "prompt-template", "gemini"),
+             "--project-root", work],
+            env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            pass_fds=(ready_w,))
+        os.close(ready_w)
+        ready = b""
+        waited_ok = True
+        if mode in ("signal_before_release", "release"):
+            if select.select([ready_r], [], [], 30)[0]:
+                ready = os.read(ready_r, 16)
+            time.sleep(0.5)
+            # Ready but not released: still running, nothing written.
+            with open(out, "rb") as fh:
+                waited_ok = ready == b"R" and proc.poll() is None and fh.read() == b"old\n"
+            if mode == "signal_before_release":
+                proc.send_signal(signal.SIGTERM)
+                time.sleep(0.3)
+                waited_ok = waited_ok and proc.poll() is None
+            proc.send_signal(signal.SIGUSR1)
+        stdout, err = proc.communicate(timeout=60)
+        # The helper closed its end: nothing more, then end of file.
+        rest = os.read(ready_r, 16)
+        os.close(ready_r)
+        with open(out, "rb") as fh:
+            dest = fh.read()
+        shutil.rmtree(work, ignore_errors=True)
+        if mode == "signal_before_release":
+            ok = (waited_ok and rest == b"" and proc.returncode == 143 and dest == b"old\n"
+                  and outcome_lines(err) == interrupted)
+            name = "a helper that is ready waits for the release; SIGTERM before it: exit 143, interrupted"
+        elif mode == "release":
+            ok = (waited_ok and rest == b"" and proc.returncode == 0 and dest == b"Read the source text.\n"
+                  and outcome_lines(err) == [OUTCOME_PREFIX + "skipped reason=no_api_key delivered=yes"])
+            name = "a released helper runs normally"
+        else:
+            ok = (proc.returncode == 1 and dest == b"old\n" and err == b"" and stdout == b""
+                  and ready == b"" and rest == b"")
+            name = ("a helper whose supervisor is not its parent stops silently" if mode == "not_parent"
+                    else "a helper with a malformed supervisor setting stops silently")
+        report(name, ok, "rc=%s waited=%s ready=%r rest=%r dest=%r %r" % (proc.returncode, waited_ok, ready, rest,
+                                                                         dest, err[-300:]))
+
+    # R3: a signal while the wrapper acts on readiness (bash 3.2 used to lose
+    # a SIGINT there). A copy of the wrapper pauses right before or right
+    # after it marks the helper ready; the signal to the runner PID must
+    # still end the run as interrupted with nothing delivered.
+    for where in ("before", "after"):
+        for signame, code in (("SIGINT", 130), ("SIGTERM", 143)):
             work = tempfile.mkdtemp(prefix="polish-runner-sup-")
+            root = plugin_copy(work)
+            runner = os.path.join(root, "scripts", "polish-gemini.sh")
+            with open(runner) as fh:
+                text = fh.read()
+            pause = ('\\1: > "$POLISH_TEST_PAUSE/at-ready"\n'
+                     '\\1while [[ ! -e "$POLISH_TEST_PAUSE/go" ]]; do :; done\n')
+            mark = r"^([ ]*)HELPER_READY=true\n"
+            text, count = re.subn(mark, (r"\g<0>" + pause) if where == "after" else (pause + r"\g<0>"),
+                                  text, flags=re.M)
+            with open(runner, "w") as fh:
+                fh.write(text)
             source = os.path.join(work, "input.md")
             out = os.path.join(work, "out.md")
             with open(source, "wb") as fh:
-                fh.write(b"Read the source text.\n")
+                fh.write(b"Read the source document.\n")
             with open(out, "wb") as fh:
-                fh.write(b"old\n")
-            env = fallback_env(work, {"HUMANIZE_POLISH_SIGNALS": "INT,TERM"})
-            env.pop("HUMANIZE_POLISH_PYTHON", None)
-            supervisor = {"not_parent": "1:USR1:USR2", "malformed": "%d:USR1:USR1" % os.getpid()}
-            env["HUMANIZE_POLISH_SUPERVISOR"] = supervisor.get(mode, "%d:USR1:USR2" % os.getpid())
-            del ready[:]
-            proc = subprocess.Popen(
-                [sys.executable, "-I", "-B", os.path.join(ROOT, "scripts", "lib", "polish_gemini.py"),
-                 "--input", source, "--output", out, "--model", "google/gemini-4-hydrogen", "--effort", "xhigh",
-                 "--timeout", "30", "--max-tokens", "1000", "--max-bytes", "100000",
-                 "--base-url", "http://127.0.0.1:9", "--template-dir", os.path.join(ROOT, "prompt-template", "gemini"),
-                 "--project-root", work],
-                env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            waited_ok = True
-            if mode in ("signal_before_release", "release"):
-                deadline = time.monotonic() + 30
-                while not ready and time.monotonic() < deadline and proc.poll() is None:
-                    time.sleep(0.02)
-                time.sleep(0.5)
-                # Ready but not released: still running, nothing written.
-                with open(out, "rb") as fh:
-                    waited_ok = bool(ready) and proc.poll() is None and fh.read() == b"old\n"
-                if mode == "signal_before_release":
-                    proc.send_signal(signal.SIGTERM)
-                    time.sleep(0.3)
-                    waited_ok = waited_ok and proc.poll() is None
-                proc.send_signal(signal.SIGUSR2)
+                fh.write(b"OLD\n")
+            proc = subprocess.Popen([runner, "--input", source, "--output", out],
+                                    env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": sys.executable,
+                                                            "POLISH_TEST_PAUSE": work}),
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True,
+                                    preexec_fn=lambda: signal.signal(signal.SIGINT, signal.SIG_DFL))
+            deadline = time.monotonic() + 30
+            while (count == 1 and not os.path.exists(os.path.join(work, "at-ready"))
+                   and proc.poll() is None and time.monotonic() < deadline):
+                time.sleep(0.01)
+            paused = os.path.exists(os.path.join(work, "at-ready"))
+            proc.send_signal(getattr(signal, signame))
+            time.sleep(0.05)
+            with open(os.path.join(work, "go"), "w"):
+                pass
             stdout, err = proc.communicate(timeout=60)
             with open(out, "rb") as fh:
                 dest = fh.read()
             shutil.rmtree(work, ignore_errors=True)
-            if mode == "signal_before_release":
-                ok = (waited_ok and proc.returncode == 143 and dest == b"old\n"
-                      and outcome_lines(err) == interrupted)
-                name = "a helper that is ready waits for the release; SIGTERM before it: exit 143, interrupted"
-            elif mode == "release":
-                ok = (waited_ok and proc.returncode == 0 and dest == b"Read the source text.\n"
-                      and outcome_lines(err) == [OUTCOME_PREFIX + "skipped reason=no_api_key delivered=yes"])
-                name = "a released helper runs normally"
-            else:
-                ok = proc.returncode == 1 and dest == b"old\n" and err == b"" and stdout == b"" and not ready
-                name = ("a helper whose supervisor is not its parent stops silently" if mode == "not_parent"
-                        else "a helper with a malformed supervisor setting stops silently")
-            report(name, ok, "rc=%s waited=%s ready=%s dest=%r %r" % (proc.returncode, waited_ok, ready, dest,
-                                                                       err[-300:]))
-    finally:
-        signal.signal(signal.SIGUSR1, old_usr1)
+            report("%s while the wrapper acts on readiness (%s it marks the helper ready): exit %d, "
+                   "one interrupted outcome, nothing delivered" % (signame, where, code),
+                   count == 1 and paused and proc.returncode == code and dest == b"OLD\n"
+                   and only_prefixed(err) and outcome_lines(err) == interrupted,
+                   "count=%d paused=%s rc=%s dest=%r %r" % (count, paused, proc.returncode, dest, err[-300:]))
+
+    # R3: the readiness pipe. A signal while it is made leaves no pipe behind;
+    # when no pipe can be made, the helper replaces the wrapper with exec and
+    # the run finishes normally.
+    for label, shim_body, code, expected in (
+            ("SIGTERM while the readiness pipe is made: exit 143, interrupted, no pipe left",
+             'kill -TERM "$(ps -o ppid= -p $PPID | tr -d " ")"\nexec \'%s\' "$@"\n' % shutil.which("mkfifo"),
+             143, interrupted),
+            ("no readiness pipe can be made: the helper replaces the wrapper and the run finishes",
+             "exit 1\n", 0, [OUTCOME_PREFIX + "skipped reason=no_api_key delivered=yes"])):
+        work = tempfile.mkdtemp(prefix="polish-runner-sup-")
+        tmp_dir = os.path.join(work, "tmp")
+        os.mkdir(tmp_dir)
+        shim = os.path.join(work, "bin")
+        os.mkdir(shim)
+        write_script(os.path.join(shim, "mkfifo"), "#!/bin/bash\n" + shim_body)
+        payload = b"Read the source text for the readiness pipe.\n"
+        proc = subprocess.Popen([RUNNER, "--input", "-"],
+                                env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": sys.executable, "TMPDIR": tmp_dir,
+                                                        "PATH": shim + os.pathsep + os.environ["PATH"]}),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        stdout, err = proc.communicate(input=payload, timeout=60)
+        leftovers = os.listdir(tmp_dir) + [f for f in os.listdir("/tmp") if f.startswith("polish-gemini-ready.%d."
+                                                                                       % proc.pid)]
+        shutil.rmtree(work, ignore_errors=True)
+        report(label, proc.returncode == code and stdout == (payload if code == 0 else b"") and not leftovers
+               and only_prefixed(err) and outcome_lines(err) == expected,
+               "rc=%s out=%r leftovers=%r %r" % (proc.returncode, stdout[:40], leftovers, err[-300:]))
 
     # During work: the helper waits on a request that never gets an answer;
     # a signal to the runner PID is passed on, a group signal reaches both.
