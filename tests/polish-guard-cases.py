@@ -1023,4 +1023,202 @@ for name, src, cand in [
          '- Parent.\n    > Clear words.\n')]:
     accepts(name, src, cand)
 
+# Round 3 (Round 2 review R2-M1 to R2-M8).
+
+
+def seg_check(name, source, candidate, expect_reject):
+    try:
+        g.check_segments(source, candidate)
+        report(name, not expect_reject, "candidate was accepted")
+    except g.GuardReject as exc:
+        report(name, expect_reject, "rejected with %s (%s)" % (exc.reason, exc.detail))
+
+
+# R2-M1: a fence closes only on a fence line indented at most three columns
+# past its container, and an unclosed fence ends where its container ends.
+for name, src, cand, reason in [
+        ("text after an overindented backtick closer edited", "```\nalpha\n    ```\nKeep text.\n```\n",
+         "```\nalpha\n    ```\nEdit text.\n```\n", "region_changed"),
+        ("text after an overindented tilde closer edited", "~~~\nalpha\n    ~~~\nKeep text.\n~~~\n",
+         "~~~\nalpha\n    ~~~\nEdit text.\n~~~\n", "region_changed"),
+        ("text after a tab-indented closer edited", "```\nalpha\n\t```\nKeep text.\n```\n",
+         "```\nalpha\n\t```\nEdit text.\n```\n", "region_changed"),
+        ("text after a closer four columns into a list item edited",
+         "- Item.\n\n  ```\n  alpha\n      ```\n  Keep text.\n  ```\n",
+         "- Item.\n\n  ```\n  alpha\n      ```\n  Edit text.\n  ```\n", "region_changed"),
+        ("text after an overindented closer in a quote edited", "> ```\n> alpha\n>     ```\n> Keep text.\n> ```\n",
+         "> ```\n> alpha\n>     ```\n> Edit text.\n> ```\n", "region_changed"),
+        ("text after a shorter closer edited", "````\nalpha\n```\nKeep text.\n````\n",
+         "````\nalpha\n```\nEdit text.\n````\n", "region_changed"),
+        ("text after a closer with an info string edited", "```\nalpha\n``` x\nKeep text.\n```\n",
+         "```\nalpha\n``` x\nEdit text.\n```\n", "region_changed"),
+        ("an unclosed fence in a list item edited", "- ```\n  alpha\n  Keep text.\n",
+         "- ```\n  alpha\n  Edit text.\n", "region_changed"),
+        ("an unclosed fence in a list item edited after a blank line", "- ```\n  alpha\n\n  Keep text.\n",
+         "- ```\n  alpha\n\n  Edit text.\n", "region_changed"),
+        ("an unclosed fence in a quote edited after a quoted blank line", "> ```\n> alpha\n>\n> Keep text.\n",
+         "> ```\n> alpha\n>\n> Edit text.\n", "region_changed"),
+        ("code in a fence inside a quoted list item edited",
+         "> - Item.\n>\n>   ```\n>   alpha\n>       ```\n>   Keep text.\n>   ```\n",
+         "> - Item.\n>\n>   ```\n>   alpha\n>       ```\n>   Edit text.\n>   ```\n", "region_changed")]:
+    rejects("R2-M1 " + name, src, cand, reason)
+for name, src, cand in [
+        ("text after a closer indented three columns reworded", "```\nalpha\n   ```\nKeep text.\n",
+         "```\nalpha\n   ```\nEdit text.\n"),
+        ("text after a closer three columns into a list item reworded",
+         "- Item.\n\n  ```\n  alpha\n     ```\n  Keep text.\n",
+         "- Item.\n\n  ```\n  alpha\n     ```\n  Edit text.\n"),
+        ("text after a fence its quote closed reworded", "> ```\n> alpha\n\nKeep text.\n",
+         "> ```\n> alpha\n\nEdit text.\n"),
+        ("text after a fence its list item closed reworded", "- ```\n  alpha\nKeep text.\n",
+         "- ```\n  alpha\nEdit text.\n"),
+        ("a line without a marker after a quoted fence reworded", "> ```\n> alpha\nKeep text.\n> ```\n",
+         "> ```\n> alpha\nEdit text.\n> ```\n")]:
+    accepts("R2-M1 " + name, src, cand)
+
+# R2-M2: code spans, autolinks and raw HTML are opaque while a link label's
+# closing bracket is found.
+M2_LINKS = [
+    ("a bracket in an HTML attribute", 'Read [a <span title="]">label</span>](old) today.'),
+    ("an opening bracket in an HTML attribute", 'Read [a <span title="[">label</span>](old) today.'),
+    ("a bracket in an HTML comment of an image", "See ![a <!-- ] -->label](old) today."),
+    ("an opening bracket in an HTML comment", "See [a <!-- [ -->label](old) today."),
+    ("a bracket in a code span", "Read [a `]` label](old) today."),
+    ("a bracket in an autolink", "Read [a <https://example.com/]> label](old) today."),
+    ("a bracket in a processing instruction", "Read [a <?x ] ?>label](old) today."),
+    ("a nested image with a bracket in its tag", 'Read [![a <b title="]">x</b>](img.png)](old) today.'),
+]
+for name, text in M2_LINKS:
+    rejects("R2-M2 link target after " + name + " changed", text + "\n", text.replace("(old)", "(new)") + "\n",
+            "inline_markup")
+    seg_check("R2-M2 segment link target after " + name + " changed", "[[a]] " + text,
+              "[[a]] " + text.replace("(old)", "(new)"), True)
+rejects("R2-M2 nested image target after a bracket in its tag changed",
+        'Read [![a <b title="]">x</b>](img.png)](old) today.\n',
+        'Read [![a <b title="]">x</b>](other.png)](old) today.\n', "inline_markup")
+accepts("R2-M2 link text around a bracket in an HTML attribute reworded",
+        'Read [a <span title="]">label</span>](old) today.\n',
+        'Read [the <span title="]">label</span>](old) now.\n')
+seg_check("R2-M2 segment link text around a bracket in an HTML attribute reworded",
+          '[[a]] Read [a <span title="]">label</span>](old) today.',
+          '[[a]] Read [the <span title="]">label</span>](old) now.', False)
+accepts("R2-M2 link text around a bracket in a code span reworded",
+        "Read [a `]` label](old) today.\n", "Read [the `]` label](old) now.\n")
+
+# R2-M3: prose units keep the original bytes after a quote marker that was
+# moved for parsing.
+for name, src in [
+        ("in an ordered item", "10. Item.\n\n    > Read `one\n    > \ttwo` today.\n"),
+        ("as math in an ordered item", "10. Item.\n\n    > Read $one\n    > \ttwo$ today.\n"),
+        ("in a nested list item", "- Parent.\n  - Child.\n\n      > Read `one\n      > \ttwo` today.\n"),
+        ("as math in a nested list item", "- Parent.\n  - Child.\n\n      > Read $one\n      > \ttwo$ today.\n"),
+        ("in a list inside a quote", "> 10. Parent.\n>\n>     > Read `one\n>     > \ttwo` today.\n"),
+        ("as math in a list inside a quote", "> 10. Parent.\n>\n>     > Read $one\n>     > \ttwo$ today.\n")]:
+    rejects("R2-M3 a tab inside multiline code changed to equivalent spaces " + name, src,
+            "\n".join(line.expandtabs(4) for line in src.split("\n")), "protected_token")
+    accepts("R2-M3 prose around multiline code reworded " + name, src,
+            src.replace("Read ", "Now read ").replace(" today.", " again."))
+
+# R2-M4: blockquote boundaries and empty blockquotes are structure.
+for name, src, cand in [
+        ("two quotes merged into one", "> First paragraph.\n\n> Second paragraph.\n",
+         "> First paragraph.\n>\n> Second paragraph.\n"),
+        ("one quote split into two", "> First paragraph.\n>\n> Second paragraph.\n",
+         "> First paragraph.\n\n> Second paragraph.\n"),
+        ("an empty quote removed", "Read the guide.\n\n>\n", "Read the guide.\n\n"),
+        ("an empty quote added", "Read the guide.\n", "Read the guide.\n\n>\n"),
+        ("two nested quotes merged", "> > First.\n>\n> > Second.\n", "> > First.\n> >\n> > Second.\n"),
+        ("two quotes in a list item merged", "- Item.\n\n  > First.\n\n  > Second.\n",
+         "- Item.\n\n  > First.\n  >\n  > Second.\n"),
+        ("a quote moved out of its list item", "- Item.\n  > First.\n  >\n  > Second.\n",
+         "- Item.\n  > First.\n>\n> Second.\n"),
+        ("an empty nested quote removed", "> Note.\n>\n> >\n", "> Note.\n>\n")]:
+    rejects("R2-M4 " + name, src, cand, "structure")
+for name, src, cand in [
+        ("prose in two quotes reworded", "> First paragraph.\n\n> Second paragraph.\n",
+         "> First part.\n\n> Second part.\n"),
+        ("prose in one quote reworded", "> First paragraph.\n>\n> Second paragraph.\n",
+         "> First part.\n>\n> Second part.\n"),
+        ("prose next to an empty quote reworded", "Read the guide.\n\n>\n", "Read this guide.\n\n>\n"),
+        ("a lazy line given its marker", "> First paragraph\ncontinues here.\n",
+         "> First paragraph\n> continues here.\n"),
+        ("prose in quotes in a list item reworded", "- Item.\n\n  > First.\n\n  > Second.\n",
+         "- Item.\n\n  > The first.\n\n  > The second.\n")]:
+    accepts("R2-M4 " + name, src, cand)
+
+# R2-M5: resolved reference links and images are emphasis boundaries.
+for name, src, cand in [
+        ("emphasis made across a full reference label", "*first [inside*][ref] last\n\n[ref]: /url\n",
+         "*first* [inside][ref] last\n\n[ref]: /url\n"),
+        ("emphasis made across a full reference image label", "*first ![inside*][ref] last\n\n[ref]: /url\n",
+         "*first* ![inside][ref] last\n\n[ref]: /url\n"),
+        ("emphasis made across a collapsed reference", "*first [inside*][] last\n\n[inside*]: /url\n",
+         "*first* [inside*][] last\n\n[inside*]: /url\n"),
+        ("emphasis made across a shortcut reference", "*first [inside*] last\n\n[inside*]: /url\n",
+         "*first* [inside*] last\n\n[inside*]: /url\n"),
+        ("emphasis made across a reference defined in a protected region",
+         "*first [inside*][ref] last\n\n<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n",
+         "*first* [inside][ref] last\n\n<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n"),
+        ("emphasis made across a reference defined in a quote", "*first [inside*][ref] last\n\n> [ref]: /url\n",
+         "*first* [inside][ref] last\n\n> [ref]: /url\n"),
+        ("an emphasis marker moved past unlinked brackets", "*a [b*] c\n", "a [b*] c*\n"),
+        ("emphasis closed by a marker after a resolved full reference undone",
+         "*a [t][x](* b)\n\n[x]: /u\n", "a [t][x](* b)*\n\n[x]: /u\n"),
+        ("emphasis closed inside an unresolved reference label undone", "*a [t][*] b\n", "a* [t][*] b\n")]:
+    rejects("R2-M5 " + name, src, cand, "inline_markup")
+for name, src, cand in [
+        ("a label reworded inside a full reference", "*first [inside*][ref] last\n\n[ref]: /url\n",
+         "*first [within*][ref] last\n\n[ref]: /url\n"),
+        ("emphasis moved around an unresolved full reference", "*first [inside*][nope] last\n",
+         "*first* [inside][nope] last\n"),
+        ("emphasis moved around a reference that holds a link",
+         "*a [b [c](/u) d*][ref] e\n\n[ref]: /url\n", "*a* [b [c](/u) d][ref] e\n\n[ref]: /url\n")]:
+    accepts("R2-M5 " + name, src, cand)
+seg_check("R2-M5 segment emphasis made across a reference label", "[[a]] *first [inside*][ref] last",
+          "[[a]] *first* [inside][ref] last", True)
+seg_check("R2-M5 segment label reworded inside a reference", "[[a]] *first [inside*][ref] last",
+          "[[a]] *first [within*][ref] last", False)
+
+# R2-M6: hard breaks follow backslash parity and skip code and HTML.
+for name, src, cand in [
+        ("two spaces added after an escaped backslash", "Text with an escaped backslash\\\\\nnext line.\n",
+         "Text with an escaped backslash\\\\  \nnext line.\n"),
+        ("two spaces added after four backslashes", "Text\\\\\\\\\nnext line.\n",
+         "Text\\\\\\\\  \nnext line.\n"),
+        ("a third backslash added", "Text\\\\\nnext line.\n", "Text\\\\\\\nnext line.\n"),
+        ("a break after a tag removed", "Read <b>bold</b>\\\nnext line.\n", "Read <b>bold</b>\nnext line.\n"),
+        ("a break after a code span removed", "Read `code`  \nnext line.\n", "Read `code`\nnext line.\n")]:
+    rejects("R2-M6 " + name, src, cand, "inline_markup")
+for name, src, cand in [
+        ("a backslash break changed to two spaces", "Line one\\\nline two.\n", "Line one  \nline two.\n"),
+        ("prose before a two-space break reworded", "Line one  \nline two.\n", "First line  \nline two.\n"),
+        ("prose before an odd backslash run reworded", "Line one\\\\\\\nline two.\n",
+         "First line\\\\\\\nline two.\n"),
+        ("spaces inside a tag that spans lines changed", 'Read <span  \ntitle="x">word</span> now.\n',
+         'Read <span \ntitle="x">word</span> now.\n')]:
+    accepts("R2-M6 " + name, src, cand)
+
+# R2-M8: processing instructions, declarations and CDATA are raw HTML.
+M8_RAW = [
+    ("a processing instruction", "Read <?php echo 'old'; ?> today."),
+    ("a declaration", "Read <!ELEMENT old EMPTY> today."),
+    ("a CDATA section", "Read <![CDATA[one] old]]> today."),
+    ("a processing instruction with emphasis markers", "Read <?x *old* ?> today."),
+    ("a CDATA section with brackets", "Read <![CDATA[a [old](b)]]> today."),
+]
+for name, text in M8_RAW:
+    rejects("R2-M8 payload of " + name + " changed", text + "\n", text.replace("old", "new") + "\n",
+            "inline_markup")
+    seg_check("R2-M8 segment payload of " + name + " changed", "[[a]] " + text,
+              "[[a]] " + text.replace("old", "new"), True)
+    accepts("R2-M8 prose around " + name + " reworded", text + "\n",
+            text.replace("Read ", "Now read ").replace(" today.", " carefully.") + "\n")
+for name, src in [
+        ("a processing instruction over lines", "Read <?php\necho 'old';\n?> today.\n"),
+        ("a CDATA section over lines", "Read <![CDATA[one\n] old]]> today.\n"),
+        ("a declaration over lines", "Read <!DOCTYPE\nold> today.\n")]:
+    rejects("R2-M8 payload of " + name + " changed", src, src.replace("old", "new"), "inline_markup")
+rejects("R2-M8 whitespace inside a comment changed", "Read <!-- a  b --> today.\n",
+        "Read <!-- a b --> today.\n", "inline_markup")
+
 sys.exit(1 if FAILED else 0)

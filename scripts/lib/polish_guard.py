@@ -187,9 +187,14 @@ _HTML_ATTR = (r"\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
               r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?")
 HTML_OPEN_TAG = r"<[A-Za-z][A-Za-z0-9-]*(?:" + _HTML_ATTR + r")*\s*/?>"
 HTML_CLOSE_TAG = r"</[A-Za-z][A-Za-z0-9-]*\s*>"
-HTML_STRICT_TAG_RE = re.compile(r"<!--.*?-->|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
+# Raw inline HTML that is not an element tag: comments, processing
+# instructions, declarations and CDATA sections, each through its own
+# terminator (they may span lines). They are kept byte for byte.
+HTML_OTHER_RAW = (r"<!---?>|<!--.*?-->|<\?.*?\?>|<![A-Za-z][^>]*>"
+                  r"|<!\[CDATA\[.*?\]\]>")
+HTML_STRICT_TAG_RE = re.compile(HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
 HTML_TAG_RE = re.compile(
-    r"<!--.*?-->|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
+    HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
     + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>", re.S)
 ENTITY_RE = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});")
 URL_RE = re.compile(r"\b(?:https?|ftp|file)://[^\s<>\"'`]+|\bwww\.[^\s<>\"'`]+")
@@ -235,7 +240,11 @@ def _mask(chars, start, end):
 
 
 def _normalize_tag(tag):
-    """Collapse whitespace in a tag outside quoted attribute values."""
+    """Collapse whitespace in an element tag outside quoted attribute values.
+    Comments, processing instructions, declarations and CDATA are kept as
+    written."""
+    if tag.startswith(("<!", "<?")):
+        return tag
     parts = re.split(r"(\"[^\"]*\"|'[^']*')", tag)
     for k in range(0, len(parts), 2):
         parts[k] = re.sub(r"\s+", " ", parts[k])
@@ -255,6 +264,36 @@ def _skip_space(text, i):
     return i
 
 
+OPAQUE_RE = re.compile(AUTOLINK_RE.pattern + "|" + HTML_STRICT_TAG_RE.pattern, re.S)
+
+
+def _opaque_end(text, i):
+    """End of the code span, autolink or raw HTML that starts at ``i``, or
+    None. These bind more tightly than link brackets, so a bracket inside
+    them is text. A backtick run with no closing run is skipped as text."""
+    if text[i] == "`":
+        run = 1
+        while i + run < len(text) and text[i + run] == "`":
+            run += 1
+        j = i + run
+        while j < len(text):
+            if text[j] != "`":
+                j += 1
+                continue
+            k = j
+            while k < len(text) and text[k] == "`":
+                k += 1
+            if k - j == run:
+                return k
+            j = k
+        return i + run
+    if text[i] == "<":
+        m = OPAQUE_RE.match(text, i)
+        if m:
+            return m.end()
+    return None
+
+
 def _label_end(text, start):
     """Index of the "]" closing the label opened at ``start``, or -1 (-2 when nested too deep)."""
     depth = 0
@@ -265,6 +304,11 @@ def _label_end(text, start):
         if ch == "\\" and i + 1 < n:
             i += 2
             continue
+        if ch in "`<":
+            end = _opaque_end(text, i)
+            if end is not None:
+                i = end
+                continue
         if ch == "[":
             depth += 1
             if depth > LINK_NESTING_LIMIT:
@@ -333,14 +377,21 @@ def _link_tail(text, open_paren):
     return None, False
 
 
-def _scan_links(text):
+def _scan_links(text, resolve=None, original=None):
     """Find inline links and images, with balanced brackets and parentheses.
 
     Returns (links, unmodeled): ``links`` holds (start, label_start, label_end,
     end, kind, target) tuples, where ``target`` is the destination with its
     optional title; ``unmodeled`` is True when a link-shaped construct is
     nested beyond LINK_NESTING_LIMIT.
+
+    With ``resolve`` (see _scan_refs), a full or collapsed reference whose
+    label is defined is a link of its own: its reference label is not read
+    as the text of an inline link (in "[a][b](c)" with "b" defined, "(c)" is
+    text). ``original`` (same length as ``text``) gives the label text.
     """
+    if original is None:
+        original = text
     links = []
     unmodeled = False
     n = len(text)
@@ -350,6 +401,11 @@ def _scan_links(text):
         if ch == "\\" and i + 1 < n:
             i += 2
             continue
+        if ch in "`<":
+            opaque = _opaque_end(text, i)
+            if opaque is not None:
+                i = opaque
+                continue
         if ch != "[":
             i += 1
             continue
@@ -357,6 +413,22 @@ def _scan_links(text):
         if close == -2:
             unmodeled = True
             break
+        if resolve is not None and close >= 0 and close + 1 < n and text[close + 1] == "[":
+            second = _ref_label_close(text, close + 1)
+            if second is not None:
+                label = original[close + 2:second]
+                if not label and not re.search(r"[\[\]]", text[i + 1:close]):
+                    label = original[i + 1:close]
+                inner, inner_unmodeled = _scan_links(text[i + 1:close], resolve, original[i + 1:close])
+                if (label.strip() and resolve(label) == "yes"
+                        and not any(k == "link" for _, _, _, _, k, _ in inner)):
+                    for (a, b, c, d, kind, target) in inner:
+                        links.append((a + i + 1, b + i + 1, c + i + 1, d + i + 1, kind, target))
+                    if inner_unmodeled:
+                        unmodeled = True
+                        break
+                    i = second + 1
+                    continue
         if close < 0 or close + 1 >= n or text[close + 1] != "(":
             i += 1
             continue
@@ -371,7 +443,7 @@ def _scan_links(text):
         links.append((start, i + 1, close, end, "image" if start < i else "link", info))
         # Links and images inside the label (an image inside a link, for
         # example) have destinations of their own.
-        inner, inner_unmodeled = _scan_links(text[i + 1:close])
+        inner, inner_unmodeled = _scan_links(text[i + 1:close], resolve, original[i + 1:close])
         for (a, b, c, d, kind, target) in inner:
             links.append((a + i + 1, b + i + 1, c + i + 1, d + i + 1, kind, target))
         if inner_unmodeled:
@@ -379,6 +451,80 @@ def _scan_links(text):
             break
         i = end
     return links, unmodeled
+
+
+REF_LABEL_LIMIT = 999
+
+
+def _ref_label_close(text, open_bracket):
+    """Index of the "]" ending the link label (no unescaped brackets, at most
+    999 characters) that opens at ``open_bracket``, or None."""
+    i = open_bracket + 1
+    while i < len(text) and i - open_bracket <= REF_LABEL_LIMIT + 1:
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text):
+            i += 2
+            continue
+        if ch == "[":
+            return None
+        if ch == "]":
+            return i
+        i += 1
+    return None
+
+
+def _scan_refs(masked, original, resolve, offset=0):
+    """Reference links and images in ``masked`` (a prose unit whose code,
+    autolinks and inline link syntax are already masked; ``original`` has the
+    same length and gives the label text).
+
+    ``resolve`` maps a label to "yes", "maybe" or "no". Returns
+    (label_start, label_end, kind, status) for every full, collapsed or
+    shortcut reference whose label is, or may be, defined; their link text is
+    scanned for nested references too.
+    """
+    out = []
+    n = len(masked)
+    i = 0
+    while i < n:
+        ch = masked[i]
+        if ch == "\\" and i + 1 < n:
+            i += 2
+            continue
+        if ch in "`<":
+            opaque = _opaque_end(masked, i)
+            if opaque is not None:
+                i = opaque
+                continue
+        if ch != "[":
+            i += 1
+            continue
+        close = _label_end(masked, i)
+        if close < 0:
+            i += 1
+            continue
+        # A collapsed or shortcut reference uses the link text as its label,
+        # which then may not hold brackets.
+        text_label = None if re.search(r"[\[\]]", masked[i + 1:close]) else original[i + 1:close]
+        end = close + 1
+        label = text_label
+        second = _ref_label_close(masked, end) if end < n and masked[end] == "[" else None
+        if second is not None:
+            # "[text][label]" (full) or "[text][]" (collapsed). A label of
+            # only whitespace is not a label, and the text is no link.
+            inner = original[end + 1:second]
+            label = inner if inner.strip() else (text_label if not inner else None)
+            end = second + 1
+        status = resolve(label) if label is not None and label.strip() else "no"
+        if status == "no":
+            i += 1
+            continue
+        kind = "image" if i > 0 and masked[i - 1] == "!" else "link"
+        out.append((offset + i + 1, offset + close, kind, status))
+        out.extend(_scan_refs(masked[i + 1:close], original[i + 1:close], resolve,
+                              offset + i + 1))
+        i = end
+    return out
 
 
 def _scan_inline(text):
@@ -436,15 +582,30 @@ def _scan_inline(text):
     return out
 
 
-def extract_tokens(text, labels=None):
+def extract_tokens(text, labels=None, refs=None, maybe=None):
     """Return (tokens, masked) for a prose fragment.
 
     ``tokens`` is an ordered list of (kind, value) pairs. ``masked`` is the
     text with every token replaced by spaces, so the remaining characters are
-    the editable prose.
+    the editable prose; emphasis markers inside a protected reference label
+    are kept, as they still pair with others.
+
+    ``labels`` collects the label spans of links and images, which are
+    boundaries for emphasis. ``refs`` is the document's (definite, possible)
+    reference labels, or None when the fragment stands alone (a segment);
+    the labels of references that may or may not resolve go to ``maybe``.
     """
     chars = list(text)
     found = []
+    unhide = []
+
+    def resolve(label):
+        if refs is None:
+            return "maybe"
+        norm = normalize_label(label)
+        if norm in refs[0]:
+            return "yes"
+        return "maybe" if norm in refs[1] else "no"
 
     def current():
         return "".join(chars)
@@ -473,28 +634,53 @@ def extract_tokens(text, labels=None):
         found.append((m.start(), "autolink", m.group(0)))
         _mask(chars, m.start(), m.end())
 
-    links, _ = _scan_links(current())
+    links, _ = _scan_links(current(), resolve, text)
     for start, label_start, label_end, end, kind, target in links:
         found.append((start, kind, target))
-        # A link label is a boundary for emphasis, except for a "link" that
-        # holds another link: CommonMark does not nest links, so its brackets
-        # are text (its destination is still protected here).
-        if labels is not None and not (kind == "link" and any(
-                k2 == "link" and label_start <= s2 and e2 <= label_end
-                for s2, _, _, e2, k2, _ in links)):
-            labels.append((label_start, label_end))
         # Keep the link text editable; mask the syntax and the target.
         _mask(chars, start, label_start)
         _mask(chars, label_end, end)
 
-    for m in REF_LINK_RE.finditer(current()):
+    if labels is not None:
+        # Link and image labels are boundaries for emphasis: inline links,
+        # and reference links whose label the document defines (with the
+        # same bracket scanner). CommonMark does not nest links, so a "link"
+        # that holds another link is text, and its brackets are no boundary
+        # (its destination is still protected here). A reference that may
+        # or may not resolve gives a possible boundary.
+        spans = [(ls, le, kind, "yes") for _, ls, le, _, kind, _ in links]
+        spans += _scan_refs(current(), text, resolve)
+        for ls, le, kind, status in spans:
+            if kind == "link":
+                inner = [s[3] for s in spans
+                         if s[2] == "link" and ls <= s[0] and s[1] <= le and (s[0], s[1]) != (ls, le)]
+                if "yes" in inner:
+                    continue
+                if inner:
+                    status = "maybe"
+            if status == "yes":
+                labels.append((ls, le))
+            elif maybe is not None:
+                maybe.append((ls, le))
+
+    snapshot = current()
+    for m in REF_LINK_RE.finditer(snapshot):
         kind = "reflink"
         if not m.group(3).strip():
             # Collapsed reference "[label][]": the text is the label.
             found.append((m.start(), kind, m.group(0)))
+            unhide.extend((k, snapshot[k]) for k in range(m.start(), m.end()) if snapshot[k] in "*_~")
             _mask(chars, m.start(), m.end())
             continue
         found.append((m.start(), kind, (m.group(1) or "") + "[" + m.group(3) + "]"))
+        # The reference label is protected. When it does not resolve, the
+        # brackets are text and its emphasis markers pair with others; when
+        # it may resolve, it is also a possible boundary.
+        status = resolve(m.group(3))
+        if status != "yes":
+            unhide.extend((k, snapshot[k]) for k in range(m.end(2), m.end()) if snapshot[k] in "*_~")
+            if status == "maybe" and maybe is not None:
+                maybe.append((m.start(3), m.end(3)))
         _mask(chars, m.start(), m.start(2))
         _mask(chars, m.end(2), m.end())
 
@@ -502,8 +688,13 @@ def extract_tokens(text, labels=None):
         found.append((m.start(), "footnote", m.group(0)))
         _mask(chars, m.start(), m.end())
 
-    for m in SHORTCUT_REF_RE.finditer(current()):
+    snapshot = current()
+    for m in SHORTCUT_REF_RE.finditer(snapshot):
         found.append((m.start(), "reflink", m.group(0)))
+        # The bracketed text is protected as a whole, as it may be a link
+        # label; its emphasis markers still pair with those around it when
+        # it is not a link.
+        unhide.extend((k, snapshot[k]) for k in range(m.start(), m.end()) if snapshot[k] in "*_~")
         _mask(chars, m.start(), m.end())
 
     for m in HTML_TAG_RE.finditer(current()):
@@ -552,6 +743,8 @@ def extract_tokens(text, labels=None):
         _mask(chars, m.start(), m.start() + len(value))
 
     for k, ch in hidden:
+        chars[k] = ch
+    for k, ch in unhide:
         chars[k] = ch
 
     # Link destinations, autolinks and URLs are read again from the original
@@ -719,11 +912,31 @@ def emphasis_structure(original, masked, labels=()):
     return forest, sorted(literal.items())
 
 
+def _blank_out(chars, start, end, fill):
+    for k in range(start, end):
+        if chars[k] != "\n":
+            chars[k] = fill
+
+
 def hard_break_count(text):
-    lines = text.split("\n")
+    """The number of hard line breaks in a prose unit: a line end after two
+    or more spaces, or after an odd number of backslashes (in an even run the
+    backslashes escape each other). Line ends inside code spans, math,
+    autolinks or raw HTML are not breaks, so those spans are replaced by a
+    non-space character first."""
+    chars = list(text)
+    for kind, start, end, _ in _scan_inline(text):
+        if kind in ("code", "math"):
+            _blank_out(chars, start, end, "\x02")
+    for regex in (INLINE_MATH_RE, AUTOLINK_RE, HTML_STRICT_TAG_RE):
+        for m in regex.finditer("".join(chars)):
+            _blank_out(chars, m.start(), m.end(), "\x02")
     count = 0
-    for line in lines[:-1]:
-        if line.endswith("  ") or line.endswith("\\"):
+    for line in "".join(chars).split("\n")[:-1]:
+        body = line.rstrip(" ")
+        if len(line) - len(body) >= 2:
+            count += 1
+        elif len(body) == len(line) and (len(body) - len(body.rstrip("\\"))) % 2 == 1:
             count += 1
     return count
 
@@ -759,15 +972,46 @@ def _first_token_difference(a, b):
     return None
 
 
-def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars=False):
-    """Compare one prose unit (a paragraph, heading, list item, cell or segment)."""
+AMBIGUOUS_LABEL_LIMIT = 4
+
+
+def _check_emphasis(src, src_masked, src_labels, src_maybe,
+                    cand, cand_masked, cand_labels, cand_maybe, where):
+    """Compare emphasis with every combination of the possible link labels
+    (references that may or may not resolve) as boundaries. A possible label
+    matters only when emphasis markers sit inside it."""
+    if len(src_maybe) != len(cand_maybe):
+        raise GuardReject("inline_markup", "%s: bracketed text changed" % where)
+
+    def has_markers(masked, span):
+        return bool(re.search(r"[*_~]", masked[span[0]:span[1]]))
+
+    relevant = [k for k in range(len(src_maybe))
+                if has_markers(src_masked, src_maybe[k]) or has_markers(cand_masked, cand_maybe[k])]
+    if len(relevant) > AMBIGUOUS_LABEL_LIMIT:
+        raise GuardReject(
+            "inline_markup",
+            "%s: more than %d bracketed texts with emphasis markers that may be links"
+            % (where, AMBIGUOUS_LABEL_LIMIT))
+    for bits in range(1 << len(relevant)):
+        chosen = [k for idx, k in enumerate(relevant) if bits >> idx & 1]
+        if (emphasis_structure(src, src_masked, src_labels + [src_maybe[k] for k in chosen])
+                != emphasis_structure(cand, cand_masked, cand_labels + [cand_maybe[k] for k in chosen])):
+            raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
+
+
+def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars=False, refs=None):
+    """Compare one prose unit (a paragraph, heading, list item, cell or segment).
+
+    ``refs`` is the document's (definite, possible) reference labels; None
+    for a segment, whose references may or may not resolve."""
     if markup_chars:
         for ch in "<>":
             if cand.count(ch) > src.count(ch):
                 raise GuardReject("markup_in_text", "%s: candidate adds %r" % (where, ch))
-    src_labels, cand_labels = [], []
-    src_tokens, src_masked = extract_tokens(src, src_labels)
-    cand_tokens, cand_masked = extract_tokens(cand, cand_labels)
+    src_labels, cand_labels, src_maybe, cand_maybe = [], [], [], []
+    src_tokens, src_masked = extract_tokens(src, src_labels, refs, src_maybe)
+    cand_tokens, cand_masked = extract_tokens(cand, cand_labels, refs, cand_maybe)
     if src_tokens != cand_tokens:
         idx, x, y = _first_token_difference(src_tokens, cand_tokens)
         kinds = set()
@@ -784,9 +1028,8 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
         raise GuardReject(
             reason,
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
-    if (emphasis_structure(src, src_masked, src_labels)
-            != emphasis_structure(cand, cand_masked, cand_labels)):
-        raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
+    _check_emphasis(src, src_masked, src_labels, src_maybe,
+                    cand, cand_masked, cand_labels, cand_maybe, where)
     if hard_break_count(src) != hard_break_count(cand):
         raise GuardReject("inline_markup", "%s: hard line breaks changed" % where)
     check_scripts(src_masked, cand_masked, where)
@@ -826,6 +1069,12 @@ REFDEF_FULL_RE = re.compile(
     r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
     r"(?:\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^()\\])*\)))?"
     r"[ \t]*(?:\n|$)")
+# The label of a definition, which may continue over lines.
+REFDEF_LABEL_RE = re.compile(r"[ ]{0,3}\[((?:\\[\s\S]|[^\[\]\\])+)\]:")
+# A line in a protected region or footnote that may be a definition: the
+# label after any quote or list markers.
+LOOSE_REFDEF_RE = re.compile(
+    r"^[ \t>]*(?:(?:[-+*]|\d{1,9}[.)])[ \t]+)*\[(?!\^)((?:\\[\s\S]|[^\[\]\\])+)\]:", re.M)
 HTML_BLOCK_TAGS = (
     "address|article|aside|blockquote|body|caption|center|col|colgroup|dd|details|dialog|"
     "dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|"
@@ -843,14 +1092,17 @@ HTML_LINE_TAG_RE = re.compile(
 
 
 class Block(object):
-    __slots__ = ("kind", "attrs", "raw", "units", "line")
+    __slots__ = ("kind", "attrs", "raw", "units", "line", "ref")
 
-    def __init__(self, kind, attrs, raw, units, line):
+    def __init__(self, kind, attrs, raw, units, line, ref=None):
         self.kind = kind
         self.attrs = attrs
         self.raw = raw
         self.units = units
         self.line = line
+        # For a reference definition: (normalized label, whether the parser
+        # read the whole definition). Not part of the comparison.
+        self.ref = ref
 
     def describe(self):
         return "block at line %d (%s)" % (self.line, self.kind)
@@ -921,6 +1173,25 @@ def _quote_rest(line, depth):
     return line[_quote_walk(line, depth)[2]:]
 
 
+def _loose_quote_end(line, depth):
+    """Position in ``line`` after ``depth`` quote markers and the optional
+    space or tab after each one. Any indentation may come before a marker:
+    a quote inside a list item can sit four or more columns into the line.
+    Used on original lines, whose structure is already known, to find where
+    their content bytes start."""
+    pos = 0
+    for _ in range(depth):
+        k = pos
+        while k < len(line) and line[k] in " \t":
+            k += 1
+        if k >= len(line) or line[k] != ">":
+            break
+        pos = k + 1
+        if pos < len(line) and line[pos] in " \t":
+            pos += 1
+    return pos
+
+
 def _quote_prefix(line, depth):
     """The first ``depth`` quote markers of ``line`` and the indentation
     before them, without the optional space after the last one."""
@@ -985,17 +1256,7 @@ def _starts_block(body, in_list):
     return False
 
 
-def _fence_end(lines, start, quote, fence):
-    """Return the index of the line that closes ``fence`` (or the last line)."""
-    n = len(lines)
-    j = start
-    while j < n:
-        b = _strip_quote(lines[j], quote)
-        cm = re.match(r"^[ \t]*(`{3,}|~{3,})[ \t]*$", b)
-        if cm and cm.group(1)[0] == fence[0] and len(cm.group(1)) >= len(fence):
-            return j
-        j += 1
-    return n - 1
+FENCE_CLOSE_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*$")
 
 
 def _is_fence_open(text):
@@ -1123,15 +1384,13 @@ def parse_blocks(text):
     """
     # Column computations read ``lines``, whose structural tabs are expanded
     # and whose quote and list prefixes may be moved; raw blocks and prose
-    # units read the original bytes in ``orig_lines``.
+    # units read the original bytes in ``orig_lines``. A line cut after a
+    # polish:on marker is cut in both copies.
     orig_lines = text.split("\n")
     lines = [_expand_structure(line) for line in orig_lines]
     n = len(lines)
     blocks = []
     i = 0
-    # Lines whose rest was cut after a polish:on marker: their blocks keep the
-    # cut text.
-    cut_lines = set()
 
     if n > 1 and lines[0] in ("---", "+++"):
         closer = lines[0]
@@ -1175,6 +1434,9 @@ def parse_blocks(text):
         return _indent_of(rel) < 4 and not _starts_quote(rel)
 
     def containers(quote, indent, qcols):
+        """Close the list items a line at quote depth ``quote`` leaves. An
+        ``indent`` of None (a line holding only quote markers) keeps the
+        items at its own level open, as a blank line does."""
         del level_stacks[quote + 1:]
         while len(level_stacks) <= quote:
             level_stacks.append([])
@@ -1185,15 +1447,74 @@ def parse_blocks(text):
             while outer and qcols[level] < outer[-1][1]:
                 outer.pop()
         stack = level_stacks[quote]
-        while stack and indent < stack[-1][1]:
+        while indent is not None and stack and indent < stack[-1][1]:
             stack.pop()
         base = stack[-1][1] if stack else 0
         return len(stack), base, tuple(len(level) for level in level_stacks)
+
+    # The open blockquotes, outermost first. Each entry is the number of open
+    # list items at every enclosing level when the quote opened: the quote
+    # ends when a line has fewer markers, when one of those list items
+    # closes, or at a blank line. Every quote that opens is a block of its
+    # own ("quote"), so merging, splitting, adding or removing a quote,
+    # including an empty one, changes the structure.
+    open_quotes = []
+
+    def track_quotes(qdepth, ancestry, line_no):
+        keep = 0
+        while (keep < min(len(open_quotes), qdepth)
+               and open_quotes[keep] == ancestry[:keep + 1]):
+            keep += 1
+        del open_quotes[keep:]
+        for level in range(keep + 1, qdepth + 1):
+            open_quotes.append(ancestry[:level])
+            blocks.append(Block("quote", {"level": level, "container": ancestry[:level]},
+                                "", [], line_no))
+
+    def fence_end(start, quote, depth, base, fence):
+        """Index of the last line of the fence opened on line ``start - 1``:
+        the closing fence, or the last line before the fence's blockquote or
+        list item ends (fenced code has no lazy continuation lines). A
+        closing fence is indented at most three columns past its container."""
+        last = start - 1
+        j = start
+        while j < n:
+            if not lines[j].strip():
+                if quote:
+                    break
+                j += 1
+                continue
+            if _quote_depth(lines[j])[0] < quote:
+                break
+            if quote and _leaves_list_item(qcols_of(j, quote), quote, level_stacks):
+                break
+            kb = _strip_quote(lines[j], quote)
+            if kb.strip():
+                if depth > 0 and _indent_of(kb) < base:
+                    break
+                rel = _past_container(kb, base)
+                cm = FENCE_CLOSE_RE.match(rel.lstrip(" "))
+                if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == fence[0]
+                        and len(cm.group(1)) >= len(fence)):
+                    return j
+                last = j
+            j += 1
+        return last
 
     while i < n:
         line = lines[i]
         quote, body = _quote_depth(line)
         if not body.strip():
+            if not line.strip():
+                # A blank line closes every blockquote and the list items
+                # inside them.
+                del level_stacks[1:]
+                del open_quotes[:]
+            else:
+                # A line with only quote markers stays inside its quotes
+                # (and their list items) and may open new ones.
+                ancestry = containers(quote, None, qcols_of(i, quote))[2]
+                track_quotes(quote, ancestry, i + 1)
             i += 1
             continue
         start_line = i + 1
@@ -1206,6 +1527,10 @@ def parse_blocks(text):
         qcols = qcols_of(i, quote)
         depth, base, ancestry = containers(quote, indent, qcols)
         cbody = ebody[base:] if indent >= base else ebody.lstrip(" ")
+        if not (depth > 0 and _starts_quote(cbody)):
+            # (A quote marker indented into a list item is moved below and
+            # the line read again; its quotes are tracked then.)
+            track_quotes(quote, ancestry, start_line)
 
         def attrs(**extra):
             out = {"quote": quote, "container": ancestry}
@@ -1231,11 +1556,16 @@ def parse_blocks(text):
             # indentation.
             blocks.append(Block("protected", attrs(), "\n".join(lines[i:j] + [lines[j][:on.end()]]),
                                 [], start_line))
-            _, after = _quote_depth(lines[j])
+            jq, after = _quote_depth(lines[j])
             prefix = lines[j][:len(lines[j]) - len(after)]
             lead = after[:len(after) - len(after.lstrip(" \t"))]
             lines[j] = prefix + lead + rest.lstrip(" \t")
-            cut_lines.add(j)
+            # The same cut on the original bytes: the rest of the line after
+            # the marker is unchanged by tab expansion or moved markers.
+            orig = orig_lines[j]
+            head = _loose_quote_end(orig, jq)
+            head += len(orig[head:]) - len(orig[head:].lstrip(" \t"))
+            orig_lines[j] = orig[:head] + orig[len(orig) - len(rest):].lstrip(" \t")
             i = j
             continue
 
@@ -1286,7 +1616,7 @@ def parse_blocks(text):
 
         fence = _is_fence_open(cbody)
         if fence:
-            end = _fence_end(lines, i + 1, quote, fence)
+            end = fence_end(i + 1, quote, depth, base, fence)
             blocks.append(Block("fence", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
             i = end + 1
             continue
@@ -1375,7 +1705,9 @@ def parse_blocks(text):
                 while (j + 1 < k and not REFDEF_RE.match(parts[j + 1 - i])
                        and not FOOTNOTE_DEF_RE.match(parts[j + 1 - i])):
                     j += 1
-            blocks.append(Block("refdef", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
+            label = REFDEF_LABEL_RE.match(joined)
+            ref = (normalize_label(label.group(1)), bool(dm)) if label else None
+            blocks.append(Block("refdef", attrs(), "\n".join(lines[i:j + 1]), [], start_line, ref))
             i = j + 1
             continue
 
@@ -1432,7 +1764,8 @@ def parse_blocks(text):
             # Whether a blank line comes before the item (it makes a list
             # loose). Recorded for every item, so adding or removing one is
             # visible however the previous block is nested.
-            blank_before = bool(blocks and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
+            seen_content = any(b.kind != "quote" for b in blocks)
+            blank_before = bool(seen_content and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
             level_stacks[quote].append((indent, content_col))
             blocks.append(Block("list_item", {
                 "quote": quote,
@@ -1497,13 +1830,10 @@ def parse_blocks(text):
                 break
             if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
-            # Original bytes, except for a line whose quote marker was moved
-            # (the original has the marker out of the prefix parser's reach)
-            # or that was cut after a polish:on marker.
-            if j in cut_lines or j in marker_quote_col:
-                content.append(_quote_rest(nxt, quote))
-            else:
-                content.append(_quote_rest(orig_lines[j], quote))
+            # The original bytes after the line's quote markers, also when a
+            # marker was moved for parsing: a tab inside a code span or math
+            # that spans lines is compared as written.
+            content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
             j += 1
         if setext_level:
             blocks.append(Block("heading", attrs(level=setext_level),
@@ -1519,9 +1849,29 @@ def parse_blocks(text):
         if block.kind in RAW_LINE_KINDS:
             first = block.line - 1
             last = first + block.raw.count("\n")
-            block.raw = "\n".join(lines[k] if k in cut_lines else orig_lines[k]
-                                  for k in range(first, last + 1))
+            block.raw = "\n".join(orig_lines[first:last + 1])
     return blocks
+
+
+def normalize_label(label):
+    """A link label as CommonMark matches it: case-folded, with runs of
+    whitespace collapsed and the ends trimmed."""
+    return " ".join(label.split()).casefold()
+
+
+def reference_labels(blocks):
+    """The link reference labels a document defines, as (definite, possible):
+    labels of definitions the parser read, and labels that may be defined
+    (in a polish:off region, a footnote, or a definition the parser could
+    not read in full)."""
+    definite, possible = set(), set()
+    for block in blocks:
+        if block.kind == "refdef" and block.ref:
+            (definite if block.ref[1] else possible).add(block.ref[0])
+        elif block.kind in ("protected", "footnote_def"):
+            for m in LOOSE_REFDEF_RE.finditer(block.raw):
+                possible.add(normalize_label(m.group(1)))
+    return definite, possible - definite
 
 
 def prose_block_count(text):
@@ -1544,6 +1894,8 @@ def _mask_code(text, segments=False):
     else:
         chunks = []
         for block in parse_blocks(text):
+            if block.kind == "quote":
+                continue
             first = block.line - 1
             last = min(first + block.raw.count("\n"), len(lines) - 1)
             if block.kind in ("fence", "indented_code"):
@@ -1608,6 +1960,9 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
                 detail += "; first difference at source line %d (%s vs %s)" % (a.line, a.kind, b.kind)
                 break
         raise GuardReject("structure", detail)
+    # Reference definitions are raw blocks, so the source's labels hold for
+    # the candidate too (a changed definition is rejected below).
+    refs = reference_labels(src_blocks)
     total_src = 0
     total_cand = 0
     for a, b in zip(src_blocks, cand_blocks):
@@ -1624,7 +1979,7 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
             raise GuardReject("structure", "%s: cell count changed" % where)
         for k, (su, cu) in enumerate(zip(a.units, b.units)):
             unit_where = where if len(a.units) == 1 else "%s cell %d" % (where, k + 1)
-            s_len, c_len = compare_prose(su, cu, unit_where, block_ratio)
+            s_len, c_len = compare_prose(su, cu, unit_where, block_ratio, refs=refs)
             total_src += s_len
             total_cand += c_len
     check_ratio(total_src, total_cand, doc_ratio, "document")
