@@ -1251,6 +1251,13 @@ def _is_table_sep(line):
     return "|" in line and "-" in line and bool(TABLE_SEP_RE.match(line))
 
 
+def _is_table_start(header, sep):
+    """GFM: a table starts with a header row and a delimiter row that have
+    the same number of cells; otherwise neither line is part of a table."""
+    return ("|" in header and _is_table_sep(sep)
+            and len(_split_cells(header)) == len(_split_cells(sep)))
+
+
 def _starts_block(body, in_paragraph):
     """True when ``body`` would start a new block instead of continuing prose.
 
@@ -1584,6 +1591,36 @@ def parse_blocks(text):
             j += 1
         return last
 
+    def emit_table(i, quote, depth, base, attrs):
+        """Emit the table whose header row is line ``i`` and whose delimiter
+        row is the next line, and return the index after it. Body rows run
+        until a blank line, the start of another block, or a line that
+        leaves the table's quote or list item, with or without pipes."""
+        rows = [i]
+        j = i + 2
+        while j < n and in_container(j, quote, depth, base):
+            if _starts_block(_past_container(_strip_quote(lines[j], quote), base), False):
+                break
+            rows.append(j)
+            j += 1
+        has_html = any(HTML_TAG_RE.search(_strip_quote(lines[r], quote)) for r in rows)
+        for idx, r in enumerate(rows):
+            row_body = _strip_quote(lines[r], quote)
+            cells = _split_cells(row_body)
+            if has_html:
+                blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
+            else:
+                blocks.append(Block("table_row", attrs(cols=len(cells)), lines[r], cells, r + 1))
+            if idx == 0:
+                sep = _strip_quote(lines[i + 1], quote)
+                sep_norm = re.sub(r"[ \t]", "", sep).strip("|")
+                blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
+        return j
+
+    # Lazy lines that head a table, by line index: the containers of the
+    # paragraph they followed (quote, depth, base, ancestry).
+    lazy_table_headers = {}
+
     while i < n:
         line = lines[i]
         quote, body = _quote_depth(line)
@@ -1601,6 +1638,26 @@ def parse_blocks(text):
             i += 1
             continue
         start_line = i + 1
+
+        def attrs(**extra):
+            out = {"quote": quote, "container": ancestry}
+            if any(ancestry):
+                # Inside a list item, a blank line between two blocks makes
+                # the list loose.
+                out["gap"] = blank_line_before(i, quote)
+            out.update(extra)
+            return out
+
+        forced = lazy_table_headers.pop(i, None)
+        if forced is not None:
+            # GFM takes a table's header row from the paragraph above the
+            # delimiter row, also when that line was a lazy continuation
+            # line: the table belongs to the paragraph's containers. Parsers
+            # differ here, so a header that becomes or stops being lazy is
+            # also a structure change.
+            quote, depth, base, ancestry = forced
+            i = emit_table(i, quote, depth, base, lambda **extra: attrs(lazy_header=True, **extra))
+            continue
         ebody = _strip_quote(line, quote)
         indent = len(ebody) - len(ebody.lstrip(" "))
         # Column of each quote marker in the text of its level: a quote
@@ -1614,15 +1671,6 @@ def parse_blocks(text):
             # (A quote marker indented into a list item is moved below and
             # the line read again; its quotes are tracked then.)
             track_quotes(quote, ancestry, start_line)
-
-        def attrs(**extra):
-            out = {"quote": quote, "container": ancestry}
-            if any(ancestry):
-                # Inside a list item, a blank line between two blocks makes
-                # the list loose.
-                out["gap"] = blank_line_before(i, quote)
-            out.update(extra)
-            return out
 
         if indent - base < 4 and POLISH_OFF_LINE_RE.match(cbody):
             j = i + 1
@@ -1860,31 +1908,9 @@ def parse_blocks(text):
             lines[i] = ((_quote_prefix(line, quote) + " ") if quote else "") + new_body
             continue
 
-        if ("|" in cbody and i + 1 < n and in_container(i + 1, quote, depth, base)
-                and _is_table_sep(_strip_quote(lines[i + 1], quote))):
-            # Body rows run until a blank line, the start of another block,
-            # or a line that leaves the table's quote or list item, with or
-            # without pipes.
-            rows = [i]
-            j = i + 2
-            while j < n and in_container(j, quote, depth, base):
-                if _starts_block(_past_container(_strip_quote(lines[j], quote), base), False):
-                    break
-                rows.append(j)
-                j += 1
-            has_html = any(HTML_TAG_RE.search(_strip_quote(lines[r], quote)) for r in rows)
-            for idx, r in enumerate(rows):
-                row_body = _strip_quote(lines[r], quote)
-                cells = _split_cells(row_body)
-                if has_html:
-                    blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
-                else:
-                    blocks.append(Block("table_row", attrs(cols=len(cells)), lines[r], cells, r + 1))
-                if idx == 0:
-                    sep = _strip_quote(lines[i + 1], quote)
-                    sep_norm = re.sub(r"[ \t]", "", sep).strip("|")
-                    blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
-            i = j
+        if (i + 1 < n and in_container(i + 1, quote, depth, base)
+                and _is_table_start(cbody, _strip_quote(lines[i + 1], quote))):
+            i = emit_table(i, quote, depth, base, attrs)
             continue
 
         # Paragraph, possibly a setext heading. An underline only counts when
@@ -1927,7 +1953,13 @@ def parse_blocks(text):
                 break
             if _starts_block(nbc, same_container):
                 break
-            if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
+            if (j + 1 < n and _is_table_start(nbc, _strip_quote(lines[j + 1], quote))
+                    and in_container(j + 1, quote, depth, base)):
+                # A delimiter row that matches the paragraph's containers
+                # turns this line into a table's header row. One that does
+                # not is lazy paragraph text, and so is this line.
+                if not same_container:
+                    lazy_table_headers[j] = (quote, depth, base, ancestry)
                 break
             # The original bytes after the line's quote markers, also when a
             # marker was moved for parsing: a tab inside a code span or math

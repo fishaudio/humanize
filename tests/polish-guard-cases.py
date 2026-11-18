@@ -1279,6 +1279,29 @@ for name, src, cand in [
          "1. | Name | Note |\n   |---|---|\n   | a | Read this. |\n",
          "1. | Name | Note |\n   |---|---|\n   | a | See this. |\n")]:
     accepts("R3 " + name, src, cand)
+# A table needs a header row and a delimiter row with the same number of
+# cells, and the delimiter row must match the containers of the paragraph
+# above it; a lazy header row keeps the table in that paragraph's list item.
+for name, src, cand in [
+        ("an empty sibling item turned into a setext underline after a mismatched delimiter row",
+         "  > ~~~\na | b\n- |---|---|\n- \n", "  > ~~~\na | b\n- |---|---|\n  - \n"),
+        ("a delimiter row indented into a list item, turning paragraph text into a table",
+         "- item text\n| a | b |\n|---|---|\n", "- item text\n| a | b |\n  |---|---|\n"),
+        ("a delimiter row moved out of a list item, turning a table into paragraph text",
+         "1. Read this.\n   | c | d |\n   |---|---|\n", "1. Read this.\n   | c | d |\n  |---|---|\n"),
+        ("a lazy header row of a table in a list item indented",
+         "- item text\n| a | b |\n  |---|---|\n", "- item text\n  | a | b |\n  |---|---|\n"),
+        ("a lazy header row of a table in a quote given its marker",
+         "> quoted text\n| a | b |\n> |---|---|\n", "> quoted text\n> | a | b |\n> |---|---|\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("pipe text after a list item, not a table, reworded",
+         "- item text\n| a | b |\n|---|---|\n", "- item words\n| a | b |\n|---|---|\n"),
+        ("a cell of a table with a lazy header row reworded",
+         "- item text\n| Read | b |\n  |---|---|\n", "- item text\n| See | b |\n  |---|---|\n"),
+        ("pipe text above a delimiter row with more cells reworded",
+         "Read a | b\n|---|---|---|\n", "See a | b\n|---|---|---|\n")]:
+    accepts("R3 " + name, src, cand)
 seg_check("R3 five emphasized references with one label in a segment reworded",
           "[[a]] Read [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].",
           "[[a]] See [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].",
