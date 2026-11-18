@@ -127,6 +127,27 @@ def child(mode, work):
                 os.kill(os.getpid(), signal.SIGTERM)
 
         p.Runner.emit = emit_with_signal
+    if mode in ("signal_after_handlers", "signal_twice"):
+        # A signal right after the run installs its handlers, and (signal_twice)
+        # a second one before the interruption path defers signals.
+        original_set = p._set_signal_handlers
+        original_block = p._block_signals
+        state = {"set": 0, "block": 0}
+
+        def set_then_signal(handler):
+            original_set(handler)
+            state["set"] += 1
+            if state["set"] == 1:
+                os.kill(os.getpid(), signal.SIGTERM)
+
+        def signal_then_block():
+            state["block"] += 1
+            if mode == "signal_twice" and state["block"] == 1:
+                os.kill(os.getpid(), signal.SIGTERM)
+            original_block()
+
+        p._set_signal_handlers = set_then_signal
+        p._block_signals = signal_then_block
     if mode == "signal_during_rename":
         original_replace = os.replace
 
@@ -678,6 +699,29 @@ def startup_cases():
                and only_prefixed(proc.stderr) and outcome_lines(proc.stderr) == [OUTCOME_PREFIX + expected],
                "fired=%s rc=%s leftovers=%r %r" % (fired, proc.returncode, leftovers, outcome_lines(proc.stderr)))
 
+    # A removal that keeps failing is reported on stderr before the outcome
+    # line; the delivery itself is unaffected.
+    work = tempfile.mkdtemp(prefix="polish-runner-start-")
+    tmp_dir = os.path.join(work, "tmp")
+    os.mkdir(tmp_dir)
+    shim = os.path.join(work, "bin")
+    os.mkdir(shim)
+    write_script(os.path.join(shim, "rm"),
+                 "#!/bin/bash\nif [[ \"${2:-}\" == */polish-gemini-in.* ]]; then exit 1; fi\n"
+                 "exec '%s' \"$@\"\n" % shutil.which("rm"))
+    proc = subprocess.run([RUNNER, "--input", "-"],
+                          env=fallback_env(work, {"PATH": shim + os.pathsep + path, "TMPDIR": tmp_dir}),
+                          input=payload, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+    leftovers = os.listdir(tmp_dir)
+    shutil.rmtree(work, ignore_errors=True)
+    lines = proc.stderr.decode("utf-8", "replace").splitlines()
+    report("a removal that keeps failing is reported before the one outcome line",
+           proc.returncode == 0 and proc.stdout == payload and only_prefixed(proc.stderr)
+           and any("could not remove the temporary file" in ln for ln in lines) and len(leftovers) == 1
+           and lines[-1] == OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"
+           and len(outcome_lines(proc.stderr)) == 1,
+           "rc=%s leftovers=%r %r" % (proc.returncode, leftovers, proc.stderr))
+
     # The Python helper is missing from the plugin: the wrapper delivers the
     # original itself.
     work = tempfile.mkdtemp(prefix="polish-runner-start-")
@@ -730,6 +774,19 @@ def startup_cases():
            "rc=%s %r" % (proc.returncode, proc.stderr))
 
 
+def interruption_window_cases():
+    """A signal right after the run installs its handlers, or a second one
+    while the interruption is handled, still gives one interrupted outcome."""
+    for mode, label in (("signal_after_handlers", "right after the handlers are installed"),
+                        ("signal_twice", "twice, the second before signals are deferred")):
+        r = run_child(mode)
+        lines = r["err"].splitlines()
+        report("SIGTERM %s: one interrupted outcome, exit 143, no raw stderr" % label,
+               r["rc"] == 143 and r["outcomes"] == [OUTCOME_PREFIX + "failed reason=interrupted delivered=no"]
+               and all(ln.startswith("polish-gemini: ") for ln in lines) and lines[-1] == r["outcomes"][0],
+               "rc=%s %r" % (r["rc"], r["err"][-300:]))
+
+
 def ignored_signal_cases():
     """SIGINT ignored when the run starts (a background job) stays ignored."""
     payload = b"Read the source text.\n" * 50000
@@ -778,6 +835,7 @@ def main():
     temp_file_signal_cases()
     shell_step_cases()
     startup_cases()
+    interruption_window_cases()
     sys.exit(1 if FAILED else 0)
 
 

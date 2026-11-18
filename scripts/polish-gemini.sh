@@ -95,8 +95,9 @@ emit_outcome() {
 # cleanup_temps: remove the registered temporary files. Signals are recorded
 # while it runs and each removal runs to completion (see shielded); a removal
 # that fails is tried again, and a path that still exists afterwards stays
-# registered. A signal recorded here is honored right after, unless delivery
-# is already under way.
+# registered and is reported on stderr (before the outcome line, which always
+# comes after cleanup). A signal recorded here is honored right after, unless
+# delivery is already under way.
 cleanup_temps() {
     local f attempt deferred="$IN_DELIVERY"
     local left=()
@@ -110,6 +111,7 @@ cleanup_temps() {
         done
         if [[ -e "$f" || -L "$f" ]]; then
             left+=("$f")
+            diag "could not remove the temporary file $f"
         fi
     done
     TEMP_FILES=(${left[@]+"${left[@]}"})

@@ -927,4 +927,55 @@ for name, src, cand in [
 rejects("a real path next to the prose pairs still protected", "Use src/main here.\n", "Use src/other here.\n",
         "protected_token")
 
+# Round 2 third re-review: lazy lines at any depth, tab columns after quote
+# markers, table rows, quotes inside list items, and emphasis in link labels.
+N = "- Parent.\n  - Child.\n"
+for name, src, cand in [
+        ("definition with a lazy line at an intermediate quote depth: destination changed",
+         "> > [a\n> b]: old\n\nRead [a b].\n", "> > [a\n> b]: new\n\nRead [a b].\n"),
+        ("definition with a lazy title line at an intermediate quote depth: title changed",
+         "> > [a]: old \"The\n> title\"\n", "> > [a]: old \"The\n> heading\"\n"),
+        ("code in a quote inside a nested item changed", N + "    > ```\n    > x = 1\n    > ```\n",
+         N + "    > ```\n    > x = 2\n    > ```\n")]:
+    rejects(name, src, cand, "region_changed")
+for name, src, cand in [
+        ("a tab after a quote marker at another column changes the list nesting",
+         "> - Parent.\n>\t- > Quoted words.\n", "> - Parent.\n >\t- > Quoted words.\n"),
+        ("a table row moved out of the list item", "- Parent.\n  > | Name | Value |\n  > | --- | --- |\n"
+         "  > | Clear | Words |\n", "- Parent.\n  > | Name | Value |\n  > | --- | --- |\n> | Clear | Words |\n"),
+        ("a quote inside a nested item moved to the parent item", N + "    > Quoted words.\n",
+         N + "  > Quoted words.\n"),
+        ("a quote inside a nested item moved out of the list", N + "    > Quoted words.\n", N + "> Quoted words.\n"),
+        ("a quote inside a wide ordered item moved out", "10. Parent.\n\n    > Quoted words.\n",
+         "10. Parent.\n\n> Quoted words.\n"),
+        ("list nesting inside a quote inside an item changed", N + "    > - a item\n    >   - b item\n",
+         N + "    > - a item\n    > - b item\n")]:
+    rejects(name, src, cand, "structure")
+for name, src, cand in [
+        ("emphasis paired across a link label", "Read [*the guide](guide) carefully*.\n",
+         "Read [the *guide*](guide) carefully.\n"),
+        ("asterisk emphasis turned into underscores", "Read *the guide* carefully.\n", "Read _the guide_ carefully.\n"),
+        ("asterisk strong emphasis turned into underscores", "Read **the guide** carefully.\n",
+         "Read __the guide__ carefully.\n")]:
+    rejects(name, src, cand, "inline_markup")
+for name, src, cand in [
+        ("a quote inside a nested item reworded", N + "    > Quoted words.\n", N + "    > Clear words.\n"),
+        ("a two-line quote inside a nested item rewrapped", N + "    > Quoted words here.\n    > More words.\n",
+         N + "    > Quoted words here and more words.\n"),
+        ("a quote inside a wide ordered item reworded", "10. Parent.\n\n    > Quoted words.\n",
+         "10. Parent.\n\n    > Clear words.\n"),
+        ("a list inside a quote inside an item reworded", N + "    > - a item\n    > - b item\n",
+         N + "    > - a thing\n    > - b thing\n"),
+        ("a lazy line at an intermediate quote depth rewrapped", "> > Read this long\n> sentence carefully.\n",
+         "> > Read this sentence carefully.\n"),
+        ("prose after a tab after a quote marker reworded", "> - Parent.\n>\t- > Quoted words.\n",
+         "> - Parent.\n>\t- > Quoted text.\n"),
+        ("a quote opened with a tab after the first marker reworded", ">\t> Quoted words.\n", ">\t> Quoted text.\n"),
+        ("a table inside a list item reworded", "- Parent.\n  | Name | Value |\n  | --- | --- |\n  | Clear | Words |\n",
+         "- Parent.\n  | Name | Value |\n  | --- | --- |\n  | Plain | Words |\n"),
+        ("emphasis inside link text reworded", "Read [the *useful* guide](x) now.\n",
+         "Read [the *helpful* guide](x) now.\n"),
+        ("emphasis around a link moved", "Read *[the guide](x)* now.\n", "Now read *[the guide](x)*.\n")]:
+    accepts(name, src, cand)
+
 sys.exit(1 if FAILED else 0)

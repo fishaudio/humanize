@@ -539,13 +539,23 @@ class Runner(object):
     # -- entry --------------------------------------------------------------
 
     def run(self):
-        _set_signal_handlers(_raise_interrupt)
         try:
+            # Installed inside the try, so a signal right after installation
+            # is handled like any other.
+            _set_signal_handlers(_raise_interrupt)
             if _STARTUP_SIGNALS:
                 raise Interrupted(_STARTUP_SIGNALS[0])
             return self._run()
         except Interrupted as exc:
-            return self._interrupted(exc.signum)
+            signum = exc.signum
+        while True:
+            # A further signal before the handlers defer it starts the
+            # interruption path again; it is idempotent.
+            try:
+                _block_signals()
+                return self._interrupted(signum)
+            except Interrupted:
+                continue
 
     def _interrupted(self, signum):
         _block_signals()

@@ -436,7 +436,7 @@ def _scan_inline(text):
     return out
 
 
-def extract_tokens(text):
+def extract_tokens(text, labels=None):
     """Return (tokens, masked) for a prose fragment.
 
     ``tokens`` is an ordered list of (kind, value) pairs. ``masked`` is the
@@ -476,6 +476,13 @@ def extract_tokens(text):
     links, _ = _scan_links(current())
     for start, label_start, label_end, end, kind, target in links:
         found.append((start, kind, target))
+        # A link label is a boundary for emphasis, except for a "link" that
+        # holds another link: CommonMark does not nest links, so its brackets
+        # are text (its destination is still protected here).
+        if labels is not None and not (kind == "link" and any(
+                k2 == "link" and label_start <= s2 and e2 <= label_end
+                for s2, _, _, e2, k2, _ in links)):
+            labels.append((label_start, label_end))
         # Keep the link text editable; mask the syntax and the target.
         _mask(chars, start, label_start)
         _mask(chars, label_end, end)
@@ -608,19 +615,11 @@ def _delimiter_runs(original, masked):
     return runs
 
 
-def emphasis_structure(original, masked):
-    """The emphasis a prose unit renders, independent of the words inside.
-
-    Delimiter runs are paired with the CommonMark "process emphasis" rules
-    (including the rule of three), and ``~~`` pairs as strikethrough. The
-    result is the nesting of the spans (em, strong, del), with siblings in
-    sorted order so emphasis can move with its words, plus the delimiters
-    that stay literal. Moving a marker away from its word, or regrouping
-    markers so that spans nest differently, changes the result.
-    """
-    stack = _delimiter_runs(original, masked)
-    spans = []
-    literal = {}
+def _pair_delimiters(stack, spans, literal):
+    """Pair the delimiter runs in ``stack`` (in text order) with the CommonMark
+    "process emphasis" rules, including the rule of three; ``~~`` pairs as
+    strikethrough. Adds (start, end, kind) to ``spans`` and counts the
+    delimiters that stay literal in ``literal``."""
 
     def drop(run):
         if run["count"]:
@@ -658,9 +657,9 @@ def emphasis_structure(original, masked):
         if closer["ch"] == "~":
             use, kind = 2, "del"
         elif opener["count"] >= 2 and closer["count"] >= 2:
-            use, kind = 2, "strong"
+            use, kind = 2, "strong" + closer["ch"]
         else:
-            use, kind = 1, "em"
+            use, kind = 1, "em" + closer["ch"]
         span_start = opener["pos"] + opener["count"] - use
         span_end = closer["pos"] + (closer["orig"] - closer["count"]) + use
         spans.append((span_start, span_end, kind))
@@ -677,6 +676,28 @@ def emphasis_structure(original, masked):
             del stack[ci]
     for run in stack:
         drop(run)
+
+
+def emphasis_structure(original, masked, labels=()):
+    """The emphasis a prose unit renders, independent of the words inside.
+
+    Delimiter runs are paired with the CommonMark rules. Runs inside a link
+    or image label pair only with each other (innermost label first), as a
+    label is closed before the text around it. The result is the nesting of
+    the spans (em and strong with their delimiter character, and del), with
+    siblings in sorted order so emphasis can move with its words, plus the
+    delimiters that stay literal. Moving a marker away from its word,
+    regrouping markers, or swapping ``*`` and ``_`` changes the result.
+    """
+    runs = _delimiter_runs(original, masked)
+    spans = []
+    literal = {}
+    used = set()
+    for label_start, label_end in sorted(labels, key=lambda lb: lb[1] - lb[0]):
+        inside = [r for r in runs if id(r) not in used and label_start <= r["pos"] < label_end]
+        used.update(id(r) for r in inside)
+        _pair_delimiters(inside, spans, literal)
+    _pair_delimiters([r for r in runs if id(r) not in used], spans, literal)
 
     # Spans nest properly; build the forest and describe it without order.
     spans.sort(key=lambda sp: (sp[0], -sp[1]))
@@ -744,8 +765,9 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
         for ch in "<>":
             if cand.count(ch) > src.count(ch):
                 raise GuardReject("markup_in_text", "%s: candidate adds %r" % (where, ch))
-    src_tokens, src_masked = extract_tokens(src)
-    cand_tokens, cand_masked = extract_tokens(cand)
+    src_labels, cand_labels = [], []
+    src_tokens, src_masked = extract_tokens(src, src_labels)
+    cand_tokens, cand_masked = extract_tokens(cand, cand_labels)
     if src_tokens != cand_tokens:
         idx, x, y = _first_token_difference(src_tokens, cand_tokens)
         kinds = set()
@@ -762,7 +784,8 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
         raise GuardReject(
             reason,
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
-    if emphasis_structure(src, src_masked) != emphasis_structure(cand, cand_masked):
+    if (emphasis_structure(src, src_masked, src_labels)
+            != emphasis_structure(cand, cand_masked, cand_labels)):
         raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
     if hard_break_count(src) != hard_break_count(cand):
         raise GuardReject("inline_markup", "%s: hard line breaks changed" % where)
@@ -833,22 +856,76 @@ class Block(object):
         return "block at line %d (%s)" % (self.line, self.kind)
 
 
+def _quote_walk(line, limit=None):
+    """Read up to ``limit`` blockquote markers at the start of ``line``.
+
+    Columns follow CommonMark: tab stops every four columns, up to three
+    columns of indentation before each marker, and a tab right after a marker
+    counts as the marker's optional space plus the rest of the tab (which
+    then counts toward the indentation that follows). Returns the indentation
+    before each marker, the end of each marker, the position after the last
+    marker and its optional space, the column there, and the columns of a
+    partly used tab that still belong to the text.
+    """
+    cols, ends = [], []
+    pos = col = pending = 0
+    while limit is None or len(cols) < limit:
+        k, c, ind = pos, col, pending
+        while k < len(line) and line[k] in " \t":
+            width = 1 if line[k] == " " else 4 - c % 4
+            c += width
+            ind += width
+            k += 1
+        if ind > 3 or k >= len(line) or line[k] != ">":
+            break
+        cols.append(ind)
+        ends.append(k + 1)
+        pos, col, pending = k + 1, c + 1, 0
+        if pos < len(line) and line[pos] == " ":
+            pos += 1
+            col += 1
+        elif pos < len(line) and line[pos] == "\t":
+            width = 4 - col % 4
+            pos += 1
+            col += width
+            pending = width - 1
+    return cols, ends, pos, col, pending
+
+
 def _quote_depth(line):
-    m = QUOTE_PREFIX_RE.match(line)
-    if not m:
-        return 0, line
-    return m.group(1).count(">"), line[m.end():]
+    cols, _, pos, _, _ = _quote_walk(line)
+    return len(cols), line[pos:]
 
 
 def _strip_quote(line, depth):
-    """Remove up to ``depth`` blockquote markers from ``line``."""
-    rest = line
-    for _ in range(depth):
-        m = re.match(r"^[ ]{0,3}>[ ]?", rest)
-        if not m:
-            break
-        rest = rest[m.end():]
-    return rest
+    """Remove up to ``depth`` blockquote markers from ``line``.
+
+    The leading whitespace of the rest is expanded to spaces at its true
+    columns, so the indentation of a list item or code block inside a quote
+    is measured as CommonMark measures it.
+    """
+    _, _, pos, col, pending = _quote_walk(line, depth)
+    out = [" " * pending]
+    k = pos
+    while k < len(line) and line[k] in " \t":
+        width = 1 if line[k] == " " else 4 - col % 4
+        out.append(" " * width)
+        col += width
+        k += 1
+    return "".join(out) + line[k:]
+
+
+def _quote_rest(line, depth):
+    """``line`` after up to ``depth`` quote markers, with its bytes unchanged
+    (the text of a prose unit keeps its exact whitespace)."""
+    return line[_quote_walk(line, depth)[2]:]
+
+
+def _quote_prefix(line, depth):
+    """The first ``depth`` quote markers of ``line`` and the indentation
+    before them, without the optional space after the last one."""
+    _, ends, _, _, _ = _quote_walk(line, depth)
+    return line[:ends[-1]] if ends else ""
 
 
 def _is_html_start(body):
@@ -978,11 +1055,11 @@ def _past_container(text, base):
     return expanded[min(base, _indent_of(expanded)):]
 
 
-def _leaves_list_item(line, quote, level_stacks):
-    """True when a quote marker of ``line`` (at the same quote depth) does not
-    reach the content column of a list item that encloses the deeper quote, so
-    the line closes that item instead of continuing inside it."""
-    cols = _quote_marker_cols(line, quote)
+def _leaves_list_item(cols, quote, level_stacks):
+    """True when one of the first ``quote`` quote markers of a line (their
+    columns are ``cols``) does not reach the content column of a list item
+    that encloses the deeper quote, so the line closes that item instead of
+    continuing inside it."""
     for level in range(min(quote, len(cols), len(level_stacks))):
         stack = level_stacks[level]
         if stack and cols[level] < stack[-1][1]:
@@ -993,15 +1070,7 @@ def _leaves_list_item(line, quote, level_stacks):
 def _quote_marker_cols(line, depth):
     """Column of each of the first ``depth`` quote markers, each measured in
     the text that remains after the markers before it."""
-    cols = []
-    rest = line
-    for _ in range(depth):
-        m = re.match(r"^([ ]{0,3})>[ ]?", rest)
-        if not m:
-            break
-        cols.append(len(m.group(1)))
-        rest = rest[m.end():]
-    return cols
+    return _quote_walk(line, depth)[0]
 
 
 def parse_blocks(text):
@@ -1034,10 +1103,31 @@ def parse_blocks(text):
     # own level whose content column it reaches. Entering a deeper quote keeps
     # the lists that enclose it; leaving a quote closes what was opened inside.
     level_stacks = [[]]
-    # The true column of a quote marker that a list marker line opens, when
-    # it was moved left to stay within reach of the quote prefix parser:
-    # line index -> (level, column).
+    # The true column of a quote marker inside a list item that was moved
+    # left to stay within reach of the quote prefix parser:
+    # line index -> {level: column}.
     marker_quote_col = {}
+
+    def qcols_of(k, depth):
+        cols = _quote_marker_cols(lines[k], depth)
+        for level, col in marker_quote_col.get(k, {}).items():
+            if level < len(cols):
+                cols[level] = col
+        return cols
+
+    def in_container(k, quote, depth, base):
+        """Whether line ``k`` stays inside the quotes and list items of the
+        current block (no lazy continuation): same quote depth, quote markers
+        that reach the enclosing items, indentation that reaches the item,
+        and no new quote."""
+        if not lines[k].strip() or _quote_depth(lines[k])[0] != quote:
+            return False
+        if quote and _leaves_list_item(qcols_of(k, quote), quote, level_stacks):
+            return False
+        kb = _strip_quote(lines[k], quote)
+        if depth > 0 and _indent_of(kb) < base:
+            return False
+        return not _past_container(kb, base).startswith(">")
 
     def containers(quote, indent, qcols):
         del level_stacks[quote + 1:]
@@ -1062,17 +1152,13 @@ def parse_blocks(text):
             i += 1
             continue
         start_line = i + 1
-        ebody = _expand_indent(body)
+        ebody = _strip_quote(line, quote)
         indent = len(ebody) - len(ebody.lstrip(" "))
         # Column of each quote marker in the text of its level: a quote
         # marker that does not reach a list item's content column closes that
         # item, so a quote moved into or out of a list item changes the
         # container tuple at every level.
-        qcols = _quote_marker_cols(line, quote)
-        if i in marker_quote_col:
-            level, col = marker_quote_col[i]
-            if level < len(qcols):
-                qcols[level] = col
+        qcols = qcols_of(i, quote)
         depth, base, ancestry = containers(quote, indent, qcols)
         cbody = ebody[base:] if indent >= base else ebody.lstrip(" ")
 
@@ -1100,9 +1186,8 @@ def parse_blocks(text):
             # indentation.
             blocks.append(Block("protected", attrs(), "\n".join(lines[i:j] + [lines[j][:on.end()]]),
                                 [], start_line))
-            qm = QUOTE_PREFIX_RE.match(lines[j])
-            prefix = qm.group(1) if qm else ""
-            after = lines[j][len(prefix):]
+            _, after = _quote_depth(lines[j])
+            prefix = lines[j][:len(lines[j]) - len(after)]
             lead = after[:len(after) - len(after.lstrip(" \t"))]
             lines[j] = prefix + lead + rest.lstrip(" \t")
             i = j
@@ -1131,17 +1216,26 @@ def parse_blocks(text):
             continue
 
         if depth > 0 and cbody.startswith(">"):
-            # A blockquote inside a list item that is indented too far for the
-            # quote prefix parser: keep it verbatim.
-            j = i
-            while j + 1 < n and lines[j + 1].strip():
-                nxt_c = _past_container(_strip_quote(lines[j + 1], quote), base)
-                if nxt_c.startswith(">") or not _starts_block(nxt_c, False):
-                    j += 1
-                    continue
-                break
-            blocks.append(Block("quote_raw", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
-            i = j + 1
+            # A blockquote inside a list item whose marker sits beyond the
+            # reach of the quote prefix parser (four or more columns into the
+            # line). Move each marker line of the quote left, keep the
+            # marker's true column for the container check, and read the
+            # lines again, so the quote is parsed like any other and stays
+            # inside its list items. Lazy lines in between are left alone.
+            k = i
+            while k < n and lines[k].strip() and _quote_depth(lines[k])[0] == quote:
+                kb = _strip_quote(lines[k], quote)
+                kind = _indent_of(kb)
+                rel = _past_container(kb, base)
+                if k > i and quote and _leaves_list_item(qcols_of(k, quote), quote, level_stacks):
+                    break
+                if kind >= base and rel.startswith(">"):
+                    marker_quote_col.setdefault(k, {})[quote] = kind
+                    lines[k] = ((_quote_prefix(lines[k], quote) + " ") if quote else "") \
+                        + " " * min(kind, 3) + kb.lstrip(" ")
+                elif rel.lstrip(" ").startswith(">") or _starts_block(rel, False):
+                    break
+                k += 1
             continue
 
         fence = _is_fence_open(cbody)
@@ -1205,16 +1299,21 @@ def parse_blocks(text):
             while k < n:
                 kq, _ = _quote_depth(lines[k])
                 kb = _strip_quote(lines[k], quote)
-                if not kb.strip() or kq not in (0, quote):
+                if not kb.strip() or kq > quote:
+                    break
+                if kq > 0 and _leaves_list_item(qcols_of(k, kq), kq, level_stacks):
                     break
                 if kq != quote:
                     # A lazy continuation line: it continues the definition
                     # unless it starts a block of its own.
-                    if _starts_block(kb, False) or kb.lstrip(" ").startswith(">"):
+                    if _starts_block(kb.lstrip(" "), False):
                         break
                     parts.append(kb.lstrip(" "))
                 else:
-                    parts.append(_past_container(kb, base))
+                    part = _past_container(kb, base)
+                    if part.startswith(">"):
+                        break
+                    parts.append(part)
                 k += 1
             joined = "\n".join(parts)
             dm = REFDEF_FULL_RE.match(joined)
@@ -1246,12 +1345,14 @@ def parse_blocks(text):
             i += 1
             continue
 
-        if "|" in cbody and i + 1 < n and _is_table_sep(_strip_quote(lines[i + 1], quote)):
-            # Body rows run until a blank line or the start of another block,
-            # with or without pipes.
+        if ("|" in cbody and i + 1 < n and in_container(i + 1, quote, depth, base)
+                and _is_table_sep(_strip_quote(lines[i + 1], quote))):
+            # Body rows run until a blank line, the start of another block,
+            # or a line that leaves the table's quote or list item, with or
+            # without pipes.
             rows = [i]
             j = i + 2
-            while j < n and lines[j].strip() and _quote_depth(lines[j])[0] == quote:
+            while j < n and in_container(j, quote, depth, base):
                 if _starts_block(_past_container(_strip_quote(lines[j], quote), base), False):
                     break
                 rows.append(j)
@@ -1305,10 +1406,10 @@ def parse_blocks(text):
                 if ws < 5 and rest_raw.startswith(">") and pad > 3:
                     # Keep a quote that opens on the marker line within reach
                     # of the quote prefix parser, and remember its column.
-                    marker_quote_col[i] = (quote, pad)
+                    marker_quote_col.setdefault(i, {})[quote] = pad
                     pad = 3
                 new_body = " " * pad + rest_raw
-            lines[i] = line[:len(line) - len(body)] + new_body
+            lines[i] = ((_quote_prefix(line, quote) + " ") if quote else "") + new_body
             continue
 
         # Paragraph, possibly a setext heading. An underline only counts when
@@ -1325,12 +1426,15 @@ def parse_blocks(text):
             if not nxt.strip():
                 break
             nq, _ = _quote_depth(nxt)
-            if nq not in (0, quote):
+            if nq > quote:
                 break
             nbody = _strip_quote(nxt, quote)
             if not nbody.strip():
                 break
-            if nq == quote and _leaves_list_item(nxt, quote, level_stacks):
+            # A line with fewer quote markers is a lazy continuation line,
+            # unless one of its markers leaves a list item (then the marker
+            # opens a new quote).
+            if nq > 0 and _leaves_list_item(qcols_of(j, nq), nq, level_stacks):
                 break
             same_container = nq == quote and (depth == 0 or _indent_of(nbody) >= base)
             nbc = _past_container(nbody, base)
@@ -1347,7 +1451,7 @@ def parse_blocks(text):
                 break
             if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
-            content.append(nbody)
+            content.append(_quote_rest(nxt, quote))
             j += 1
         if setext_level:
             blocks.append(Block("heading", attrs(level=setext_level),
