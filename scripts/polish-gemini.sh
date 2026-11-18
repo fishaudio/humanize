@@ -663,21 +663,139 @@ fi
 HANDOFF_SIGNALS=""
 [[ -n "$(trap -p INT)" ]] && HANDOFF_SIGNALS="INT"
 [[ -n "$(trap -p TERM)" ]] && HANDOFF_SIGNALS="${HANDOFF_SIGNALS:+$HANDOFF_SIGNALS,}TERM"
-# A signal before this point ends the run through on_signal with one outcome
-# line. From here the handled signals are ignored across the exec (an ignored
-# signal stays ignored through exec) and the Python helper catches them from
-# its first statements on (HUMANIZE_POLISH_SIGNALS), so no signal can end the
-# run before an outcome line is possible. Standard error stays on /dev/null
-# through the exec, so a failed exec prints nothing raw; the helper takes the
-# caller's stderr from fd 9 (HUMANIZE_POLISH_STDERR_FD). When the exec fails
-# (execfail keeps this shell running), the original is delivered.
-shopt -s execfail
+
+# ----------------------------------------
+# Supervised start
+# ----------------------------------------
+# This shell stays the runner's process and keeps handling SIGINT and SIGTERM
+# while the helper starts. The helper installs its own handlers, reports that
+# it is ready with READY_SIG, and waits for RELEASE_SIG before it reads any
+# input. A signal that reaches this shell before then is recorded; at
+# readiness it is passed on to the helper, which ends the run as interrupted
+# with nothing delivered. After the release, signals are passed on and the
+# helper owns the one outcome line; this shell exits with its status. When
+# the helper ends before it is ready, this shell finishes the run: as
+# interrupted when a signal came, or by delivering the original when the
+# helper could not start.
+HELPER_PID=""
+HELPER_READY=false
+HELPER_READY_EARLY=false
+HELPER_PENDING=""
+HELPER_PENDING_NAME=""
+HELPER_FORWARDED=""
+HELPER_TRAPS=0
+HELPER_STATUS=0
+
+helper_ready() {
+    HELPER_TRAPS=$((HELPER_TRAPS + 1))
+    if [[ -z "$HELPER_PID" ]]; then
+        HELPER_READY_EARLY=true
+        return 0
+    fi
+    if [[ "$HELPER_READY" == "true" ]]; then
+        return 0
+    fi
+    HELPER_READY=true
+    if [[ -n "$HELPER_PENDING_NAME" ]]; then
+        kill -"$HELPER_PENDING_NAME" "$HELPER_PID" 2>/dev/null
+    fi
+    kill -"$RELEASE_SIG" "$HELPER_PID" 2>/dev/null
+}
+
+# helper_signal CODE NAME: a SIGINT or SIGTERM while the helper runs.
+helper_signal() {
+    HELPER_TRAPS=$((HELPER_TRAPS + 1))
+    if [[ "$HELPER_READY" == "true" ]]; then
+        HELPER_FORWARDED="${HELPER_FORWARDED:-$1}"
+        kill -"$2" "$HELPER_PID" 2>/dev/null
+    elif [[ -z "$HELPER_PENDING" ]]; then
+        HELPER_PENDING="$1"
+        HELPER_PENDING_NAME="$2"
+    fi
+}
+
+# wait_helper: wait until the helper ends and set HELPER_STATUS. A trap that
+# runs while this shell waits makes wait return early with a status above
+# 128; waiting again gives the helper's own status, or 127 when the first
+# wait had already collected it.
+wait_helper() {
+    local seen again
+    seen="$HELPER_TRAPS"
+    wait "$HELPER_PID"
+    HELPER_STATUS=$?
+    while [[ "$HELPER_TRAPS" != "$seen" ]]; do
+        seen="$HELPER_TRAPS"
+        wait "$HELPER_PID"
+        again=$?
+        if (( again == 127 )); then
+            break
+        fi
+        HELPER_STATUS=$again
+    done
+}
+
+# The readiness and release signals: SIGUSR1 and SIGUSR2, the other way
+# round when SIGUSR1 was ignored when the run started (an ignored signal
+# cannot be trapped).
+READY_SIG=""
+RELEASE_SIG=""
+trap 'helper_ready' USR1
+if [[ -n "$(trap -p USR1)" ]]; then
+    READY_SIG=USR1
+    RELEASE_SIG=USR2
+else
+    trap 'helper_ready' USR2
+    if [[ -n "$(trap -p USR2)" ]]; then
+        READY_SIG=USR2
+        RELEASE_SIG=USR1
+    fi
+fi
+
+# Standard error stays on /dev/null for the helper until it is released, so
+# a failed start prints nothing raw; it then takes the caller's stderr from
+# fd 9 (HUMANIZE_POLISH_STDERR_FD). Standard input is passed on explicitly,
+# as an asynchronous command would otherwise read /dev/null.
 export HUMANIZE_POLISH_STDERR_FD="$OUT_FD"
 export HUMANIZE_POLISH_SIGNALS="$HANDOFF_SIGNALS"
-trap '' INT TERM
-exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"
-trap 'on_signal 130' INT
-trap 'on_signal 143' TERM
-unset HUMANIZE_POLISH_STDERR_FD HUMANIZE_POLISH_SIGNALS
+if [[ -n "$READY_SIG" ]]; then
+    trap 'helper_signal 130 INT' INT
+    trap 'helper_signal 143 TERM' TERM
+    export HUMANIZE_POLISH_SUPERVISOR="$$:$READY_SIG:$RELEASE_SIG"
+    "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}" <&0 &
+    HELPER_PID=$!
+    unset HUMANIZE_POLISH_STDERR_FD HUMANIZE_POLISH_SIGNALS HUMANIZE_POLISH_SUPERVISOR
+    if [[ "$HELPER_READY_EARLY" == "true" ]]; then
+        helper_ready
+    fi
+    wait_helper
+    if [[ "$HELPER_READY" == "true" ]]; then
+        # A signal passed on after the helper had already finished still
+        # marks the run as interrupted.
+        if [[ -n "$HELPER_FORWARDED" ]] && (( HELPER_STATUS == 0 || HELPER_STATUS == 3 || HELPER_STATUS == 4 )); then
+            exit "$HELPER_FORWARDED"
+        fi
+        exit "$HELPER_STATUS"
+    fi
+    trap 'on_signal 130' INT
+    trap 'on_signal 143' TERM
+    if [[ -n "$HELPER_PENDING" ]] || (( HELPER_STATUS == 130 || HELPER_STATUS == 143 )); then
+        IN_DELIVERY=true
+        emit_outcome failed interrupted no
+        exit "${HELPER_PENDING:-$HELPER_STATUS}"
+    fi
+else
+    # Neither SIGUSR1 nor SIGUSR2 can be trapped (both were ignored when the
+    # run started), so the start cannot be supervised. The helper replaces
+    # this shell instead; the handled signals are ignored for the moment of
+    # the exec and caught from the helper's first statements on. When the
+    # exec fails (execfail keeps this shell running), the original is
+    # delivered below.
+    shopt -s execfail
+    trap '' INT TERM
+    exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"
+    trap 'on_signal 130' INT
+    trap 'on_signal 143' TERM
+    unset HUMANIZE_POLISH_STDERR_FD HUMANIZE_POLISH_SIGNALS
+fi
 diag "could not start $PYTHON_BIN; delivering the original"
 deliver_original "${SKIP_REASON:-missing_dependency}"

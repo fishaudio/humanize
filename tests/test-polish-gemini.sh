@@ -491,7 +491,13 @@ for _ in $(seq 1 100); do
     [[ "$(req_count)" != "0" ]] && break
     sleep 0.1
 done
-ps -ww -o args= -p "$RUN_PID" > "$TEST_DIR/argv.txt" 2>/dev/null
+# The wrapper and the helper it supervises (its child).
+{
+    ps -ww -o args= -p "$RUN_PID"
+    for child_pid in $(pgrep -P "$RUN_PID"); do
+        ps -ww -o args= -p "$child_pid"
+    done
+} > "$TEST_DIR/argv.txt" 2>/dev/null
 wait "$RUN_PID"
 _record_run
 if [[ -s "$TEST_DIR/argv.txt" ]] && ! grep -q "$TEST_KEY" "$TEST_DIR/argv.txt" && grep -q "polish_gemini.py" "$TEST_DIR/argv.txt"; then

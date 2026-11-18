@@ -29,12 +29,19 @@ import signal  # noqa: E402
 
 # SIGINT and SIGTERM received before the run installs its own handlers.
 _STARTUP_SIGNALS = []
+# Set when the shell wrapper supervises the start (HUMANIZE_POLISH_SUPERVISOR):
+# (wrapper pid, signal that reports readiness, signal that releases the run).
+_SUPERVISOR = []
+_RELEASED = []
+# Seconds to wait for the release before giving up; the wrapper then
+# delivers the original itself.
+RELEASE_WAIT_LIMIT = 60.0
 
 
 def _adopt_stderr():
     """Take the caller's standard error from the descriptor the shell wrapper
-    kept it on (HUMANIZE_POLISH_STDERR_FD). The wrapper holds its own standard
-    error on /dev/null through the exec, so a failed start prints nothing raw.
+    kept it on (HUMANIZE_POLISH_STDERR_FD). Until then standard error is the
+    wrapper's /dev/null, so a failed start or import prints nothing raw.
     """
     value = os.environ.pop("HUMANIZE_POLISH_STDERR_FD", None)
     if value is None or not re.fullmatch(r"[0-9]+", value) or int(value) < 3:
@@ -72,9 +79,83 @@ def _catch_startup_signals():
         signal.signal(signum, _record_startup_signal)
 
 
+def _record_release(signum, frame):
+    _RELEASED.append(signum)
+
+
+def _ignore_signal(signum, frame):
+    pass
+
+
+def _read_supervisor():
+    """Read HUMANIZE_POLISH_SUPERVISOR ("PID:READY:RELEASE", signal names
+    USR1 and USR2) and catch the release signal from here on, so it cannot
+    end the process."""
+    value = os.environ.pop("HUMANIZE_POLISH_SUPERVISOR", None)
+    if value is None:
+        return
+    names = {"USR1": signal.SIGUSR1, "USR2": signal.SIGUSR2}
+    m = re.fullmatch(r"([0-9]+):(USR1|USR2):(USR1|USR2)", value)
+    if not m or m.group(2) == m.group(3):
+        # A wrapper that asked for supervision but cannot be answered: the
+        # run must not go ahead unsupervised.
+        _SUPERVISOR.append(None)
+        return
+    _SUPERVISOR.append((int(m.group(1)), names[m.group(2)], names[m.group(3)]))
+    signal.signal(names[m.group(3)], _record_release)
+
+
+def _await_release(handled):
+    """The start handshake with the supervising shell wrapper.
+
+    The wrapper keeps its SIGINT and SIGTERM traps while this process starts.
+    Once its handlers are in place (``handled`` are the signals it catches),
+    this process blocks them, tells the wrapper it is ready, and waits for
+    the release before it reads any input. A SIGINT or SIGTERM that arrives
+    meanwhile is recorded, and the run then ends as interrupted; the wrapper
+    sends a signal it received before readiness the same way, followed by
+    the release. Returns False when the wrapper is gone or does not answer:
+    the process must then end without delivering anything.
+    """
+    if not _SUPERVISOR:
+        return True
+    if _SUPERVISOR[0] is None:
+        return False
+    pid, ready, release = _SUPERVISOR[0]
+    if os.getppid() != pid:
+        return False
+    waited = set(handled) | {release, signal.SIGALRM}
+    old_alarm = signal.signal(signal.SIGALRM, _ignore_signal)
+    signal.pthread_sigmask(signal.SIG_BLOCK, waited)
+    ok = True
+    try:
+        os.kill(pid, ready)
+        deadline = time.monotonic() + RELEASE_WAIT_LIMIT
+        signal.setitimer(signal.ITIMER_REAL, 0.5, 0.5)
+        while not _RELEASED:
+            signum = signal.sigwait(waited)
+            if signum == release:
+                break
+            if signum == signal.SIGALRM:
+                if os.getppid() != pid or time.monotonic() > deadline:
+                    ok = False
+                    break
+                continue
+            _STARTUP_SIGNALS.append(signum)
+    except OSError:
+        ok = False
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0, 0)
+        # A signal still pending reaches its handler here: a startup signal
+        # is recorded, a timer tick is ignored.
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, waited)
+        signal.signal(signal.SIGALRM, old_alarm)
+    return ok
+
+
 if __name__ == "__main__":
-    _adopt_stderr()
     _catch_startup_signals()
+    _read_supervisor()
 
 import email.utils  # noqa: E402
 import json  # noqa: E402
@@ -1156,4 +1237,9 @@ def main(argv):
 
 
 if __name__ == "__main__":
+    if not _await_release(_HANDLED_SIGNALS):
+        # The supervising wrapper is gone or did not release the run: end
+        # without reading input or delivering anything.
+        sys.exit(EXIT_USAGE)
+    _adopt_stderr()
     sys.exit(main(sys.argv[1:]))
