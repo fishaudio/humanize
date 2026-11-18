@@ -47,8 +47,21 @@ DEFAULT_BASE_URL="https://openrouter.ai/api/v1"
 
 TEMP_FILES=()
 
+# Diagnostics are always one line, and never look like the outcome line,
+# whatever text (file names, config values, loader warnings) they carry.
 diag() {
-    printf 'polish-gemini: %s\n' "$*" >&2
+    local msg="$*"
+    # Control characters, and the Unicode line separators U+0085, U+2028 and
+    # U+2029 (as UTF-8 bytes), become spaces.
+    msg="$(printf '%s' "$msg" | LC_ALL=C tr '\000-\037\177' ' ' |
+        LC_ALL=C sed $'s/\xe2\x80[\xa8\xa9]/ /g; s/\xc2\x85/ /g')"
+    if [[ "${#msg}" -gt 1000 ]]; then
+        msg="${msg:0:1000}..."
+    fi
+    case "$msg" in
+        outcome=*) msg="note: $msg" ;;
+    esac
+    printf 'polish-gemini: %s\n' "$msg" >&2
 }
 
 emit_outcome() {
@@ -63,14 +76,62 @@ cleanup_temps() {
     TEMP_FILES=()
 }
 
+# While the fallback copy is being delivered, a signal is recorded and handled
+# once delivery has finished: the outcome line reports what was delivered and
+# the exit code (130 or 143) reports the interruption.
+IN_DELIVERY=false
+PENDING_SIGNAL=""
+
+SIGNALS_SEEN=0
+
 on_signal() {
+    if [[ "$IN_DELIVERY" == "true" ]]; then
+        PENDING_SIGNAL="$1"
+        SIGNALS_SEEN=$((SIGNALS_SEEN + 1))
+        return 0
+    fi
     trap - INT TERM
     cleanup_temps
     emit_outcome failed interrupted no
     exit "$1"
 }
+
+# finish_delivery OUTCOME REASON DELIVERED EXIT_CODE
+# Signals stay deferred until the process exits, so a signal at any point in
+# here still yields exactly one outcome line and exit code 130 or 143. The
+# outcome describes what was delivered; the exit code reports the interruption.
+finish_delivery() {
+    cleanup_temps
+    if [[ -n "$PENDING_SIGNAL" ]]; then
+        diag "interrupted during delivery; delivery finished first"
+    fi
+    emit_outcome "$1" "$2" "$3"
+    exit "${PENDING_SIGNAL:-$4}"
+}
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
+
+# shielded CMD [ARGS...]: run one delivery step to completion.
+# The step runs in the background with SIGINT and SIGTERM ignored, so a signal
+# sent to the whole process group (for example Ctrl-C) cannot cut it short.
+# Waiting with the wait builtin lets the trap record a signal sent to this
+# shell alone; in the foreground, bash would drop a SIGINT that the child
+# survived. wait returns 130 or 143 when a trapped signal interrupts it; the
+# step itself cannot end that way because it ignores both signals.
+shielded() {
+    local pid status seen
+    ( trap '' INT TERM; exec "$@" ) &
+    pid=$!
+    while :; do
+        seen="$SIGNALS_SEEN"
+        wait "$pid"
+        status=$?
+        if [[ "$SIGNALS_SEEN" != "$seen" ]] && (( status == 130 || status == 143 )); then
+            continue
+        fi
+        return "$status"
+    done
+}
 
 usage_error() {
     diag "$1"
@@ -386,15 +447,16 @@ deliver_original() {
         cat > "$src"
     fi
 
+    # A signal that arrived before this point has already ended the run with
+    # nothing delivered. From here on, signals wait until delivery is done.
+    IN_DELIVERY=true
     if [[ -n "$OUTPUT" ]]; then
         if [[ "$INPUT" != "-" && -e "$OUTPUT" && "$OUTPUT" -ef "$INPUT" ]]; then
             :
         else
             if [[ -d "$OUTPUT" ]] || ! tmp_out="$(mktemp "$(dirname "$OUTPUT")/.polish-gemini-XXXXXX" 2>/dev/null)"; then
                 diag "could not write $OUTPUT"
-                cleanup_temps
-                emit_outcome failed delivery_error no
-                exit 4
+                finish_delivery failed delivery_error no 4
             fi
             TEMP_FILES+=("$tmp_out")
             if [[ -e "$OUTPUT" ]]; then
@@ -402,32 +464,27 @@ deliver_original() {
             else
                 mode="$(printf '%o' $(( 0666 & ~0$(umask) )))"
             fi
-            if ! cat "$src" > "$tmp_out" || ! chmod "${mode:-644}" "$tmp_out" || ! mv -f "$tmp_out" "$OUTPUT"; then
+            if ! shielded cat "$src" > "$tmp_out" || ! shielded chmod "${mode:-644}" "$tmp_out" \
+                || ! shielded mv -f "$tmp_out" "$OUTPUT"; then
                 diag "could not write $OUTPUT"
-                cleanup_temps
-                emit_outcome failed delivery_error no
-                exit 4
+                finish_delivery failed delivery_error no 4
             fi
         fi
     else
-        if ! cat "$src"; then
-            cleanup_temps
-            emit_outcome failed delivery_error no
-            exit 4
+        if ! shielded cat "$src"; then
+            finish_delivery failed delivery_error no 4
         fi
     fi
 
-    cleanup_temps
-    emit_outcome skipped "$reason" yes
     if [[ "$STRICT" == "true" ]]; then
-        exit 3
+        finish_delivery skipped "$reason" yes 3
     fi
-    exit 0
+    finish_delivery skipped "$reason" yes 0
 }
 
 PYTHON_BIN="${HUMANIZE_POLISH_PYTHON:-python3}"
 if ! command -v "$PYTHON_BIN" >/dev/null 2>&1 || \
-   ! "$PYTHON_BIN" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; then
+   ! "$PYTHON_BIN" -I -B -c 'import sys; sys.exit(0 if sys.version_info >= (3, 7) else 1)' >/dev/null 2>&1; then
     if [[ -z "$SKIP_REASON" ]]; then
         diag "python3 (3.7 or newer) is required for polishing; delivering the original"
     fi

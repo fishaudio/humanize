@@ -44,7 +44,7 @@ for path in sys.argv[1:]:
     with open(path) as fh:
         compile(fh.read(), path, "exec")' \
     "$SCRIPT_DIR/../scripts/lib/polish_guard.py" "$SCRIPT_DIR/../scripts/lib/polish_gemini.py" \
-    "$SCRIPT_DIR/mocks/openrouter-mock.py" "$SCRIPT_DIR/polish-guard-cases.py"; then
+    "$SCRIPT_DIR/mocks/openrouter-mock.py" "$SCRIPT_DIR/polish-guard-cases.py" "$SCRIPT_DIR/polish-runner-cases.py"; then
     pass "Python helpers and test files compile"
 else
     fail "Python helpers and test files compile" "no syntax errors" "compile failed"

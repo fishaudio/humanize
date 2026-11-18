@@ -91,7 +91,7 @@ because the shell would re-split the arguments and can fail before the script st
 | `rejected` | The reply failed the guard (for example `protected_token`, `structure`, `script_changed`) | Tell the user the original was kept and why |
 | `failed` | The request failed (for example `timeout`, `auth`, `rate_limited`, `truncated`) | Tell the user the original was kept and why |
 
-`delivered=no` means nothing was written (usage error, delivery failure, or an interruption before delivery).
+`delivered=no` means nothing was written (usage error, delivery failure, or an interruption before delivery). With exit code 130 or 143 and `delivered=yes`, the run was interrupted after delivery had started; the outcome still says what was delivered, so a `polished` result still needs the review below.
 
 ## Review Checklist
 
@@ -115,7 +115,7 @@ If any item fails, deliver the original or a corrected version, and say so.
 | 3 | `--strict` only: the original was delivered because polishing was skipped, rejected, or failed |
 | 1 | Usage error; nothing delivered |
 | 4 | Delivery failed (for example an unwritable output); the destination is unchanged |
-| 130 / 143 | Interrupted; nothing delivered if the signal arrived before delivery |
+| 130 / 143 | Interrupted; nothing delivered if the signal arrived before delivery, otherwise the outcome line says what was delivered |
 
 ## Manual Segments Procedure (Component and Template Files)
 

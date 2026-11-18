@@ -426,4 +426,170 @@ report("HTML splice escapes angle brackets", lt_out == "<p>Use the 1 &gt; 0 form
 nested_spans, nested_segs = g.html_extract("<pre><span>a</span> still pre</pre><p>Prose.</p>")
 report("HTML excluded region ends at its own closing tag", nested_segs == "[[s1]] Prose.", nested_segs)
 
+# ----------------------------------------------------------------------------
+# Round 1 regression cases (review findings M1-M4 and M8)
+# ----------------------------------------------------------------------------
+
+# M1: blocks that start on a list-marker line.
+for prefix, label in (("- ", "bullet"), ("1. ", "ordered"), ("> - ", "quoted bullet")):
+    rejects("%s: indented code on the marker line changed" % label,
+            prefix + "    echo hello\n", prefix + "    echo goodbye\n", "region_changed")
+    rejects("%s: HTML block on the marker line changed" % label,
+            prefix + "<div>Keep this sentence.</div>\n", prefix + "<div>Change this sentence.</div>\n",
+            "region_changed")
+    rejects("%s: heading level on the marker line changed" % label,
+            prefix + "# First section\n", prefix + "## First section\n", "structure")
+    rejects("%s: reference definition on the marker line changed" % label,
+            prefix + '[ref]: /foo "Keep title"\n', prefix + '[ref]: /foo "Changed title"\n',
+            "region_changed")
+    accepts("%s: prose on the marker line stays editable" % label,
+            prefix + "Install the plugin before you start.\n",
+            prefix + "Install the plugin before starting.\n")
+rejects("quote on the marker line removed", "- > Quoted message\n", "- Quoted message\n", "structure")
+rejects("quote moved out of a list item", "- Item.\n\n  > Quoted message\n", "- Item.\n\n> Quoted message\n",
+        "structure")
+rejects("nested item on the marker line flattened", "- - inner item\n", "- inner item\n", "structure")
+rejects("blank line added between list items", "- One item.\n- Other item.\n",
+        "- One item.\n\n- Other item.\n", "structure")
+rejects("blank line removed between list items", "- One item.\n\n- Other item.\n",
+        "- One item.\n- Other item.\n", "structure")
+rejects("thematic break after a list turned into a setext heading in the item",
+        "- Item text\n---\n", "- Item text\n  ---\n", "structure")
+accepts("loose list keeps its blank lines", "- One item.\n\n- Other item.\n",
+        "- One item here.\n\n- Other item here.\n")
+rejects("task marker line content turned into a heading", "- [ ] Write the docs\n",
+        "- [ ] # Write the docs\n", "structure")
+accepts("task item reworded", "- [ ] Write the docs\n", "- [ ] Write the documentation\n")
+
+# M2: polish:off regions inside containers and inline.
+QUOTED_OFF = "> <!-- polish:off -->\n> Never change this sentence.\n> <!-- polish:on -->\n"
+rejects("quoted polish:off region changed", QUOTED_OFF, QUOTED_OFF.replace("Never", "Always"),
+        "region_changed")
+LIST_OFF = "- Item.\n\n  <!-- polish:off -->\n  Keep this exact text.\n  <!-- polish:on -->\n"
+rejects("list-contained polish:off region changed", LIST_OFF, LIST_OFF.replace("exact", "precise"),
+        "region_changed")
+INLINE_OFF = "Read <!-- polish:off -->keep this text<!-- polish:on --> carefully today.\n"
+rejects("inline polish:off region changed", INLINE_OFF, INLINE_OFF.replace("keep", "edit"),
+        "region_changed")
+accepts("text outside an inline polish:off region stays editable", INLINE_OFF,
+        INLINE_OFF.replace("carefully today", "with care today"))
+UNCLOSED = "Read <!-- polish:off -->keep this text\n\nAnd keep this paragraph too.\n"
+rejects("unterminated inline polish:off protects later blocks", UNCLOSED,
+        UNCLOSED.replace("keep this paragraph", "change this paragraph"), "region_changed")
+rejects("unterminated inline polish:off protects the rest of its block", UNCLOSED,
+        UNCLOSED.replace("keep this text", "edit this text"), "region_changed")
+UNCLOSED_LINE = "Intro paragraph.\n\n<!-- polish:off -->\nKeep this.\n\nAnd this.\n"
+rejects("unterminated polish:off line protects to the end", UNCLOSED_LINE,
+        UNCLOSED_LINE.replace("And this", "Also this"), "region_changed")
+
+# M3: paired math.
+rejects("digit-leading dollar math with spaces changed", "Use $2 x + y$ here.\n", "Use $2 x - y$ here.\n",
+        "protected_token")
+rejects("TeX inline math changed", "Compute \\(x + y\\) carefully.\n", "Compute \\(x - y\\) carefully.\n",
+        "protected_token")
+rejects("TeX display math in a paragraph changed", "Then \\[a = b + c\\] holds.\n",
+        "Then \\[a = b - c\\] holds.\n", "protected_token")
+rejects("inline double-dollar math changed", "So $$a + b$$ holds.\n", "So $$a - b$$ holds.\n",
+        "protected_token")
+accepts("prices with a space before the second dollar stay prose", "It costs $5 or $10 a month.\n",
+        "It costs $5 or $10 every month.\n")
+for name, cand in (("segments digit-leading math changed", "[[s1]] Use $2 x - y$ here."),
+                   ("segments TeX math changed", "[[s1]] Use \\(x - y\\) here.")):
+    src_seg = "[[s1]] Use $2 x + y$ here." if "digit" in name else "[[s1]] Use \\(x + y\\) here."
+    try:
+        g.check_segments(src_seg, cand)
+        report(name, False, "accepted")
+    except g.GuardReject as exc:
+        report(name, exc.reason == "protected_token", exc.reason)
+
+# M4: escaped punctuation.
+rejects("escaped emphasis turned into emphasis", "This is \\*literal\\* text.\n", "This is *literal* text.\n",
+        "inline_markup")
+rejects("escaped link turned into a link", "Read \\[the guide](guide.md) carefully.\n",
+        "Read [the guide](guide.md) carefully.\n", "inline_markup")
+rejects("escaped HTML turned into HTML", "Use \\<span>hello</span> safely.\n",
+        "Use <span>hello</span> safely.\n", "inline_markup")
+rejects("escape added to emphasis", "This is *bold* text.\n", "This is \\*bold\\* text.\n", "inline_markup")
+rejects("escaped backslash before emphasis made odd", "Keep \\\\*this* word.\n", "Keep \\*this* word.\n",
+        "inline_markup")
+accepts("escaped backslash before emphasis reworded", "Keep \\\\*this* word.\n", "Keep \\\\*that* word.\n")
+accepts("escaped text reworded around the escapes", "This is \\*literal\\* text.\n",
+        "This is \\*literal\\* wording.\n")
+rejects("backslash inside a code span is literal", "Run `a\\*b` now.\n", "Run `a*b` now.\n",
+        "protected_token")
+rejects("escaped backtick does not open a code span", "Use \\`tick and `code` here.\n",
+        "Use `tick and `code` here.\n")
+
+# M8: eligible attributes on body and unquoted values.
+ATTR_PAGE = '<body aria-label="Page overview"><input placeholder=Search><p>Read the guide.</p></body>'
+attr_spans, attr_segs = g.html_extract(ATTR_PAGE)
+report("HTML body attribute and unquoted value are extracted",
+       attr_segs == "[[s1]] Page overview\n[[s2]] Search\n[[s3]] Read the guide.", attr_segs)
+attr_out = g.html_splice(ATTR_PAGE, attr_spans, ["Overview of the page", 'Search "docs" = fast/', "Read the guide."])
+try:
+    g.html_verify(ATTR_PAGE, attr_out)
+    report("HTML unquoted value with spaces and quotes verifies", True)
+except g.GuardReject as exc:
+    report("HTML unquoted value with spaces and quotes verifies", False, exc.detail)
+report("HTML unquoted value is escaped into one value",
+       "placeholder=Search&#32;&quot;docs&quot;&#32;&#61;&#32;fast&#47;>" in attr_out, attr_out)
+report("HTML bytes outside the attribute values are unchanged",
+       attr_out.startswith('<body aria-label="Overview of the page"><input placeholder=')
+       and attr_out.endswith("><p>Read the guide.</p></body>"), attr_out)
+_, excl_segs = g.html_extract('<body><code title="Not eligible">x</code><pre><abbr title=Hidden>y</abbr></pre>'
+                              '<p title=Shown>Text.</p></body>')
+report("HTML attributes under excluded elements are not extracted",
+       excl_segs == "[[s1]] Shown\n[[s2]] Text.", excl_segs)
+_, head_segs = g.html_extract('<html><head><link rel="alternate" title="Feed"></head><body><p>Hi there.</p></body></html>')
+report("HTML attributes in head are not extracted", head_segs == "[[s1]] Hi there.", head_segs)
+
+# Round 1 re-review follow-ups.
+rejects("a tab inside inline code changed to spaces", "Use `a\tb` carefully.\n", "Use `a  b` carefully.\n",
+        "protected_token")
+accepts("rewording before inline code that holds a tab", "Use `a\tb` carefully.\n", "Read `a\tb` carefully.\n")
+rejects("a tab inside a fence on a list marker changed", "- ```sh\n  printf 'a\tb'\n  ```\n",
+        "- ```sh\n  printf 'a    b'\n  ```\n", "region_changed")
+rejects("link target after an escape changed", "Read [guide](folder\\*old) carefully.\n",
+        "Read [guide](folder\\*new) carefully.\n", "inline_markup")
+rejects("URL after an escape changed", "Visit https://example.com/a\\?old carefully.\n",
+        "Visit https://example.com/a\\?new carefully.\n")
+rejects("double-dollar math with spaces changed", "So $$ a + b $$ holds.\n", "So $$ a - b $$ holds.\n",
+        "protected_token")
+rejects("dollar math followed by a letter changed", "Use $2 x + y$th term.\n", "Use $2 x - y$th term.\n",
+        "protected_token")
+SPAN_OFF = "Read <!-- polish:off -->keep.\n\nKeep too. <!-- polish:on -->\n"
+rejects("blank line added inside a polish:off region that spans blocks", SPAN_OFF,
+        SPAN_OFF.replace("keep.\n\n", "keep.\n\n\n"), "region_changed")
+TRAIL_OFF = "Read <!-- polish:off -->keep this  \ntext here.\n"
+rejects("trailing spaces removed inside an unterminated region", TRAIL_OFF,
+        TRAIL_OFF.replace("this  \n", "this\n"), "region_changed")
+accepts("prose after polish:on in the closing block stays editable",
+        "Read <!-- polish:off -->keep.\n\nKeep too. <!-- polish:on --> Read carefully.\n",
+        "Read <!-- polish:off -->keep.\n\nKeep too. <!-- polish:on --> Read with care.\n")
+accepts("prose before polish:off in a list item stays editable",
+        "- Read <!-- polish:off -->keep.\n\n  Keep too. <!-- polish:on -->\n",
+        "- View <!-- polish:off -->keep.\n\n  Keep too. <!-- polish:on -->\n")
+accepts("a marker inside inline code is just text", "Use `<!-- polish:off -->` carefully.\n",
+        "Use `<!-- polish:off -->` with care.\n")
+accepts("a marker inside a fenced block is just text",
+        "```html\n<!-- polish:off -->\n```\n\nRead the notes carefully.\n",
+        "```html\n<!-- polish:off -->\n```\n\nRead the notes with care.\n")
+try:
+    g.check_segments("[[s1]] <!-- polish:off -->keep\n[[s2]] Keep exact text.\n[[s3]] <!-- polish:on -->",
+                     "[[s1]] <!-- polish:off -->keep\n[[s2]] Keep other text.\n[[s3]] <!-- polish:on -->")
+    report("segments inside a polish:off region that spans segments", False, "accepted")
+except g.GuardReject as exc:
+    report("segments inside a polish:off region that spans segments", exc.reason == "region_changed", exc.reason)
+_, off_segs = g.html_extract("<body><!-- polish:off --><p title=\"Keep\">Keep exact text.</p><!-- polish:on -->"
+                             "<p>Polish this.</p></body>")
+report("HTML text and attributes inside polish:off comments are not eligible",
+       off_segs == "[[s1]] Polish this.", off_segs)
+rejects("blank line added after a quoted list item", "- > Quoted text.\n- Next item.\n",
+        "- > Quoted text.\n\n- Next item.\n", "structure")
+accepts("quoted prose in a numbered item stays editable", "10. > Read the guide carefully.\n",
+        "10. > Read the guide with care.\n")
+accepts("an item after a quoted sibling stays editable",
+        "- Parent.\n  - > Read the quote.\n  - Read the guide carefully.\n",
+        "- Parent.\n  - > Read the quote.\n  - Read the guide with care.\n")
+
 sys.exit(1 if FAILED else 0)

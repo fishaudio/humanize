@@ -97,6 +97,17 @@ def _raise_interrupt(signum, frame):
 
 _DEFERRED_SIGNALS = []
 
+# A signal that was ignored when the process started (for example SIGINT in a
+# background job started by a non-interactive shell) stays ignored, as it does
+# in the shell wrapper, which cannot trap such a signal.
+_HANDLED_SIGNALS = tuple(s for s in (signal.SIGINT, signal.SIGTERM)
+                         if signal.getsignal(s) != signal.SIG_IGN)
+
+
+def _set_signal_handlers(handler):
+    for signum in _HANDLED_SIGNALS:
+        signal.signal(signum, handler)
+
 
 def _defer_signal(signum, frame):
     _DEFERRED_SIGNALS.append(signum)
@@ -104,8 +115,28 @@ def _defer_signal(signum, frame):
 
 def _block_signals():
     """Defer SIGINT and SIGTERM until exit (main thread only)."""
-    signal.signal(signal.SIGINT, _defer_signal)
-    signal.signal(signal.SIGTERM, _defer_signal)
+    _set_signal_handlers(_defer_signal)
+
+
+def _exit_code_for(signum):
+    return 130 if signum == signal.SIGINT else 143
+
+
+_CONTROL_RE = re.compile("[\x00-\x1f\x7f\x85\u2028\u2029]+")
+
+
+def one_line(text, limit=1000):
+    """Make untrusted text safe for a single diagnostic line.
+
+    Control characters and line separators become spaces, the text is
+    truncated, and it never starts like the outcome line.
+    """
+    text = _CONTROL_RE.sub(" ", str(text))
+    if len(text) > limit:
+        text = text[:limit] + "..."
+    if text.lstrip().startswith("outcome="):
+        text = "note: " + text
+    return text
 
 
 def _mask_signals_in_thread():
@@ -284,7 +315,8 @@ def api_error_message(raw_body):
     if isinstance(data, dict) and isinstance(data.get("error"), dict):
         msg = data["error"].get("message")
         if isinstance(msg, str):
-            return msg[:300]
+            # Not truncated here: diag() redacts the key first, then truncates.
+            return msg
     return ""
 
 
@@ -353,24 +385,33 @@ class Record(object):
         return cls(runner, skill_dir, cache_dir)
 
     def _write(self, directory, name, data, atomic=False):
+        """Write one record file. Never raises: records are optional."""
         if self.broken:
             return
-        if isinstance(data, str):
-            data = self.runner.redact(data).encode("utf-8")
         path = os.path.join(directory, name)
+        tmp = None
         try:
+            if isinstance(data, str):
+                data = self.runner.redact(data).encode("utf-8", "backslashreplace")
             if atomic:
                 fd, tmp = tempfile.mkstemp(prefix="." + name + ".", dir=directory)
                 with os.fdopen(fd, "wb") as fh:
                     fh.write(data)
                 os.replace(tmp, path)
+                tmp = None
             else:
                 with open(path, "wb") as fh:
                     fh.write(data)
-        except OSError as exc:
+        except Exception as exc:  # any failure only disables records
             self.broken = True
-            sys.stderr.write("%s records=unavailable (could not write %s: %s)\n"
-                             % (PREFIX, name, exc.strerror or exc))
+            if tmp is not None:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+            detail = getattr(exc, "strerror", None) or exc
+            sys.stderr.write("%s %s\n" % (PREFIX, one_line(
+                "records=unavailable (could not write %s: %s)" % (name, self.runner.redact(str(detail))))))
 
     def write_input(self, text):
         self._write(self.skill_dir, "input.md", text)
@@ -385,9 +426,10 @@ class Record(object):
         if self.broken:
             return
         try:
-            with open(os.path.join(self.cache_dir, "gemini-run.log"), "a") as fh:
-                fh.write("[%s] %s\n" % (_iso(time.time()), self.runner.redact(text)))
-        except OSError:
+            with open(os.path.join(self.cache_dir, "gemini-run.log"), "a", encoding="utf-8",
+                      errors="backslashreplace") as fh:
+                fh.write("[%s] %s\n" % (_iso(time.time()), one_line(self.runner.redact(text))))
+        except Exception:
             pass
 
     def write_metadata(self, fields):
@@ -428,7 +470,8 @@ class Runner(object):
         return text
 
     def diag(self, message):
-        text = self.redact(message)
+        # Redact before truncating so a key cut in half cannot slip through.
+        text = one_line(self.redact(str(message)))
         sys.stderr.write("%s %s\n" % (PREFIX, text))
         sys.stderr.flush()
         if self.record is not None:
@@ -445,8 +488,7 @@ class Runner(object):
     # -- entry --------------------------------------------------------------
 
     def run(self):
-        signal.signal(signal.SIGINT, _raise_interrupt)
-        signal.signal(signal.SIGTERM, _raise_interrupt)
+        _set_signal_handlers(_raise_interrupt)
         try:
             return self._run()
         except Interrupted as exc:
@@ -458,7 +500,7 @@ class Runner(object):
         if self.record is not None and not self.outcome_emitted:
             self._finish_record("failed", "interrupted", False)
         self.emit("failed", "interrupted", self.delivered)
-        return 130 if signum == signal.SIGINT else 143
+        return _exit_code_for(signum)
 
     def _cleanup_temps(self):
         for path in list(self.temp_paths):
@@ -483,6 +525,9 @@ class Runner(object):
             if stop.detail:
                 self.diag(stop.detail)
             return self.finish(stop.outcome, stop.reason, data)
+        except Exception as exc:  # never let an unexpected error skip delivery
+            self.diag("internal error: %s: %s" % (type(exc).__name__, exc))
+            return self.finish("failed", "internal_error", data)
         if final_bytes == data:
             return self.finish("unchanged", "identical", data)
         return self.finish("polished", "ok", final_bytes)
@@ -725,6 +770,9 @@ class Runner(object):
                     "Content-Type: application/json\nAccept: application/json\nX-Title: humanize-polish\n\n%s\n"
                     % (_iso(time.time()), self.opts["timeout"], url, body_json))
             posts += 1
+            # Record the effort of the request being sent, so a failed retry
+            # is reported with the effort it actually used.
+            self.effort_used = effort
             self.diag("sending request %d to %s (model=%s effort=%s max_tokens=%s)"
                       % (posts, url, self.opts["model"], effort, self.opts["max-tokens"]))
             kind, value = self._send_once(url, json.dumps(body).encode("utf-8"), headers)
@@ -736,7 +784,6 @@ class Runner(object):
             status, resp_headers, raw = value
             self.diag("HTTP %d after request %d" % (status, posts))
             if status == 200:
-                self.effort_used = effort
                 return self._accept(raw)
             message = api_error_message(raw)
             if message:
@@ -753,7 +800,6 @@ class Runner(object):
                     time.sleep(wait)
                     continue
                 raise Stop("failed", "rate_limited", "rate limited and the retry would pass the deadline")
-            self.effort_used = effort
             raise Stop("failed", classify_status(status))
 
     def _accept(self, raw):
@@ -761,23 +807,31 @@ class Runner(object):
             data = json.loads(raw.decode("utf-8"))
         except (ValueError, UnicodeDecodeError):
             raise Stop("failed", "bad_json", "response body is not valid JSON")
-        if isinstance(data, dict):
-            usage = data.get("usage")
-            if isinstance(usage, dict):
-                self.usage = usage
-            if self.record is not None:
-                self.record.write_cache_file("gemini-run.out", json.dumps(_strip_reasoning(data), indent=2,
-                                                                          ensure_ascii=False) + "\n")
+        try:
+            # JSON escapes can decode to lone surrogates, which are not text.
+            json.dumps(data, ensure_ascii=False).encode("utf-8")
+        except (UnicodeError, ValueError, TypeError):
+            raise Stop("failed", "bad_json", "response contains invalid Unicode")
         if not isinstance(data, dict):
             raise Stop("failed", "api_error", "response is not a JSON object")
-        if data.get("error"):
-            raise Stop("failed", "api_error", "response contains an error object: %s"
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            self.usage = usage
+        if self.record is not None:
+            try:
+                cleaned = json.dumps(_strip_reasoning(data), indent=2, ensure_ascii=False) + "\n"
+            except Exception:
+                cleaned = "(response could not be serialized)\n"
+            self.record.write_cache_file("gemini-run.out", cleaned)
+        # An error field of any value except null means the call failed.
+        if data.get("error", None) is not None:
+            raise Stop("failed", "api_error", "response contains an error field: %s"
                        % api_error_message(raw))
         choices = data.get("choices")
         if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
             raise Stop("failed", "api_error", "response has no choices")
         choice = choices[0]
-        if choice.get("error"):
+        if choice.get("error", None) is not None:
             raise Stop("failed", "api_error", "response choice contains an error")
         message = choice.get("message")
         if not isinstance(message, dict):
@@ -854,15 +908,32 @@ class Runner(object):
 
     def finish(self, outcome, reason, payload):
         _block_signals()
+        if _DEFERRED_SIGNALS:
+            # Interrupted before delivery began: deliver nothing.
+            return self._interrupted(_DEFERRED_SIGNALS[0])
         ok = self._deliver(payload)
         self.delivered = ok
         if not ok:
             outcome, reason = "failed", "delivery_error"
         if self.record is not None:
-            if ok:
-                self.record.write_skill_file("output.md", payload)
-            self._finish_record(outcome, reason, ok)
+            try:
+                if ok:
+                    self.record.write_skill_file("output.md", payload)
+                self._finish_record(outcome, reason, ok)
+            except Exception as exc:  # records must never block the outcome
+                self.diag("records=unavailable (%s)" % exc)
+        if _DEFERRED_SIGNALS:
+            # Interrupted during delivery: the delivery finished (or failed)
+            # first. The outcome line still describes what was delivered, and
+            # the exit code (130 or 143) reports the interruption. A signal
+            # that arrives after this point is still reflected in the exit
+            # code by main().
+            self.diag("interrupted by %s during delivery; delivery %s first"
+                      % ("SIGINT" if _DEFERRED_SIGNALS[0] == signal.SIGINT else "SIGTERM",
+                         "finished" if ok else "failed"))
         self.emit(outcome, reason, ok)
+        if _DEFERRED_SIGNALS:
+            return _exit_code_for(_DEFERRED_SIGNALS[0])
         if not ok:
             return EXIT_DELIVERY
         if self.opts["strict"] and outcome in ("skipped", "rejected", "failed"):
@@ -967,7 +1038,12 @@ class Runner(object):
 def _strip_reasoning(data):
     """Return a copy of a response without any reasoning text."""
     clean = json.loads(json.dumps(data))
-    for choice in clean.get("choices") or []:
+    if not isinstance(clean, dict):
+        return clean
+    choices = clean.get("choices")
+    if not isinstance(choices, list):
+        return clean
+    for choice in choices:
         if isinstance(choice, dict):
             for holder in (choice, choice.get("message"), choice.get("delta")):
                 if isinstance(holder, dict):
@@ -993,10 +1069,14 @@ def main(argv):
     try:
         opts = parse_options(argv)
     except UsageError as exc:
-        sys.stderr.write("%s %s\n" % (PREFIX, exc))
+        sys.stderr.write("%s %s\n" % (PREFIX, one_line(exc)))
         sys.stderr.write("%s outcome=failed reason=usage_error delivered=no\n" % PREFIX)
         return EXIT_USAGE
-    return Runner(opts).run()
+    rc = Runner(opts).run()
+    if _DEFERRED_SIGNALS and rc in (EXIT_OK, EXIT_STRICT, EXIT_DELIVERY):
+        # A signal that arrived after the outcome line was printed.
+        rc = _exit_code_for(_DEFERRED_SIGNALS[0])
+    return rc
 
 
 if __name__ == "__main__":

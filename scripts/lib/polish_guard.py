@@ -146,11 +146,29 @@ def check_scripts(src_text, cand_text, where):
 # ----------------------------------------------------------------------------
 
 CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)
-# Inline math: "$x + y$", and digit-leading math without spaces such as "$2x$".
-# Digit-leading spans with spaces are left alone so prices like "$5 or $10"
-# stay prose (their numbers are still protected as digit tokens).
+# Inline math, using the Pandoc rule: "$" opens when followed by a non-space,
+# and closes when preceded by a non-space and not followed by a word
+# character. So "$2 x + y$" is math, while in "$5 or $10" the second "$" is
+# preceded by a space and cannot close, and the text stays prose. "$$...$$"
+# inside a line is math too; "\(...\)" and "\[...\]" are found by the inline
+# scanner.
 INLINE_MATH_RE = re.compile(
-    r"(?<![\\$\w])\$(?:(?=[^\s$\d])[^$\n]*?(?<=\S)|(?=\d)[^\s$]+)\$(?!\w)")
+    r"\$\$[^$]*?[^\s$][^$]*?\$\$"
+    r"|(?<![\\$])\$(?=[^\s$])[^$\n]*?(?<=[^\s\\])\$(?!\d)")
+# Text between inline polish:off and polish:on markers, or from a polish:off
+# marker to the end of the unit when the region continues past it.
+INLINE_PROTECTED_RE = re.compile(r"<!--\s*polish:off\s*-->.*?(?:<!--\s*polish:on\s*-->|\Z)", re.S)
+POLISH_OFF_LINE_RE = re.compile(r"^\s*<!--\s*polish:off\s*-->\s*$")
+POLISH_ON_LINE_RE = re.compile(r"^\s*<!--\s*polish:on\s*-->\s*$")
+POLISH_ON_RE = re.compile(r"<!--\s*polish:on\s*-->")
+# Placeholder for the two characters of a backslash escape: it keeps link
+# targets and URLs that contain an escape in one piece, but is not markup.
+ESCAPE_HOLD = "\ue000"
+# A fence opener or closer on a line, after any quote or list-marker prefix.
+FENCE_LINE_RE = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-+*]|\d{1,9}[.)])[ \t]+)?(`{3,}|~{3,})(.*)$")
+POLISH_OFF_RE = re.compile(r"<!--\s*polish:off\s*-->")
+# ASCII punctuation that a backslash escapes in CommonMark.
+ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 AUTOLINK_RE = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*|[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>")
 LINK_RE = re.compile(
@@ -193,7 +211,7 @@ PROSE_SLASH_PAIRS = frozenset(["and/or", "either/or", "he/she", "his/her", "him/
 PROSE_ABBREVIATIONS = frozenset(["e.g", "i.e", "a.k.a", "n.b", "p.s", "a.m", "p.m", "u.s", "u.k"])
 # Emphasis delimited by underscores, such as "_word_" or "__two words__".
 UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_])(?:(?!\1).)+?(?<=[^\s_])\1(?!\w)")
-MARKUP_TOKEN_KINDS = ("tag", "link", "image", "reflink", "autolink", "footnote")
+MARKUP_TOKEN_KINDS = ("tag", "link", "image", "reflink", "autolink", "footnote", "escape")
 
 
 def _mask(chars, start, end):
@@ -217,6 +235,61 @@ def _strip_url(url):
     return url
 
 
+def _scan_inline(text):
+    """Find code spans, TeX math and backslash escapes in one left-to-right pass.
+
+    Returns (kind, start, end, value) tuples. Scanning in order gets escape
+    parity right: in "\\\\*" the backslash is escaped and the star is active,
+    an escaped backtick never opens a code span, and backslashes inside a
+    code span are literal.
+    """
+    out = []
+    n = len(text)
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == "\\" and i + 1 < n:
+            nxt = text[i + 1]
+            if nxt in "([":
+                closer = "\\)" if nxt == "(" else "\\]"
+                end = text.find(closer, i + 2)
+                if end >= 0:
+                    out.append(("math", i, end + 2, text[i:end + 2]))
+                    i = end + 2
+                    continue
+            if nxt in ESCAPABLE:
+                out.append(("escape", i, i + 2, text[i:i + 2]))
+                i += 2
+                continue
+            i += 1
+            continue
+        if ch == "`":
+            run = 1
+            while i + run < n and text[i + run] == "`":
+                run += 1
+            j = i + run
+            close = -1
+            while j < n:
+                if text[j] == "`":
+                    k = j
+                    while k < n and text[k] == "`":
+                        k += 1
+                    if k - j == run:
+                        close = j
+                        break
+                    j = k
+                else:
+                    j += 1
+            if close >= 0:
+                out.append(("code", i, close + run, text[i + run:close]))
+                i = close + run
+            else:
+                i += run
+            continue
+        i += 1
+    return out
+
+
 def extract_tokens(text):
     """Return (tokens, masked) for a prose fragment.
 
@@ -230,8 +303,20 @@ def extract_tokens(text):
     def current():
         return "".join(chars)
 
-    for m in CODE_SPAN_RE.finditer(current()):
-        found.append((m.start(), "code", m.group(2)))
+    for kind, start, end, value in _scan_inline(current()):
+        found.append((start, kind, value))
+        if kind == "escape":
+            # Hide the escaped punctuation from the markup patterns but keep
+            # the position occupied, so a link target or URL that contains an
+            # escape is still one token.
+            chars[start] = ESCAPE_HOLD
+            chars[start + 1] = ESCAPE_HOLD
+        else:
+            _mask(chars, start, end)
+
+    # After code spans, so a marker quoted inside inline code is just text.
+    for m in INLINE_PROTECTED_RE.finditer(current()):
+        found.append((m.start(), "protected", m.group(0)))
         _mask(chars, m.start(), m.end())
 
     for m in INLINE_MATH_RE.finditer(current()):
@@ -388,7 +473,12 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
             kinds.add(x[0])
         if y:
             kinds.add(y[0])
-        reason = "inline_markup" if kinds & set(MARKUP_TOKEN_KINDS) else "protected_token"
+        if "protected" in kinds:
+            reason = "region_changed"
+        elif kinds & set(MARKUP_TOKEN_KINDS):
+            reason = "inline_markup"
+        else:
+            reason = "protected_token"
         raise GuardReject(
             reason,
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
@@ -407,7 +497,7 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
 # ----------------------------------------------------------------------------
 
 RAW_KINDS = ("frontmatter", "fence", "math", "html", "protected", "footnote_def",
-             "refdef", "hr", "table_sep", "table_raw", "indented_code", "list_fence")
+             "refdef", "hr", "table_sep", "table_raw", "indented_code", "quote_raw")
 
 QUOTE_PREFIX_RE = re.compile(r"^((?:[ ]{0,3}>[ ]?)+)")
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})(.*)$")
@@ -467,8 +557,7 @@ def _strip_quote(line, depth):
 
 
 def _is_html_start(body):
-    stripped = body.strip()
-    if stripped == POLISH_OFF or stripped == POLISH_ON:
+    if POLISH_OFF_LINE_RE.match(body) or POLISH_ON_LINE_RE.match(body):
         return False
     return bool(HTML_BLOCK_RE.match(body) or HTML_LINE_TAG_RE.match(body))
 
@@ -516,7 +605,7 @@ def _starts_block(body, in_list):
     """True when ``body`` would start a new block instead of continuing prose."""
     if not body.strip():
         return True
-    if body.strip() in (POLISH_OFF, POLISH_ON):
+    if POLISH_OFF_LINE_RE.match(body) or POLISH_ON_LINE_RE.match(body):
         return True
     if FENCE_RE.match(body) or ATX_RE.match(body) or HR_RE.match(body):
         return True
@@ -584,8 +673,33 @@ def _html_block_end(lines, i, body):
     return min(j, n - 1)
 
 
+def _expand_indent(text):
+    """Expand tabs in the leading whitespace only; the content keeps its bytes."""
+    lead = len(text) - len(text.lstrip(" \t"))
+    return text[:lead].expandtabs(4) + text[lead:]
+
+
+def _indent_of(text):
+    expanded = _expand_indent(text)
+    return len(expanded) - len(expanded.lstrip(" "))
+
+
+def _past_container(text, base):
+    """``text`` with up to ``base`` columns of container indentation removed."""
+    expanded = _expand_indent(text)
+    return expanded[min(base, _indent_of(expanded)):]
+
+
 def parse_blocks(text):
-    """Split Markdown or plain text into an ordered list of blocks."""
+    """Split Markdown or plain text into an ordered list of blocks.
+
+    List items are containers: a ``list_item`` block carries the marker, its
+    nesting depth, and whether a blank line separates it from the previous
+    item. The rest of the marker line is then read again as the first line of
+    the item's content, so headings, code, HTML, quotes, definitions and
+    nested items that start on a marker line are classified like any other
+    block, with ``container`` giving the number of enclosing list items.
+    """
     lines = text.split("\n")
     n = len(lines)
     blocks = []
@@ -616,24 +730,32 @@ def parse_blocks(text):
 
     while i < n:
         line = lines[i]
-        if not line.strip():
+        quote, body = _quote_depth(line)
+        if not body.strip():
             i += 1
             continue
         start_line = i + 1
-
-        if line.strip() == POLISH_OFF:
-            j = i + 1
-            while j < n and lines[j].strip() != POLISH_ON:
-                j += 1
-            end = min(j, n - 1)
-            blocks.append(Block("protected", {}, "\n".join(lines[i:end + 1]), [], start_line))
-            i = end + 1
-            continue
-
-        quote, body = _quote_depth(line)
-        ebody = body.expandtabs(4)
+        ebody = _expand_indent(body)
         indent = len(ebody) - len(ebody.lstrip(" "))
         depth, base = containers(quote, indent)
+        cbody = ebody[base:] if indent >= base else ebody.lstrip(" ")
+        # Column of the first quote marker, so a quote moved into or out of a
+        # list item is visible.
+        qcol = (len(line) - len(line.lstrip(" "))) if quote else 0
+
+        def attrs(**extra):
+            out = {"quote": quote, "qcol": qcol, "container": depth}
+            out.update(extra)
+            return out
+
+        if POLISH_OFF_LINE_RE.match(cbody):
+            j = i + 1
+            while j < n and not POLISH_ON_RE.search(lines[j]):
+                j += 1
+            end = min(j, n - 1)
+            blocks.append(Block("protected", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
+            i = end + 1
+            continue
 
         if indent - base >= 4:
             # Indented code block: every following line that is blank or
@@ -653,40 +775,50 @@ def parse_blocks(text):
                     k += 1
                     continue
                 break
-            blocks.append(Block("indented_code", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:j + 1]), [], start_line))
+            blocks.append(Block("indented_code", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
             i = j + 1
             continue
 
-        fence = _is_fence_open(body)
+        if depth > 0 and cbody.startswith(">"):
+            # A blockquote inside a list item that is indented too far for the
+            # quote prefix parser: keep it verbatim.
+            j = i
+            while j + 1 < n and lines[j + 1].strip():
+                nxt_c = _past_container(_strip_quote(lines[j + 1], quote), base)
+                if nxt_c.startswith(">") or not _starts_block(nxt_c, False):
+                    j += 1
+                    continue
+                break
+            blocks.append(Block("quote_raw", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
+            i = j + 1
+            continue
+
+        fence = _is_fence_open(cbody)
         if fence:
             end = _fence_end(lines, i + 1, quote, fence)
-            blocks.append(Block("fence", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:end + 1]), [], start_line))
+            blocks.append(Block("fence", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
             i = end + 1
             continue
 
-        if body.lstrip().startswith("$$"):
+        if cbody.lstrip().startswith("$$"):
             j = i
-            opener = body.strip()
+            opener = cbody.strip()
             if not (len(opener) > 2 and opener.endswith("$$")):
                 j = i + 1
                 while j < n and "$$" not in lines[j]:
                     j += 1
             end = min(j, n - 1)
-            blocks.append(Block("math", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:end + 1]), [], start_line))
+            blocks.append(Block("math", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
             i = end + 1
             continue
 
-        if _is_html_start(body):
-            end = _html_block_end(lines, i, body)
-            blocks.append(Block("html", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:end + 1]), [], start_line))
+        if _is_html_start(cbody):
+            end = _html_block_end(lines, i, cbody)
+            blocks.append(Block("html", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
             i = end + 1
             continue
 
-        if FOOTNOTE_DEF_RE.match(body):
+        if FOOTNOTE_DEF_RE.match(cbody):
             # Continuation: indented lines right after the definition, and
             # lines indented four columns after blank lines.
             j = i
@@ -703,17 +835,16 @@ def parse_blocks(text):
                     j = k
                     k += 1
                     continue
-                if kb.expandtabs(4).startswith("    "):
+                if _indent_of(kb) - base >= 4:
                     j = k
                     k += 1
                     continue
                 break
-            blocks.append(Block("footnote_def", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:j + 1]), [], start_line))
+            blocks.append(Block("footnote_def", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
             i = j + 1
             continue
 
-        if REFDEF_RE.match(body):
+        if REFDEF_RE.match(cbody):
             # A title may continue on the following lines.
             j = i
             while j + 1 < n:
@@ -721,38 +852,36 @@ def parse_blocks(text):
                 nb = _strip_quote(lines[j + 1], quote)
                 if nq != quote or not nb.strip():
                     break
-                if REFDEF_RE.match(nb) or FOOTNOTE_DEF_RE.match(nb):
+                nbc = _past_container(nb, base)
+                if REFDEF_RE.match(nbc) or FOOTNOTE_DEF_RE.match(nbc):
                     break
-                if nb[:1] in (" ", "\t") or nb.lstrip()[:1] in ("\"", "'", "("):
+                if nbc[:1] in (" ", "\t") or nbc.lstrip()[:1] in ("\"", "'", "("):
                     j += 1
                     continue
                 break
-            blocks.append(Block("refdef", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:j + 1]), [], start_line))
+            blocks.append(Block("refdef", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
             i = j + 1
             continue
 
-        hm = ATX_RE.match(body)
+        hm = ATX_RE.match(cbody)
         if hm:
-            blocks.append(Block("heading", {"level": len(hm.group(1)), "quote": quote,
-                                            "container": depth},
-                                line, [hm.group(2) or ""], start_line))
+            blocks.append(Block("heading", attrs(level=len(hm.group(1))), line,
+                                [hm.group(2) or ""], start_line))
             i += 1
             continue
 
-        if HR_RE.match(body):
-            blocks.append(Block("hr", {"quote": quote, "container": depth}, body.strip(), [],
-                                start_line))
+        if HR_RE.match(cbody):
+            blocks.append(Block("hr", attrs(), cbody.strip(), [], start_line))
             i += 1
             continue
 
-        if "|" in body and i + 1 < n and _is_table_sep(_strip_quote(lines[i + 1], quote)):
+        if "|" in cbody and i + 1 < n and _is_table_sep(_strip_quote(lines[i + 1], quote)):
             # Body rows run until a blank line or the start of another block,
             # with or without pipes.
             rows = [i]
             j = i + 2
             while j < n and lines[j].strip() and _quote_depth(lines[j])[0] == quote:
-                if _starts_block(_strip_quote(lines[j], quote), False):
+                if _starts_block(_past_container(_strip_quote(lines[j], quote), base), False):
                     break
                 rows.append(j)
                 j += 1
@@ -761,72 +890,63 @@ def parse_blocks(text):
                 row_body = _strip_quote(lines[r], quote)
                 cells = _split_cells(row_body)
                 if has_html:
-                    blocks.append(Block("table_raw", {"quote": quote, "container": depth},
-                                        lines[r], [], r + 1))
+                    blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
                 else:
-                    blocks.append(Block("table_row", {"quote": quote, "container": depth,
-                                                      "cols": len(cells)},
-                                        lines[r], cells, r + 1))
+                    blocks.append(Block("table_row", attrs(cols=len(cells)), lines[r], cells, r + 1))
                 if idx == 0:
                     sep = _strip_quote(lines[i + 1], quote)
                     sep_norm = re.sub(r"[ \t]", "", sep).strip("|")
-                    blocks.append(Block("table_sep", {"quote": quote, "container": depth},
-                                        sep_norm, [], i + 2))
+                    blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
             i = j
             continue
 
-        lm = LIST_ITEM_RE.match(body)
+        lm = LIST_ITEM_RE.match(ebody)
         if lm:
             marker = lm.group("marker")
-            after_marker = ebody[indent + len(marker):]
-            gap = len(after_marker) - len(after_marker.lstrip(" "))
-            if gap >= 5 or not after_marker.strip():
-                gap = 1
-            list_stack.append((indent, indent + len(marker) + gap))
-            ordered = marker[-1] in ".)"
+            col0 = indent + len(marker)
+            after_marker = ebody[col0:]
+            ws_raw = after_marker[:len(after_marker) - len(after_marker.lstrip(" \t"))]
+            rest_raw = after_marker[len(ws_raw):]
+            ws = len((" " * col0 + ws_raw).expandtabs(4)) - col0
+            gap = 1 if (ws >= 5 or not rest_raw.strip()) else ws
+            content_col = col0 + gap
             task = lm.group("task")
-            task_norm = task.strip().lower() if task else ""
-            attrs = {
+            prev = blocks[-1] if blocks else None
+            # A blank line before an item makes the list loose, when the
+            # previous block belongs to the list (an item, content inside an
+            # item, or a quote indented inside an item).
+            in_list = prev is not None and (prev.kind == "list_item"
+                                            or prev.attrs.get("container", 0) > 0
+                                            or prev.attrs.get("qcol", 0) > 0)
+            blank_before = bool(in_list and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
+            list_stack.append((indent, content_col))
+            blocks.append(Block("list_item", {
                 "quote": quote,
+                "qcol": qcol,
                 "depth": depth,
-                "ordered": ordered,
+                "ordered": marker[-1] in ".)",
                 "marker": marker,
-                "task": task_norm,
-            }
-            item_fence = _is_fence_open(lm.group("rest"))
-            if item_fence:
-                # A fence that opens on the marker line is kept verbatim with
-                # the marker.
-                end = _fence_end(lines, i + 1, quote, item_fence)
-                blocks.append(Block("list_fence", attrs, "\n".join(lines[i:end + 1]), [],
-                                    start_line))
-                i = end + 1
-                continue
-            content = [_prose_line(lm.group("rest"))]
-            j = i + 1
-            while j < n:
-                nxt = lines[j]
-                nq, nbody = _quote_depth(nxt)
-                if not nxt.strip():
-                    break
-                if nq not in (0, quote):
-                    break
-                nbody = _strip_quote(nxt, quote)
-                if _starts_block(nbody, True):
-                    break
-                if "|" in nbody and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
-                    break
-                content.append(_prose_line(nbody))
-                j += 1
-            blocks.append(Block("list_item", attrs, "\n".join(lines[i:j]), ["\n".join(content)],
-                                start_line))
-            i = j
+                "task": task.strip().lower() if task else "",
+                "blank_before": blank_before,
+            }, line, [], start_line))
+            # Read the rest of the marker line again as the item's first
+            # content line, at the item's content column.
+            if task:
+                new_body = " " * content_col + lm.group("rest")
+            else:
+                pad = col0 + ws
+                if ws < 5 and rest_raw.startswith(">"):
+                    # Keep a quote that opens on the marker line within reach
+                    # of the quote prefix parser.
+                    pad = min(pad, 3)
+                new_body = " " * pad + rest_raw
+            lines[i] = line[:len(line) - len(body)] + new_body
             continue
 
         # Paragraph, possibly a setext heading. An underline only counts when
-        # it sits in the same blockquote as the paragraph; a lazy "---" line
-        # outside the quote is a thematic break.
-        content = [_prose_line(body)]
+        # it sits in the same blockquote and the same list item as the
+        # paragraph; a lazy "---" line outside them is a thematic break.
+        content = [_prose_line(cbody)]
         j = i + 1
         setext_level = 0
         while j < n:
@@ -837,37 +957,99 @@ def parse_blocks(text):
             if nq not in (0, quote):
                 break
             nbody = _strip_quote(nxt, quote)
-            sm = SETEXT_RE.match(nbody)
-            if sm and nq == quote:
+            if not nbody.strip():
+                break
+            same_container = nq == quote and (depth == 0 or _indent_of(nbody) >= base)
+            nbc = _past_container(nbody, base)
+            sm = SETEXT_RE.match(nbc)
+            if sm and same_container:
                 setext_level = 1 if sm.group(1)[0] == "=" else 2
                 j += 1
                 break
-            if _starts_block(nbody, False):
+            if _starts_block(nbc, False):
                 break
-            if "|" in nbody and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
+            if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
             content.append(_prose_line(nbody))
             j += 1
         if setext_level:
-            blocks.append(Block("heading", {"level": setext_level, "quote": quote,
-                                            "container": depth},
+            blocks.append(Block("heading", attrs(level=setext_level),
                                 "\n".join(lines[i:j]), ["\n".join(content)], start_line))
         else:
-            blocks.append(Block("paragraph", {"quote": quote, "container": depth},
-                                "\n".join(lines[i:j]), ["\n".join(content)], start_line))
+            blocks.append(Block("paragraph", attrs(), "\n".join(lines[i:j]), ["\n".join(content)],
+                                start_line))
         i = j
 
     return blocks
 
 
 def prose_block_count(text):
-    return len([b for b in parse_blocks(text) if b.kind not in RAW_KINDS])
+    return len([b for b in parse_blocks(text)
+                if b.kind not in RAW_KINDS and any(u.strip() for u in b.units)])
+
+
+def _mask_code(text):
+    """``text`` with fenced code and inline code spans blanked out (same length)."""
+    out = []
+    fence = None
+    for line in text.split("\n"):
+        m = FENCE_LINE_RE.match(line)
+        if fence is None:
+            if m and not (m.group(1)[0] == "`" and "`" in m.group(2)):
+                fence = m.group(1)
+                out.append(" " * len(line))
+            else:
+                out.append(line)
+        else:
+            out.append(" " * len(line))
+            if (m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence)
+                    and not m.group(2).strip()):
+                fence = None
+    chars = list("\n".join(out))
+    for kind, start, end, _ in _scan_inline("".join(chars)):
+        if kind == "code":
+            _mask(chars, start, end)
+    return "".join(chars)
+
+
+def protected_slices(text):
+    """Exact source slices covered by polish:off regions, in order.
+
+    A region runs from a polish:off marker to the next polish:on marker, or to
+    the end of the text when it is never closed. Markers inside code are text.
+    """
+    masked = _mask_code(text)
+    slices = []
+    pos = 0
+    while True:
+        m = POLISH_OFF_RE.search(masked, pos)
+        if not m:
+            break
+        e = POLISH_ON_RE.search(masked, m.end())
+        end = e.end() if e else len(text)
+        slices.append(text[m.start():end])
+        pos = end
+    return slices
+
+
+def check_regions(source, candidate):
+    """Reject any change to text inside polish:off regions, including whitespace."""
+    src = protected_slices(source)
+    cand = protected_slices(candidate)
+    if src != cand:
+        if len(src) != len(cand):
+            detail = "the number of polish:off regions changed from %d to %d" % (len(src), len(cand))
+        else:
+            idx = next(k for k in range(len(src)) if src[k] != cand[k])
+            detail = "polish:off region %d changed" % (idx + 1)
+        raise GuardReject("region_changed", detail)
 
 
 def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=DOC_RATIO_BOUNDS):
     """Verify a Markdown or text candidate against its source. Raises GuardReject."""
     if candidate.count("\r") != source.count("\r"):
         raise GuardReject("structure", "carriage-return line endings changed")
+    check_regions(source, candidate)
     src_blocks = parse_blocks(source)
     cand_blocks = parse_blocks(candidate)
     if len(src_blocks) != len(cand_blocks):
@@ -938,6 +1120,7 @@ def check_segments(source_text, candidate_text, html_mode=False,
         cand = parse_segments(candidate_text)
     except ValueError as exc:
         raise GuardReject("segment_mismatch", str(exc))
+    check_regions(source_text, candidate_text)
     src_ids = [s[0] for s in src]
     cand_ids = [c[0] for c in cand]
     if src_ids != cand_ids:
@@ -1130,10 +1313,11 @@ def _analyze_html(source):
     spans = []
     skeleton = []
     excluded = []
-    state = {"body": False, "head": False, "title": 0}
+    # "protected" is set between <!-- polish:off --> and <!-- polish:on -->.
+    state = {"body": False, "head": False, "title": 0, "protected": False}
 
     def eligible_context():
-        if excluded:
+        if excluded or state["protected"]:
             return False
         if state["title"]:
             return True
@@ -1181,8 +1365,12 @@ def _analyze_html(source):
                     "self-closing <%s/> on a non-void element near offset %d" % (lowered, off))
             attr_sig = []
             regex_attrs = []
-            tag_eligible = (eligible_context() and lowered not in EXCLUDED_ELEMENTS
-                            and not state["title"])
+            # Attribute eligibility does not depend on the text context: the
+            # body element's own attributes count, and so do unquoted values.
+            tag_eligible = (not excluded and not state["protected"]
+                            and lowered not in EXCLUDED_ELEMENTS
+                            and not state["title"]
+                            and (lowered == "body" or eligible_context()))
             raw_tag = payload or ""
             name_match = re.match(r"<[^\s/>]+", raw_tag)
             pos = name_match.end() if name_match else 0
@@ -1197,8 +1385,8 @@ def _analyze_html(source):
                 else:
                     value, vstart, quote = am.group(4), am.start(4), ""
                 regex_attrs.append((name, None if value is None else html.unescape(value)))
-                if (tag_eligible and name in ELIGIBLE_ATTRS and quote and value is not None
-                        and value.strip() and not _has_template_syntax(value)):
+                if (tag_eligible and name in ELIGIBLE_ATTRS and value is not None
+                        and value.strip(HTML_WS) and not _has_template_syntax(value)):
                     core = value.strip(HTML_WS)
                     if _has_semicolonless_ref(core):
                         raise UnsupportedInput(
@@ -1245,6 +1433,11 @@ def _analyze_html(source):
                 state["title"] -= 1
         else:
             skeleton.append((kind, payload))
+            if kind == "comment" and not excluded:
+                if re.fullmatch(r"\s*polish:off\s*", payload or ""):
+                    state["protected"] = True
+                elif re.fullmatch(r"\s*polish:on\s*", payload or ""):
+                    state["protected"] = False
     if run_start is not None:
         flush_run(run_start, len(source))
     return spans, skeleton
@@ -1257,13 +1450,23 @@ def html_extract(source):
     return spans, (format_segments(segments) if segments else "")
 
 
-def _escape_text(text, quote=""):
+# Characters that would end or split an unquoted attribute value.
+UNQUOTED_ESCAPES = {'"': "&quot;", "'": "&#39;", "=": "&#61;", "`": "&#96;",
+                    " ": "&#32;", "\t": "&#9;", "\n": "&#10;", "\f": "&#12;", "\r": "&#13;"}
+
+
+def _escape_text(text, quote="", unquoted=False):
     out = re.sub(r"&(?!(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});)", "&amp;", text)
     out = out.replace("<", "&lt;").replace(">", "&gt;")
     if quote == '"':
         out = out.replace('"', "&quot;")
     elif quote == "'":
         out = out.replace("'", "&#39;")
+    elif unquoted:
+        out = "".join(UNQUOTED_ESCAPES.get(ch, ch) for ch in out)
+        if out.endswith("/"):
+            # "value/>" would read as a self-closing slash.
+            out = out[:-1] + "&#47;"
     return out
 
 
@@ -1282,7 +1485,8 @@ def html_splice(source, spans, polished):
         if new_text == collapse_ws(span.core):
             pieces.append(source[span.start:span.end])
         else:
-            pieces.append(span.lead + _escape_text(new_text, span.quote) + span.trail)
+            unquoted = span.kind == "attr" and not span.quote
+            pieces.append(span.lead + _escape_text(new_text, span.quote, unquoted) + span.trail)
         cursor = span.end
     pieces.append(source[cursor:])
     return "".join(pieces)

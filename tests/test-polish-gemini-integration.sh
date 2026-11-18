@@ -344,7 +344,8 @@ FEATURE_FILES=(
     "skills/polish-gemini/SKILL.md" "config/default_config.json" "hooks/loop-codex-stop-hook.sh"
     "docs/usage.md" "README.md" ".claude-plugin/plugin.json" ".claude-plugin/marketplace.json"
     "tests/test-polish-gemini.sh" "tests/test-polish-gemini-guard.sh" "tests/test-polish-gemini-integration.sh"
-    "tests/polish-guard-cases.py" "tests/mocks/openrouter-mock.py" "tests/manual-polish-gemini-real.sh"
+    "tests/polish-guard-cases.py" "tests/polish-runner-cases.py" "tests/mocks/openrouter-mock.py"
+    "tests/manual-polish-gemini-real.sh"
     "tests/run-all-tests.sh"
 )
 CJK_HITS=""

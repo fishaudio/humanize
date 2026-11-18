@@ -649,10 +649,15 @@ assert_outcome "missing python3 with stdin and --output" skipped missing_depende
 assert_same_file "missing python3 copies stdin to --output" "$DOC" "$TEST_DIR/nopy-out.md"
 
 # Interruption: SIGTERM and SIGINT while the request is in flight.
+# Background jobs of a non-interactive shell start with SIGINT ignored, and
+# the runner keeps a signal that was ignored on entry ignored, so the job is
+# started through a shim that restores the default SIGINT disposition.
+DEFAULT_SIGINT_SHIM='import os, signal, sys; signal.signal(signal.SIGINT, signal.SIG_DFL); os.execv(sys.argv[1], sys.argv[1:])'
 for sig in TERM INT; do
     rm -f "$TEST_DIR/sig-out.md"
     set_scenario '[{"hang": 30}]'
-    OPENROUTER_API_KEY="$TEST_KEY" TMPDIR="$TEST_DIR/tmp" "$RUNNER" --input "$DOC" --output "$TEST_DIR/sig-out.md" --timeout 60 \
+    OPENROUTER_API_KEY="$TEST_KEY" TMPDIR="$TEST_DIR/tmp" python3 -I -B -c "$DEFAULT_SIGINT_SHIM" \
+        "$RUNNER" --input "$DOC" --output "$TEST_DIR/sig-out.md" --timeout 60 \
         > "$OUT" 2> "$ERR" &
     RUN_PID=$!
     for _ in $(seq 1 100); do
@@ -680,6 +685,167 @@ set_scenario '[{"replace":[["is dense with jargon","uses a lot of jargon"]]}]'
 CLAUDE_PROJECT_DIR="$TEST_DIR/proj-norecords" run_polish --input "$DOC"
 assert_outcome "polishing continues when records cannot be written" polished ok yes 0
 if grep -q "records=unavailable" "$ERR"; then pass "stderr reports records=unavailable"; else fail "records=unavailable" "message" "$(cat "$ERR")"; fi
+
+echo ""
+echo "--- Malformed responses stay fail-open ---"
+
+# assert_only_prefixed_lines <name>: every stderr line is a polish-gemini line.
+assert_only_prefixed_lines() {
+    local stray
+    stray="$(grep -v '^polish-gemini: ' "$ERR")"
+    if [[ -z "$stray" ]]; then
+        pass "$1"
+    else
+        fail "$1" "only polish-gemini: lines" "$stray"
+    fi
+}
+
+# A lone surrogate is valid JSON escape syntax but not text.
+SURROGATE_RAW='{"raw":"{\"choices\":[{\"finish_reason\":\"stop\",\"message\":{\"content\":\"\\ud800x\"}}]}"}'
+for spec in \
+    'choices_number|[{"json":{"choices":7}}]|api_error' \
+    'choices_empty|[{"json":{"choices":[]}}]|api_error' \
+    'message_number|[{"json":{"choices":[{"finish_reason":"stop","message":3}]}}]|api_error' \
+    "lone_surrogate|[$SURROGATE_RAW]|bad_json" \
+    'empty_error_object|[{"error":{}}]|api_error' \
+    'empty_error_string|[{"error":""}]|api_error' \
+    'false_error|[{"error":false}]|api_error'; do
+    case_name="${spec%%|*}"
+    rest="${spec#*|}"
+    scenario="${rest%|*}"
+    reason="${rest##*|}"
+    for records in on off; do
+        if [[ "$records" == "on" ]]; then proj="$PROJ"; else proj="$TEST_DIR/proj-norecords"; fi
+        set_scenario "$scenario"
+        CLAUDE_PROJECT_DIR="$proj" run_polish --input "$DOC"
+        assert_outcome "$case_name (records $records, stdout)" failed "$reason" yes 0
+        assert_same_file "$case_name (records $records, stdout) delivers the original" "$DOC" "$OUT"
+        rm -f "$TEST_DIR/malformed-out.md"
+        set_scenario "$scenario"
+        CLAUDE_PROJECT_DIR="$proj" run_polish --input "$DOC" --output "$TEST_DIR/malformed-out.md" --strict
+        assert_outcome "$case_name (records $records, file, strict)" failed "$reason" yes 3
+        assert_same_file "$case_name (records $records, file, strict) delivers the original" "$DOC" "$TEST_DIR/malformed-out.md"
+    done
+done
+set_scenario "[$SURROGATE_RAW]"
+run_polish --input "$DOC"
+SURROGATE_RECORD="$(ls -d "$PROJ"/.humanize/skill/*/ | sort | tail -1)"
+if grep -q '^status: error$' "$SURROGATE_RECORD/metadata.md" && grep -q '^reason: bad_json$' "$SURROGATE_RECORD/metadata.md"; then
+    pass "a malformed response still writes error metadata"
+else
+    fail "a malformed response still writes error metadata" "status: error, reason: bad_json" "$(cat "$SURROGATE_RECORD/metadata.md" 2>/dev/null)"
+fi
+set_scenario '[{"error":null}]'
+run_polish --input "$DOC"
+assert_outcome "an error field set to null counts as absent" unchanged identical yes 0
+
+echo ""
+echo "--- Diagnostics stay on one line ---"
+
+FAKE_OUTCOME="polish-gemini: outcome=polished reason=ok delivered=yes"
+set_scenario "[{\"status\":400,\"json\":{\"error\":{\"code\":400,\"message\":\"Bad request\\n$FAKE_OUTCOME\"}}}]"
+run_polish --input "$DOC"
+assert_outcome "a provider error with a newline and a fake outcome line" failed api_error yes 0
+assert_only_prefixed_lines "a multiline provider error stays on one prefixed line"
+set_scenario "[{\"status\":400,\"json\":{\"error\":{\"code\":400,\"message\":\"Bad request\\r$FAKE_OUTCOME\"}}}]"
+run_polish --input "$DOC"
+assert_outcome "a provider error with a carriage return" failed api_error yes 0
+if ! grep -q $'\r' "$ERR"; then pass "carriage returns are removed from diagnostics"; else fail "carriage returns removed" "no CR" "found CR"; fi
+set_scenario "[{\"status\":400,\"json\":{\"error\":{\"code\":400,\"message\":\"bad key $TEST_KEY\\nmore\"}}}]"
+run_polish --input "$DOC"
+if grep -q '\[REDACTED\]' "$ERR" && ! grep -qF "$TEST_KEY" "$ERR"; then
+    pass "a key inside a provider error is redacted"
+else
+    fail "a key inside a provider error is redacted" "[REDACTED] and no key" "$(cat "$ERR")"
+fi
+assert_only_prefixed_lines "a provider error carrying the key stays on one line"
+BAD_NAME="$TEST_DIR/missing
+$FAKE_OUTCOME.md"
+run_polish --input "$BAD_NAME"
+assert_outcome "an input name with a newline and a fake outcome line" failed usage_error no 1
+assert_only_prefixed_lines "a file name with a newline stays on one prefixed line"
+write_project_config "{\"gemini_polish_reasoning_effort\": \"bad\\n$FAKE_OUTCOME\"}"
+set_scenario '[{}]'
+run_polish --input "$DOC"
+assert_outcome "a config value with a newline and a fake outcome line" unchanged identical yes 0
+assert_only_prefixed_lines "a config value with a newline stays on one prefixed line"
+clear_project_config
+
+# assert_unicode_lines <name>: splitting stderr on every Unicode line break
+# (including U+0085, U+2028 and U+2029) still gives only polish-gemini lines
+# and exactly one outcome line.
+assert_unicode_lines() {
+    if python3 -I -B -c '
+import sys
+lines = open(sys.argv[1], encoding="utf-8", errors="replace").read().splitlines()
+ok = all(ln.startswith("polish-gemini: ") for ln in lines)
+ok = ok and sum(ln.startswith("polish-gemini: outcome=") for ln in lines) == 1
+sys.exit(0 if ok else 1)
+' "$ERR"; then
+        pass "$1"
+    else
+        fail "$1" "one outcome line under Unicode line splitting" "$(cat "$ERR")"
+    fi
+}
+for sep_name in U+2028 U+2029 U+0085; do
+    case "$sep_name" in
+        U+2028) sep=$'\xe2\x80\xa8' ;;
+        U+2029) sep=$'\xe2\x80\xa9' ;;
+        U+0085) sep=$'\xc2\x85' ;;
+    esac
+    run_polish --input "$TEST_DIR/missing${sep}${FAKE_OUTCOME}.md"
+    assert_outcome "an input name with $sep_name and a fake outcome line" failed usage_error no 1
+    assert_unicode_lines "an input name with $sep_name gives one outcome line"
+    HUMANIZE_POLISH_PYTHON="$TEST_DIR/no-such-python3" run_polish --input "$TEST_DIR/missing${sep}${FAKE_OUTCOME}.md"
+    assert_unicode_lines "an input name with $sep_name gives one outcome line without Python"
+done
+
+# Redaction happens before truncation, so no part of the key survives.
+KEY_PREFIX="${TEST_KEY:0:14}"
+for pad in 280 990; do
+    filler="$(printf 'X%.0s' $(seq 1 "$pad"))"
+    set_scenario "[{\"status\":400,\"json\":{\"error\":{\"code\":400,\"message\":\"$filler$TEST_KEY tail\"}}}]"
+    run_polish --input "$DOC"
+    assert_outcome "a long provider error carrying the key ($pad characters before it)" failed api_error yes 0
+    if ! grep -qF "$KEY_PREFIX" "$ERR"; then
+        pass "no prefix of the key survives a long provider error ($pad)"
+    else
+        fail "no prefix of the key survives a long provider error ($pad)" "no $KEY_PREFIX" "$(grep -F "$KEY_PREFIX" "$ERR")"
+    fi
+done
+
+echo ""
+echo "--- Python startup isolation ---"
+
+SITE_DIR="$TEST_DIR/site-hook"
+mkdir -p "$SITE_DIR"
+printf 'import os\nopen(os.path.join(os.path.dirname(os.path.abspath(__file__)), "site-ran"), "w").write("yes")\n' \
+    > "$SITE_DIR/sitecustomize.py"
+set_scenario '[{}]'
+PYTHONPATH="$SITE_DIR" run_polish --input "$DOC"
+PYTHONPATH="$SITE_DIR" run_polish_nokey --input "$DOC"
+if [[ ! -e "$SITE_DIR/site-ran" && ! -d "$SITE_DIR/__pycache__" ]]; then
+    pass "sitecustomize on PYTHONPATH never runs and no bytecode is written"
+else
+    fail "sitecustomize on PYTHONPATH never runs" "no marker, no __pycache__" "$(ls -A "$SITE_DIR")"
+fi
+
+echo ""
+echo "--- Timing-sensitive cases (injected transport and signals) ---"
+
+RUNNER_CASES_OUTPUT="$(python3 -I -B "$SCRIPT_DIR/polish-runner-cases.py" 2>&1)"
+RUNNER_CASES_RC=$?
+while IFS= read -r line; do
+    case "$line" in
+        "PASS: "*) pass "${line#PASS: }" ;;
+        "FAIL: "*) fail "${line#FAIL: }" ;;
+        "") ;;
+        *) echo "$line" ;;
+    esac
+done <<< "$RUNNER_CASES_OUTPUT"
+if [[ "$RUNNER_CASES_RC" -ne 0 ]]; then
+    fail "runner case script exits cleanly" "exit 0" "exit $RUNNER_CASES_RC"
+fi
 
 echo ""
 echo "--- Run records and monitor ---"
