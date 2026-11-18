@@ -1221,4 +1221,59 @@ for name, src in [
 rejects("R2-M8 whitespace inside a comment changed", "Read <!-- a  b --> today.\n",
         "Read <!-- a b --> today.\n", "inline_markup")
 
+# Round 3 re-review: quote markers inside list items continue a fence, a
+# paragraph or a table; closing an outer item closes the lists inside it;
+# lazy lines are read past the list items they reach; empty or non-1
+# ordered items do not interrupt a paragraph; trailing blank lines of an
+# unclosed fence belong to it.
+for name, src, cand in [
+        ("a code line in a quoted fence inside a list item edited",
+         "- > ~~~\n    > Keep this text.\n", "- > ~~~\n    > Edit this text.\n"),
+        ("a code line in a quoted fence inside a list item, marker past four columns, edited",
+         "1. > ```\n     > keep = 1\n     > ```\n", "1. > ```\n     > edit = 1\n     > ```\n"),
+        ("a trailing quoted blank line of an unclosed fence removed",
+         "> ~~~\n> keep\n>\n\nRead this prose.\n", "> ~~~\n> keep\n\nRead this prose.\n"),
+        ("whitespace of a trailing blank line of a fence in a list item changed",
+         "- ~~~\n  keep\n   \n\nRead this prose.\n", "- ~~~\n  keep\n  \n\nRead this prose.\n"),
+        ("indented code after an outer item closes edited",
+         "- > - Item.\n>     keep\n", "- > - Item.\n>     edit\n"),
+        ("a nested list after a lazy line removed",
+         "- > Read the prose.\n    code\n    > - Next item.\n", "- > Read the prose.\n    code\n"),
+        ("a heading after a lazy quote line merged into the paragraph",
+         "   \n- # head\n  > text two\n\t# head\n>   ~~~\n", "   \n- # head\n  > text two\n    \t# head\n>   ~~~\n"),
+        ("a blank code line after an empty item that cannot interrupt changed",
+         "   text two\n1. \n   ~~~\n    \n1. \n    text two\n", "   text two\n1. \n   ~~~\n     \n1. \n    text two\n"),
+        ("a code line after an empty item that cannot interrupt edited",
+         "   text two\n1. \n   ~~~\n    \n1. \n    text two\n", "   text two\n1. \n   ~~~\n    \n1. \n    edit two\n"),
+        ("a code line after an ordered item that does not start at 1 edited",
+         "Read this\n2. item\n~~~\nkeep\n~~~\n", "Read this\n2. item\n~~~\nedit\n~~~\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("prose in a quote continued by a marker inside the list item reworded",
+         "- > *Read the\n    > prose.*\n", "- > *See the\n    > prose.*\n"),
+        ("five emphasized references to one possible definition reworded",
+         "Read [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].\n\n"
+         "<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n",
+         "See [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].\n\n"
+         "<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n"),
+        ("an empty item after a list item, not a paragraph interruption, kept",
+         "- Read this.\n-\n- Then that.\n", "- Read it.\n-\n- Then that.\n"),
+        ("a lazy line that continues a paragraph inside a list item reworded",
+         "- > Read the\n    prose here.\n", "- > See the\n    prose here.\n")]:
+    accepts("R3 " + name, src, cand)
+seg_check("R3 five emphasized references with one label in a segment reworded",
+          "[[a]] Read [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].",
+          "[[a]] See [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].",
+          False)
+rejects("R3 emphasis moved across five references with one possible label",
+        "Read [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].\n\n"
+        "<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n",
+        "Read [*guide][ref] and [guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].\n\n"
+        "<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n")
+rejects("R3 emphasis inside references with more than four possible labels",
+        "Read [*a*][r1] [*b*][r2] [*c*][r3] [*d*][r4] [*e*][r5].\n\n<!-- polish:off -->\n"
+        "[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n<!-- polish:on -->\n",
+        "See [*a*][r1] [*b*][r2] [*c*][r3] [*d*][r4] [*e*][r5].\n\n<!-- polish:off -->\n"
+        "[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n<!-- polish:on -->\n", "inline_markup")
+
 sys.exit(1 if FAILED else 0)

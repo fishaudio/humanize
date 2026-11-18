@@ -479,8 +479,9 @@ def _scan_refs(masked, original, resolve, offset=0):
     same length and gives the label text).
 
     ``resolve`` maps a label to "yes", "maybe" or "no". Returns
-    (label_start, label_end, kind, status) for every full, collapsed or
-    shortcut reference whose label is, or may be, defined; their link text is
+    (label_start, label_end, kind, status, key) for every full, collapsed or
+    shortcut reference whose label is, or may be, defined; ``key`` is the
+    normalized label that decides whether it resolves. Their link text is
     scanned for nested references too.
     """
     out = []
@@ -520,7 +521,7 @@ def _scan_refs(masked, original, resolve, offset=0):
             i += 1
             continue
         kind = "image" if i > 0 and masked[i - 1] == "!" else "link"
-        out.append((offset + i + 1, offset + close, kind, status))
+        out.append((offset + i + 1, offset + close, kind, status, normalize_label(label)))
         out.extend(_scan_refs(masked[i + 1:close], original[i + 1:close], resolve,
                               offset + i + 1))
         i = end
@@ -593,7 +594,8 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
     ``labels`` collects the label spans of links and images, which are
     boundaries for emphasis. ``refs`` is the document's (definite, possible)
     reference labels, or None when the fragment stands alone (a segment);
-    the labels of references that may or may not resolve go to ``maybe``.
+    the labels of references that may or may not resolve go to ``maybe``,
+    each as (start, end, key): labels with the same key resolve together.
     """
     chars = list(text)
     found = []
@@ -647,10 +649,13 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         # same bracket scanner). CommonMark does not nest links, so a "link"
         # that holds another link is text, and its brackets are no boundary
         # (its destination is still protected here). A reference that may
-        # or may not resolve gives a possible boundary.
-        spans = [(ls, le, kind, "yes") for _, ls, le, _, kind, _ in links]
+        # or may not resolve gives a possible boundary; one whose boundary
+        # also depends on references inside it gets a key of its own, so
+        # every combination is checked.
+        spans = [(ls, le, kind, "yes", None) for _, ls, le, _, kind, _ in links]
         spans += _scan_refs(current(), text, resolve)
-        for ls, le, kind, status in spans:
+        nested = 0
+        for ls, le, kind, status, key in spans:
             if kind == "link":
                 inner = [s[3] for s in spans
                          if s[2] == "link" and ls <= s[0] and s[1] <= le and (s[0], s[1]) != (ls, le)]
@@ -658,10 +663,12 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
                     continue
                 if inner:
                     status = "maybe"
+                    key = ("nested", nested)
+                    nested += 1
             if status == "yes":
                 labels.append((ls, le))
             elif maybe is not None:
-                maybe.append((ls, le))
+                maybe.append((ls, le, key))
 
     snapshot = current()
     for m in REF_LINK_RE.finditer(snapshot):
@@ -680,7 +687,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         if status != "yes":
             unhide.extend((k, snapshot[k]) for k in range(m.end(2), m.end()) if snapshot[k] in "*_~")
             if status == "maybe" and maybe is not None:
-                maybe.append((m.start(3), m.end(3)))
+                maybe.append((m.start(3), m.end(3), normalize_label(m.group(3))))
         _mask(chars, m.start(), m.start(2))
         _mask(chars, m.end(2), m.end())
 
@@ -979,8 +986,10 @@ def _check_emphasis(src, src_masked, src_labels, src_maybe,
                     cand, cand_masked, cand_labels, cand_maybe, where):
     """Compare emphasis with every combination of the possible link labels
     (references that may or may not resolve) as boundaries. A possible label
-    matters only when emphasis markers sit inside it."""
-    if len(src_maybe) != len(cand_maybe):
+    matters only when emphasis markers sit inside it. Labels that share a
+    reference label resolve together, so the combinations are taken over
+    the distinct reference labels."""
+    if [m[2] for m in src_maybe] != [m[2] for m in cand_maybe]:
         raise GuardReject("inline_markup", "%s: bracketed text changed" % where)
 
     def has_markers(masked, span):
@@ -988,15 +997,20 @@ def _check_emphasis(src, src_masked, src_labels, src_maybe,
 
     relevant = [k for k in range(len(src_maybe))
                 if has_markers(src_masked, src_maybe[k]) or has_markers(cand_masked, cand_maybe[k])]
-    if len(relevant) > AMBIGUOUS_LABEL_LIMIT:
+    keys = []
+    for k in relevant:
+        if src_maybe[k][2] not in keys:
+            keys.append(src_maybe[k][2])
+    if len(keys) > AMBIGUOUS_LABEL_LIMIT:
         raise GuardReject(
             "inline_markup",
-            "%s: more than %d bracketed texts with emphasis markers that may be links"
-            % (where, AMBIGUOUS_LABEL_LIMIT))
-    for bits in range(1 << len(relevant)):
-        chosen = [k for idx, k in enumerate(relevant) if bits >> idx & 1]
-        if (emphasis_structure(src, src_masked, src_labels + [src_maybe[k] for k in chosen])
-                != emphasis_structure(cand, cand_masked, cand_labels + [cand_maybe[k] for k in chosen])):
+            "%s: emphasis markers inside bracketed texts with more than %d different labels that may "
+            "be links" % (where, AMBIGUOUS_LABEL_LIMIT))
+    for bits in range(1 << len(keys)):
+        on = [key for idx, key in enumerate(keys) if bits >> idx & 1]
+        chosen = [k for k in relevant if src_maybe[k][2] in on]
+        if (emphasis_structure(src, src_masked, src_labels + [src_maybe[k][:2] for k in chosen])
+                != emphasis_structure(cand, cand_masked, cand_labels + [cand_maybe[k][:2] for k in chosen])):
             raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
 
 
@@ -1237,18 +1251,33 @@ def _is_table_sep(line):
     return "|" in line and "-" in line and bool(TABLE_SEP_RE.match(line))
 
 
-def _starts_block(body, in_list):
-    """True when ``body`` would start a new block instead of continuing prose."""
+def _starts_block(body, in_paragraph):
+    """True when ``body`` would start a new block instead of continuing prose.
+
+    ``in_paragraph``: the line reaches every container of the paragraph, so
+    the paragraph itself is what a new block would interrupt. A list item
+    then interrupts it only when it has content and, if ordered, starts at
+    1; otherwise the line continues the paragraph."""
     if not body.strip():
         return True
     if POLISH_OFF_LINE_RE.match(body) or POLISH_ON_LINE_RE.match(body):
         return True
+    if _indent_of(body) >= 4:
+        # Four columns past the container: indented code cannot interrupt a
+        # paragraph and nothing else starts there, so the line continues it.
+        return False
     if FENCE_RE.match(body) or ATX_RE.match(body) or HR_RE.match(body):
         return True
     if _is_html_start(body):
         return True
-    if LIST_ITEM_RE.match(body):
-        return True
+    lm = LIST_ITEM_RE.match(body)
+    if lm:
+        if not in_paragraph:
+            return True
+        marker = lm.group("marker")
+        if not body[lm.end("marker"):].strip():
+            return False
+        return marker[-1] not in ".)" or int(marker[:-1]) == 1
     if FOOTNOTE_DEF_RE.match(body) or REFDEF_RE.match(body):
         return True
     # A "$$" line does not interrupt a paragraph: display math written inside
@@ -1422,7 +1451,7 @@ def parse_blocks(text):
         current block (no lazy continuation): same quote depth, quote markers
         that reach the enclosing items, indentation that reaches the item,
         and no new quote."""
-        if not lines[k].strip() or _quote_depth(lines[k])[0] != quote:
+        if not lines[k].strip() or relocate_quotes(k, quote) != quote:
             return False
         if quote and _leaves_list_item(qcols_of(k, quote), quote, level_stacks):
             return False
@@ -1441,11 +1470,17 @@ def parse_blocks(text):
         while len(level_stacks) <= quote:
             level_stacks.append([])
         # A quote marker closes the list items at its level whose content
-        # column it does not reach.
+        # column it does not reach, and with them the quotes opened inside
+        # those items and every list in those quotes.
         for level in range(quote):
             outer = level_stacks[level]
+            closed = False
             while outer and qcols[level] < outer[-1][1]:
                 outer.pop()
+                closed = True
+            if closed:
+                for deeper in range(level + 1, len(level_stacks)):
+                    level_stacks[deeper] = []
         stack = level_stacks[quote]
         while indent is not None and stack and indent < stack[-1][1]:
             stack.pop()
@@ -1460,6 +1495,50 @@ def parse_blocks(text):
     # including an empty one, changes the structure.
     open_quotes = []
 
+    def past_matched(body, level):
+        """``body`` (a line after ``level`` quote markers) past the open list
+        items at that level that its indentation reaches. CommonMark matches
+        list items outermost first; a new block would start after the last
+        item the line reaches, so a lazy line is read from there."""
+        reach = 0
+        if level < len(level_stacks):
+            ind = _indent_of(body)
+            for _, content in level_stacks[level]:
+                if ind < content:
+                    break
+                reach = content
+        return _past_container(body, reach)
+
+    def relocate_quotes(k, limit):
+        """Move the quote markers of line ``k`` that sit four or more columns
+        into the line but within every open list item at their level (as the
+        relocation below does for a new quote), up to ``limit`` markers in
+        all, and return the line's quote depth afterwards. Such a marker
+        continues the open quote inside those items: CommonMark matches the
+        items first and the marker after them."""
+        depth_now = _quote_depth(lines[k])[0]
+        while depth_now < limit and depth_now < len(level_stacks) and level_stacks[depth_now]:
+            if depth_now and _leaves_list_item(qcols_of(k, depth_now), depth_now, level_stacks):
+                break
+            kb = _strip_quote(lines[k], depth_now)
+            kind = _indent_of(kb)
+            content = level_stacks[depth_now][-1][1]
+            if kind < content or not _starts_quote(_past_container(kb, content)):
+                break
+            marker_quote_col.setdefault(k, {})[depth_now] = kind
+            lines[k] = ((_quote_prefix(lines[k], depth_now) + " ") if depth_now else "") \
+                + " " * min(kind, 3) + kb.lstrip(" ")
+            depth_now = _quote_depth(lines[k])[0]
+        return depth_now
+
+    def blank_line_before(k, depth):
+        """Whether the line before line ``k`` is blank inside ``depth``
+        quotes (read from the original bytes)."""
+        if k <= 0:
+            return False
+        prev = orig_lines[k - 1]
+        return not prev[_loose_quote_end(prev, depth):].strip()
+
     def track_quotes(qdepth, ancestry, line_no):
         keep = 0
         while (keep < min(len(open_quotes), qdepth)
@@ -1468,23 +1547,27 @@ def parse_blocks(text):
         del open_quotes[keep:]
         for level in range(keep + 1, qdepth + 1):
             open_quotes.append(ancestry[:level])
-            blocks.append(Block("quote", {"level": level, "container": ancestry[:level]},
-                                "", [], line_no))
+            quote_attrs = {"level": level, "container": ancestry[:level]}
+            if any(ancestry[:level]):
+                quote_attrs["gap"] = blank_line_before(line_no - 1, level - 1)
+            blocks.append(Block("quote", quote_attrs, "", [], line_no))
 
     def fence_end(start, quote, depth, base, fence):
         """Index of the last line of the fence opened on line ``start - 1``:
         the closing fence, or the last line before the fence's blockquote or
         list item ends (fenced code has no lazy continuation lines). A
-        closing fence is indented at most three columns past its container."""
+        closing fence is indented at most three columns past its container.
+        Blank and whitespace-only lines inside the container are code too."""
         last = start - 1
         j = start
         while j < n:
             if not lines[j].strip():
                 if quote:
                     break
+                last = j
                 j += 1
                 continue
-            if _quote_depth(lines[j])[0] < quote:
+            if relocate_quotes(j, quote) < quote:
                 break
             if quote and _leaves_list_item(qcols_of(j, quote), quote, level_stacks):
                 break
@@ -1497,7 +1580,7 @@ def parse_blocks(text):
                 if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == fence[0]
                         and len(cm.group(1)) >= len(fence)):
                     return j
-                last = j
+            last = j
             j += 1
         return last
 
@@ -1534,6 +1617,10 @@ def parse_blocks(text):
 
         def attrs(**extra):
             out = {"quote": quote, "container": ancestry}
+            if any(ancestry):
+                # Inside a list item, a blank line between two blocks makes
+                # the list loose.
+                out["gap"] = blank_line_before(i, quote)
             out.update(extra)
             return out
 
@@ -1767,6 +1854,8 @@ def parse_blocks(text):
             seen_content = any(b.kind != "quote" for b in blocks)
             blank_before = bool(seen_content and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
             level_stacks[quote].append((indent, content_col))
+            empty_item = (not task and not rest_raw.strip()
+                          and (i + 1 >= n or not _strip_quote(lines[i + 1], quote).strip()))
             blocks.append(Block("list_item", {
                 "quote": quote,
                 "depth": depth,
@@ -1776,6 +1865,11 @@ def parse_blocks(text):
                 "task": task.strip().lower() if task else "",
                 "blank_before": blank_before,
             }, line, [], start_line))
+            if empty_item:
+                # An item may start with at most one blank line: one that
+                # starts empty and is followed by a blank line is empty, and
+                # what follows is outside it.
+                level_stacks[quote].pop()
             # Read the rest of the marker line again as the item's first
             # content line, at the item's content column.
             if task:
@@ -1804,10 +1898,11 @@ def parse_blocks(text):
             nxt = lines[j]
             if not nxt.strip():
                 break
-            nq, _ = _quote_depth(nxt)
+            nq = relocate_quotes(j, quote)
+            nxt = lines[j]
             if nq > quote:
                 break
-            nbody = _strip_quote(nxt, quote)
+            nbody = _strip_quote(nxt, nq)
             if not nbody.strip():
                 break
             # A line with fewer quote markers is a lazy continuation line,
@@ -1816,7 +1911,9 @@ def parse_blocks(text):
             if nq > 0 and _leaves_list_item(qcols_of(j, nq), nq, level_stacks):
                 break
             same_container = nq == quote and (depth == 0 or _indent_of(nbody) >= base)
-            nbc = _past_container(nbody, base)
+            # A lazy line, or one that leaves some of the paragraph's list
+            # items, is read past the items it does reach.
+            nbc = past_matched(nbody, nq)
             if _starts_quote(nbc):
                 # A quote marker indented into a list item starts a quote,
                 # which interrupts the paragraph.
@@ -1826,7 +1923,7 @@ def parse_blocks(text):
                 setext_level = 1 if sm.group(1)[0] == "=" else 2
                 j += 1
                 break
-            if _starts_block(nbc, False):
+            if _starts_block(nbc, same_container):
                 break
             if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
