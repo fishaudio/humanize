@@ -553,6 +553,9 @@ class Runner(object):
             # is handled like any other.
             _set_signal_handlers(_raise_interrupt)
             if _STARTUP_SIGNALS:
+                # Through the raise-once state, so a further signal is only
+                # recorded.
+                _INTERRUPTING.append(_STARTUP_SIGNALS[0])
                 raise Interrupted(_STARTUP_SIGNALS[0])
             return self._run()
         except Interrupted as exc:

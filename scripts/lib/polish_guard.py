@@ -1082,6 +1082,13 @@ RAW_LINE_KINDS = ("frontmatter", "fence", "math", "html", "footnote_def", "refde
                   "indented_code", "table_raw")
 
 
+def _starts_quote(text):
+    """Whether ``text`` (a line past its containers) starts a blockquote: a
+    ``>`` after at most three columns of indentation."""
+    stripped = text.lstrip(" ")
+    return stripped.startswith(">") and len(text) - len(stripped) < 4
+
+
 def _expand_structure(line):
     """``line`` with the tabs in its structural start replaced by spaces at
     their true columns; the rest of the line keeps its bytes."""
@@ -1165,7 +1172,7 @@ def parse_blocks(text):
             return False
         rel = _past_container(kb, base)
         # Four columns past the container make the line indented code.
-        return _indent_of(rel) < 4 and not rel.startswith(">")
+        return _indent_of(rel) < 4 and not _starts_quote(rel)
 
     def containers(quote, indent, qcols):
         del level_stacks[quote + 1:]
@@ -1254,7 +1261,7 @@ def parse_blocks(text):
             i = j + 1
             continue
 
-        if depth > 0 and cbody.startswith(">"):
+        if depth > 0 and _starts_quote(cbody):
             # A blockquote inside a list item whose marker sits beyond the
             # reach of the quote prefix parser (four or more columns into the
             # line). Move each marker line of the quote left, keep the
@@ -1268,7 +1275,7 @@ def parse_blocks(text):
                 rel = _past_container(kb, base)
                 if k > i and quote and _leaves_list_item(qcols_of(k, quote), quote, level_stacks):
                     break
-                if kind >= base and rel.startswith(">"):
+                if kind >= base and _starts_quote(rel):
                     marker_quote_col.setdefault(k, {})[quote] = kind
                     lines[k] = ((_quote_prefix(lines[k], quote) + " ") if quote else "") \
                         + " " * min(kind, 3) + kb.lstrip(" ")
@@ -1350,7 +1357,7 @@ def parse_blocks(text):
                     parts.append(kb.lstrip(" "))
                 else:
                     part = _past_container(kb, base)
-                    if part.startswith(">"):
+                    if _starts_quote(part):
                         break
                     parts.append(part)
                 k += 1
@@ -1477,7 +1484,7 @@ def parse_blocks(text):
                 break
             same_container = nq == quote and (depth == 0 or _indent_of(nbody) >= base)
             nbc = _past_container(nbody, base)
-            if nbc.startswith(">"):
+            if _starts_quote(nbc):
                 # A quote marker indented into a list item starts a quote,
                 # which interrupts the paragraph.
                 break
@@ -1490,7 +1497,13 @@ def parse_blocks(text):
                 break
             if "|" in nbc and j + 1 < n and _is_table_sep(_strip_quote(lines[j + 1], quote)):
                 break
-            content.append(_quote_rest(nxt if j in cut_lines else orig_lines[j], quote))
+            # Original bytes, except for a line whose quote marker was moved
+            # (the original has the marker out of the prefix parser's reach)
+            # or that was cut after a polish:on marker.
+            if j in cut_lines or j in marker_quote_col:
+                content.append(_quote_rest(nxt, quote))
+            else:
+                content.append(_quote_rest(orig_lines[j], quote))
             j += 1
         if setext_level:
             blocks.append(Block("heading", attrs(level=setext_level),
@@ -1500,13 +1513,14 @@ def parse_blocks(text):
                                 start_line))
         i = j
 
-    # Raw blocks are compared byte for byte against the original lines.
+    # Raw blocks are compared byte for byte against the original lines; a
+    # line cut after a polish:on marker keeps its cut text.
     for block in blocks:
         if block.kind in RAW_LINE_KINDS:
             first = block.line - 1
             last = first + block.raw.count("\n")
-            if not any(k in cut_lines for k in range(first, last + 1)):
-                block.raw = "\n".join(orig_lines[first:last + 1])
+            block.raw = "\n".join(lines[k] if k in cut_lines else orig_lines[k]
+                                  for k in range(first, last + 1))
     return blocks
 
 

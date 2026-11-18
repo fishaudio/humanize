@@ -127,9 +127,10 @@ def child(mode, work):
                 os.kill(os.getpid(), signal.SIGTERM)
 
         p.Runner.emit = emit_with_signal
-    if mode == "signal_in_except":
-        # A SIGTERM right after the handlers are installed, and a second one
-        # on the first line of the handler for the first.
+    if mode in ("signal_in_except", "startup_then_except"):
+        # A SIGTERM right after the handlers are installed (or, for
+        # startup_then_except, one recorded while the module starts), and a
+        # second one on the first line of the handler for the first.
         import inspect
         src, first = inspect.getsourcelines(p.Runner.run)
         target_line = first + next(k for k, ln in enumerate(src) if "signum = exc.signum" in ln)
@@ -140,7 +141,12 @@ def child(mode, work):
             original_set(handler)
             if not fired["set"]:
                 fired["set"] = True
-                os.kill(os.getpid(), signal.SIGTERM)
+                if mode == "signal_in_except":
+                    os.kill(os.getpid(), signal.SIGTERM)
+
+        if mode == "startup_then_except":
+            p._catch_startup_signals()
+            os.kill(os.getpid(), signal.SIGTERM)
 
         def tracer(frame, event, arg):
             if frame.f_code is p.Runner.run.__code__:
@@ -806,7 +812,8 @@ def interruption_window_cases():
     while the interruption is handled, still gives one interrupted outcome."""
     for mode, label in (("signal_after_handlers", "right after the handlers are installed"),
                         ("signal_twice", "twice, the second before signals are deferred"),
-                        ("signal_in_except", "twice, the second in the handler of the first")):
+                        ("signal_in_except", "twice, the second in the handler of the first"),
+                        ("startup_then_except", "while Python starts, then again in the handler")):
         r = run_child(mode)
         lines = r["err"].splitlines()
         report("SIGTERM %s: one interrupted outcome, exit 143, no raw stderr" % label,

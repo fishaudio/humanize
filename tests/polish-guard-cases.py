@@ -1002,4 +1002,25 @@ for name, src, cand in [
          "> -\tParent item.\n> - Child.\n")]:
     accepts(name, src, cand)
 
+# Round 2 fifth re-review: relocated quote continuation lines, raw blocks
+# after a polish:on cut, and quotes a few columns past a list item.
+for name, src, cand, reason in [
+        ("an HTML attribute on a continuation line of a relocated quote changed",
+         '- Parent.\n  - Child.\n    > Read <a\n    > href="OLD">guide</a>.\n',
+         '- Parent.\n  - Child.\n    > Read <a\n    > href="NEW">guide</a>.\n', "inline_markup"),
+        ("pre content after a polish:on cut changed from a tab to spaces",
+         '<!-- polish:off -->\nKeep.\n<!-- polish:on --> <pre>\n\tOLD\n</pre>\n',
+         '<!-- polish:off -->\nKeep.\n<!-- polish:on --> <pre>\n    OLD\n</pre>\n', "region_changed"),
+        ("HTML in a quote two columns past a list item changed", '- Parent.\n    > <div>OLD</div>\n',
+         '- Parent.\n    > <div>NEW</div>\n', "region_changed"),
+        ("a quote two columns past a list item removed", '- Parent.\n    > Quoted words.\n',
+         '- Parent.\nQuoted words.\n', "structure")]:
+    rejects(name, src, cand, reason)
+for name, src, cand in [
+        ("emphasis rewrapped inside a relocated quote", '- Parent.\n  - Child.\n    >Read *the *"useful guide"* carefully*.\n',
+         '- Parent.\n  - Child.\n    >Read *the\n    >*"useful guide"* carefully*.\n'),
+        ("a quote two columns past a list item reworded", '- Parent.\n    > Quoted words.\n',
+         '- Parent.\n    > Clear words.\n')]:
+    accepts(name, src, cand)
+
 sys.exit(1 if FAILED else 0)
