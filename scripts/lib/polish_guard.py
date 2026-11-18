@@ -1089,17 +1089,23 @@ REFDEF_LABEL_RE = re.compile(r"[ ]{0,3}\[((?:\\[\s\S]|[^\[\]\\])+)\]:")
 # label after any quote or list markers.
 LOOSE_REFDEF_RE = re.compile(
     r"^[ \t>]*(?:(?:[-+*]|\d{1,9}[.)])[ \t]+)*\[(?!\^)((?:\\[\s\S]|[^\[\]\\])+)\]:", re.M)
+# HTML block start conditions 1 to 6 (CommonMark, with the type 6 tag
+# names cmark-gfm uses); these may interrupt a paragraph.
 HTML_BLOCK_TAGS = (
-    "address|article|aside|blockquote|body|caption|center|col|colgroup|dd|details|dialog|"
-    "dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|h[1-6]|head|"
-    "header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|optgroup|"
-    "option|p|param|search|section|summary|table|tbody|td|tfoot|th|thead|title|tr|track|"
-    "ul|pre|script|style|textarea|picture|video|audio|canvas|svg|img|source")
+    "address|article|aside|base|basefont|blockquote|body|caption|center|col|colgroup|dd|"
+    "details|dialog|dir|div|dl|dt|fieldset|figcaption|figure|footer|form|frame|frameset|"
+    "h[1-6]|head|header|hr|html|iframe|legend|li|link|main|menu|menuitem|nav|noframes|ol|"
+    "optgroup|option|p|param|section|source|summary|table|tbody|td|tfoot|th|thead|title|tr|"
+    "track|ul")
 HTML_BLOCK_RE = re.compile(
-    r"^[ ]{0,3}(?:<(?:!--|!\[CDATA\[|![A-Za-z]|\?)|</?(?:" + HTML_BLOCK_TAGS + r")(?:\s|/?>|$))",
+    r"^[ ]{0,3}(?:<(?:!--|!\[CDATA\[|![A-Za-z]|\?)|<(?:script|pre|style|textarea)(?:\s|>|$)"
+    r"|</?(?:" + HTML_BLOCK_TAGS + r")(?:\s|/?>|$))",
     re.I)
 HTML_TYPE1_RE = re.compile(r"<(?:script|pre|style|textarea)(?:\s|>|$)", re.I)
 HTML_TYPE1_END_RE = re.compile(r"</(?:script|pre|style|textarea)\s*>", re.I)
+# HTML block start condition 7: any other complete tag alone on its line
+# (cmark-gfm also counts a closing script, pre, style or textarea tag). It
+# cannot interrupt a paragraph.
 HTML_LINE_TAG_RE = re.compile(
     r"^[ ]{0,3}(?:" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
     + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>)[ \t]*$")
@@ -1213,10 +1219,14 @@ def _quote_prefix(line, depth):
     return line[:ends[-1]] if ends else ""
 
 
-def _is_html_start(body):
+def _is_html_start(body, interrupt=False):
+    """Whether ``body`` starts an HTML block; with ``interrupt``, whether it
+    can interrupt a paragraph (start conditions 1 to 6 only)."""
     if POLISH_OFF_LINE_RE.match(body) or POLISH_ON_LINE_RE.match(body):
         return False
-    return bool(HTML_BLOCK_RE.match(body) or HTML_LINE_TAG_RE.match(body))
+    if HTML_BLOCK_RE.match(body):
+        return True
+    return not interrupt and bool(HTML_LINE_TAG_RE.match(body))
 
 
 def _split_cells(row):
@@ -1248,23 +1258,31 @@ def _split_cells(row):
 
 
 def _is_table_sep(line):
-    return "|" in line and "-" in line and bool(TABLE_SEP_RE.match(line))
+    """A GFM delimiter row (``line`` past its containers): cells of dashes
+    with optional colons, separated by pipes. A lone run of dashes is a
+    setext underline (cmark-gfm reads that first) and a line that starts a
+    list item is one; ":---" and "---|" are delimiter rows."""
+    return ("-" in line and bool(TABLE_SEP_RE.match(line)) and not SETEXT_RE.match(line)
+            and not LIST_ITEM_RE.match(line))
 
 
 def _is_table_start(header, sep):
     """GFM: a table starts with a header row and a delimiter row that have
-    the same number of cells; otherwise neither line is part of a table."""
-    return ("|" in header and _is_table_sep(sep)
-            and len(_split_cells(header)) == len(_split_cells(sep)))
+    the same number of cells; otherwise neither line is part of a table.
+    The header row needs no pipe ("Name" above ":---" is a one-column
+    table)."""
+    return _is_table_sep(sep) and len(_split_cells(header)) == len(_split_cells(sep))
 
 
 def _starts_block(body, in_paragraph):
     """True when ``body`` would start a new block instead of continuing prose.
 
     ``in_paragraph``: the line reaches every container of the paragraph, so
-    the paragraph itself is what a new block would interrupt. A list item
-    then interrupts it only when it has content and, if ordered, starts at
-    1; otherwise the line continues the paragraph."""
+    the paragraph itself is what a new block would interrupt (cmark-gfm). A
+    list item then interrupts it only when it has content and, if ordered,
+    starts at 1, and an HTML block of start condition 7 cannot start;
+    otherwise the line continues the paragraph. A lazy line (fewer
+    containers) can start either."""
     if not body.strip():
         return True
     if POLISH_OFF_LINE_RE.match(body) or POLISH_ON_LINE_RE.match(body):
@@ -1275,7 +1293,7 @@ def _starts_block(body, in_paragraph):
         return False
     if FENCE_RE.match(body) or ATX_RE.match(body) or HR_RE.match(body):
         return True
-    if _is_html_start(body):
+    if _is_html_start(body, interrupt=in_paragraph):
         return True
     lm = LIST_ITEM_RE.match(body)
     if lm:
@@ -1285,7 +1303,10 @@ def _starts_block(body, in_paragraph):
         if not body[lm.end("marker"):].strip():
             return False
         return marker[-1] not in ".)" or int(marker[:-1]) == 1
-    if FOOTNOTE_DEF_RE.match(body) or REFDEF_RE.match(body):
+    # A reference definition starts only where a paragraph could start (it
+    # is read from the paragraph's first lines), and a table takes it as a
+    # row; a footnote definition interrupts a paragraph (cmark-gfm).
+    if FOOTNOTE_DEF_RE.match(body):
         return True
     # A "$$" line does not interrupt a paragraph: display math written inside
     # a paragraph ("Use $$\na + b\n$$ here.") stays one protected math token.
@@ -1304,35 +1325,58 @@ def _is_fence_open(text):
     return fm.group(2)
 
 
-def _html_block_end(lines, i, body):
-    """Return the index of the last line of the HTML block starting at ``i``.
-
-    Follows the CommonMark end conditions: raw-text elements, comments,
-    processing instructions, declarations and CDATA end at their closing
-    marker even across blank lines; other HTML blocks end at a blank line.
-    """
-    n = len(lines)
+def _html_end_marker(body):
+    """The end condition of the HTML block that ``body`` starts: a pattern
+    for raw-text elements, comments, processing instructions, declarations
+    and CDATA (CommonMark types 1 to 5), which end at their closing marker
+    even across blank lines, or None for types 6 and 7, which end before a
+    blank line."""
     stripped = body.lstrip(" ")
-    end_re = None
     if HTML_TYPE1_RE.match(stripped):
-        end_re = HTML_TYPE1_END_RE
-    elif stripped.startswith("<!--"):
-        end_re = re.compile(re.escape("-->"))
-    elif stripped.startswith("<?"):
-        end_re = re.compile(re.escape("?>"))
-    elif stripped.startswith("<![CDATA["):
-        end_re = re.compile(re.escape("]]>"))
-    elif re.match(r"<![A-Za-z]", stripped):
-        end_re = re.compile(">")
-    if end_re is None:
-        j = i
-        while j + 1 < n and lines[j + 1].strip():
-            j += 1
-        return j
-    j = i
-    while j < n and not end_re.search(lines[j]):
-        j += 1
-    return min(j, n - 1)
+        return HTML_TYPE1_END_RE
+    if stripped.startswith("<!--"):
+        return re.compile(re.escape("-->"))
+    if stripped.startswith("<?"):
+        return re.compile(re.escape("?>"))
+    if stripped.startswith("<![CDATA["):
+        return re.compile(re.escape("]]>"))
+    if re.match(r"<![A-Za-z]", stripped):
+        return re.compile(">")
+    return None
+
+
+def _read_definitions(content):
+    """Read the reference definitions at the start of a paragraph whose
+    lines are ``content`` (leading whitespace is ignored), as CommonMark
+    does when the paragraph closes. Return a list of (first, end, label,
+    parsed) entries in line indices, and the index of the first line after
+    them. A line that starts like a definition this parser cannot read is
+    kept with the lines up to the next one that starts a definition, as an
+    unparsed definition."""
+    parts = [line.lstrip(" \t") for line in content]
+    out = []
+    k = 0
+    while k < len(parts):
+        if FOOTNOTE_DEF_RE.match(parts[k]) or not REFDEF_START_RE.match(parts[k]):
+            break
+        joined = "\n".join(parts[k:])
+        dm = REFDEF_FULL_RE.match(joined)
+        lm = REFDEF_LABEL_RE.match(joined)
+        label = lm.group(1) if lm else None
+        if dm:
+            end = k + joined[:dm.end()].rstrip("\n").count("\n") + 1
+            out.append((k, end, label, True))
+            k = end
+            continue
+        if not REFDEF_RE.match(parts[k]):
+            break
+        end = k + 1
+        while (end < len(parts) and not REFDEF_RE.match(parts[end])
+               and not FOOTNOTE_DEF_RE.match(parts[end])):
+            end += 1
+        out.append((k, end, label, False))
+        k = end
+    return out, k
 
 
 def _expand_indent(text):
@@ -1406,8 +1450,15 @@ def _expand_structure(line):
     return "".join(out) + line[m.end():]
 
 
-def parse_blocks(text):
+def parse_blocks(text, spec_blank_items=False):
     """Split Markdown or plain text into an ordered list of blocks.
+
+    By default the parser follows cmark-gfm (GitHub). With
+    ``spec_blank_items`` it follows the CommonMark text where cmark-gfm
+    differs: a list item that starts empty and is followed by a line of
+    only whitespace ends there even when that whitespace reaches the item's
+    content column. ``check_document`` compares documents in that mode too
+    when the difference applies, so a change must be safe under both.
 
     List items are containers: a ``list_item`` block carries the marker, its
     nesting depth, and whether a blank line separates it from the previous
@@ -1591,6 +1642,47 @@ def parse_blocks(text):
             j += 1
         return last
 
+    def html_end(start, quote, depth, base, body):
+        """Index of the last line of the HTML block that starts on line
+        ``start`` with ``body``: the line with its end marker, the last line
+        before a blank line (types 6 and 7), or the last line before the
+        block's blockquote or list item ends. HTML blocks have no lazy
+        continuation lines, so a line that leaves those containers ends the
+        block however it ends otherwise."""
+        end_re = _html_end_marker(body)
+        if end_re is not None and end_re.search(body):
+            return start
+        last = start
+        j = start + 1
+        while j < n:
+            if not lines[j].strip():
+                # A blank line ends a blockquote and an HTML block of type 6
+                # or 7; the other types run on inside a list item.
+                if end_re is None or quote:
+                    break
+                last = j
+                j += 1
+                continue
+            if relocate_quotes(j, quote) < quote:
+                break
+            if quote and _leaves_list_item(qcols_of(j, quote), quote, level_stacks):
+                break
+            kb = _strip_quote(lines[j], quote)
+            if not kb.strip():
+                # Only quote markers: a blank line inside the quote.
+                if end_re is None:
+                    break
+                last = j
+                j += 1
+                continue
+            if depth > 0 and _indent_of(kb) < base:
+                break
+            last = j
+            if end_re is not None and end_re.search(kb):
+                return j
+            j += 1
+        return last
+
     def emit_table(i, quote, depth, base, attrs):
         """Emit the table whose header row is line ``i`` and whose delimiter
         row is the next line, and return the index after it. Body rows run
@@ -1609,6 +1701,11 @@ def parse_blocks(text):
             cells = _split_cells(row_body)
             if has_html:
                 blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
+            elif idx == 0:
+                # markdown-it needs a pipe in the header row; cmark-gfm does
+                # not ("Name" above ":---" is a table there only).
+                blocks.append(Block("table_row", attrs(cols=len(cells), piped="|" in row_body),
+                                    lines[r], cells, r + 1))
             else:
                 blocks.append(Block("table_row", attrs(cols=len(cells)), lines[r], cells, r + 1))
             if idx == 0:
@@ -1617,9 +1714,9 @@ def parse_blocks(text):
                 blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
         return j
 
-    # Lazy lines that head a table, by line index: the containers of the
-    # paragraph they followed (quote, depth, base, ancestry).
-    lazy_table_headers = {}
+    # Paragraph lines that head a table and are read with the paragraph's
+    # containers, by line index: (quote, depth, base, ancestry, lazy).
+    table_headers = {}
 
     while i < n:
         line = lines[i]
@@ -1648,15 +1745,17 @@ def parse_blocks(text):
             out.update(extra)
             return out
 
-        forced = lazy_table_headers.pop(i, None)
+        forced = table_headers.pop(i, None)
         if forced is not None:
             # GFM takes a table's header row from the paragraph above the
             # delimiter row, also when that line was a lazy continuation
-            # line: the table belongs to the paragraph's containers. Parsers
-            # differ here, so a header that becomes or stops being lazy is
-            # also a structure change.
-            quote, depth, base, ancestry = forced
-            i = emit_table(i, quote, depth, base, lambda **extra: attrs(lazy_header=True, **extra))
+            # line or indented four columns: the table belongs to the
+            # paragraph's containers. Other parsers (markdown-it) read
+            # neither as a header row, so a header that becomes or stops
+            # being lazy or indented is also a structure change.
+            quote, depth, base, ancestry, lazy = forced
+            marks = {"lazy_header": True} if lazy else {"indented_header": True}
+            i = emit_table(i, quote, depth, base, lambda **extra: attrs(**dict(marks, **extra)))
             continue
         ebody = _strip_quote(line, quote)
         indent = len(ebody) - len(ebody.lstrip(" "))
@@ -1677,19 +1776,19 @@ def parse_blocks(text):
             while j < n and not POLISH_ON_RE.search(lines[j]):
                 j += 1
             if j >= n:
-                blocks.append(Block("protected", attrs(), "\n".join(lines[i:]), [], start_line))
+                blocks.append(Block("protected", attrs(base=base), "\n".join(lines[i:]), [], start_line))
                 i = n
                 continue
             on = POLISH_ON_RE.search(lines[j])
             rest = lines[j][on.end():]
             if not rest.strip():
-                blocks.append(Block("protected", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
+                blocks.append(Block("protected", attrs(base=base), "\n".join(lines[i:j + 1]), [], start_line))
                 i = j + 1
                 continue
             # The region ends at the polish:on marker; the rest of that line is
             # read again as ordinary content, keeping its quote prefix and
             # indentation.
-            blocks.append(Block("protected", attrs(), "\n".join(lines[i:j] + [lines[j][:on.end()]]),
+            blocks.append(Block("protected", attrs(base=base), "\n".join(lines[i:j] + [lines[j][:on.end()]]),
                                 [], start_line))
             jq, after = _quote_depth(lines[j])
             prefix = lines[j][:len(lines[j]) - len(after)]
@@ -1722,7 +1821,7 @@ def parse_blocks(text):
                     k += 1
                     continue
                 break
-            blocks.append(Block("indented_code", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
+            blocks.append(Block("indented_code", attrs(base=base), "\n".join(lines[i:j + 1]), [], start_line))
             i = j + 1
             continue
 
@@ -1732,8 +1831,11 @@ def parse_blocks(text):
             # line). Move each marker line of the quote left, keep the
             # marker's true column for the container check, and read the
             # lines again, so the quote is parsed like any other and stays
-            # inside its list items. Lazy lines in between are left alone.
+            # inside its list items. Lazy lines in between are left alone; a
+            # line after a marker line with nothing after the marker is not
+            # lazy (no paragraph is open), so the quote ends there.
             k = i
+            text_open = False
             while k < n and lines[k].strip() and _quote_depth(lines[k])[0] == quote:
                 kb = _strip_quote(lines[k], quote)
                 kind = _indent_of(kb)
@@ -1744,7 +1846,8 @@ def parse_blocks(text):
                     marker_quote_col.setdefault(k, {})[quote] = kind
                     lines[k] = ((_quote_prefix(lines[k], quote) + " ") if quote else "") \
                         + " " * min(kind, 3) + kb.lstrip(" ")
-                elif rel.lstrip(" ").startswith(">") or _starts_block(rel, False):
+                    text_open = bool(rel.lstrip(" ")[1:].strip())
+                elif not text_open or rel.lstrip(" ").startswith(">") or _starts_block(rel, False):
                     break
                 k += 1
             continue
@@ -1769,16 +1872,23 @@ def parse_blocks(text):
             continue
 
         if _is_html_start(cbody):
-            end = _html_block_end(lines, i, cbody)
-            blocks.append(Block("html", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
+            end = html_end(i, quote, depth, base, cbody)
+            blocks.append(Block("html", attrs(base=base), "\n".join(lines[i:end + 1]), [], start_line))
             i = end + 1
             continue
 
         if FOOTNOTE_DEF_RE.match(cbody):
-            # Continuation: indented lines right after the definition, and
-            # lines indented four columns after blank lines.
+            # cmark-gfm reads a footnote definition as a container whose
+            # lines are indented four columns past its own container (blank
+            # lines in between too). A less indented line right after one
+            # of its lines continues its paragraph lazily, unless it starts a
+            # block of its own (a fence, HTML, a list item, a heading and so
+            # on): that block ends the definition. A fence inside it has no
+            # lazy lines, and when the definition ends inside a fence, the
+            # blank lines before its end are code too.
             j = i
             k = i + 1
+            open_fence = None
             while k < n:
                 kq, _ = _quote_depth(lines[k])
                 if kq != quote:
@@ -1787,62 +1897,30 @@ def parse_blocks(text):
                 if not kb.strip():
                     k += 1
                     continue
-                if k == j + 1 and kb[:1] in (" ", "\t"):
-                    j = k
-                    k += 1
-                    continue
                 if _indent_of(kb) - base >= 4:
+                    rel = _past_container(kb, base + 4)
+                    if open_fence:
+                        cm = FENCE_CLOSE_RE.match(rel.lstrip(" "))
+                        if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == open_fence[0]
+                                and len(cm.group(1)) >= len(open_fence)):
+                            open_fence = None
+                    elif _indent_of(rel) < 4:
+                        open_fence = _is_fence_open(rel)
                     j = k
                     k += 1
                     continue
+                if k == j + 1 and not open_fence:
+                    # (A lazy line keeps the definition open: a line
+                    # indented four columns after it is inside again.)
+                    lazy = past_matched(kb, quote)
+                    if not (_starts_quote(lazy) or _starts_block(lazy, False)):
+                        j = k
+                        k += 1
+                        continue
                 break
-            blocks.append(Block("footnote_def", attrs(), "\n".join(lines[i:j + 1]), [], start_line))
-            i = j + 1
-            continue
-
-        parts = None
-        if REFDEF_START_RE.match(cbody):
-            # The lines up to the next blank line, with quote and container
-            # prefixes removed: a definition's label, destination and title
-            # may each continue on the next line.
-            parts = [cbody]
-            k = i + 1
-            while k < n:
-                kq, _ = _quote_depth(lines[k])
-                kb = _strip_quote(lines[k], quote)
-                if not kb.strip() or kq > quote:
-                    break
-                if kq > 0 and _leaves_list_item(qcols_of(k, kq), kq, level_stacks):
-                    break
-                if kq != quote:
-                    # A lazy continuation line: it continues the definition
-                    # unless it starts a block of its own.
-                    if _starts_block(kb.lstrip(" "), False):
-                        break
-                    parts.append(kb.lstrip(" "))
-                else:
-                    part = _past_container(kb, base)
-                    if _starts_quote(part):
-                        break
-                    parts.append(part)
-                k += 1
-            joined = "\n".join(parts)
-            dm = REFDEF_FULL_RE.match(joined)
-            if not dm and not REFDEF_RE.match(cbody):
-                parts = None
-        if parts is not None:
-            if dm:
-                j = i + joined[:dm.end()].rstrip("\n").count("\n")
-            else:
-                # Not a definition this parser can model: keep its lines byte
-                # for byte up to the next blank line or the next definition.
-                j = i
-                while (j + 1 < k and not REFDEF_RE.match(parts[j + 1 - i])
-                       and not FOOTNOTE_DEF_RE.match(parts[j + 1 - i])):
-                    j += 1
-            label = REFDEF_LABEL_RE.match(joined)
-            ref = (normalize_label(label.group(1)), bool(dm)) if label else None
-            blocks.append(Block("refdef", attrs(), "\n".join(lines[i:j + 1]), [], start_line, ref))
+            if open_fence:
+                j = k - 1
+            blocks.append(Block("footnote_def", attrs(base=base), "\n".join(lines[i:j + 1]), [], start_line))
             i = j + 1
             continue
 
@@ -1877,8 +1955,17 @@ def parse_blocks(text):
             seen_content = any(b.kind != "quote" for b in blocks)
             blank_before = bool(seen_content and i > 0 and not _strip_quote(lines[i - 1], quote).strip())
             level_stacks[quote].append((indent, content_col))
-            empty_item = (not task and not rest_raw.strip()
-                          and (i + 1 >= n or not _strip_quote(lines[i + 1], quote).strip()))
+            empty_item = False
+            ws_open = False
+            if not task and not rest_raw.strip():
+                if i + 1 >= n:
+                    empty_item = True
+                else:
+                    next_body = _strip_quote(lines[i + 1], quote)
+                    if not next_body.strip():
+                        ws_open = (_quote_depth(lines[i + 1])[0] == quote
+                                   and _indent_of(next_body) >= content_col)
+                        empty_item = spec_blank_items or not ws_open
             blocks.append(Block("list_item", {
                 "quote": quote,
                 "depth": depth,
@@ -1887,11 +1974,14 @@ def parse_blocks(text):
                 "marker": marker,
                 "task": task.strip().lower() if task else "",
                 "blank_before": blank_before,
+                "ws_open": ws_open,
             }, line, [], start_line))
             if empty_item:
                 # An item may start with at most one blank line: one that
                 # starts empty and is followed by a blank line is empty, and
-                # what follows is outside it.
+                # what follows is outside it. cmark-gfm keeps the item open
+                # when that line holds whitespace up to the item's content
+                # column.
                 level_stacks[quote].pop()
             # Read the rest of the marker line again as the item's first
             # content line, at the item's content column.
@@ -1909,7 +1999,7 @@ def parse_blocks(text):
             continue
 
         if (i + 1 < n and in_container(i + 1, quote, depth, base)
-                and _is_table_start(cbody, _strip_quote(lines[i + 1], quote))):
+                and _is_table_start(cbody, _past_container(_strip_quote(lines[i + 1], quote), base))):
             i = emit_table(i, quote, depth, base, attrs)
             continue
 
@@ -1919,9 +2009,25 @@ def parse_blocks(text):
         # Unit lines keep their bytes after the leading indentation of the
         # first line, so whitespace inside a code span or math that spans
         # lines is compared exactly. Whitespace outside tokens is not compared.
+        # Reference definitions are read from the start of the paragraph
+        # once its lines are known, as CommonMark does: a line after a
+        # definition continues the same paragraph (an indented line is text,
+        # not code), and an underline below nothing but definitions is text.
         content = [cbody.lstrip(" \t")]
         j = i + 1
         setext_level = 0
+
+        def sep_after(k):
+            """Whether line ``k + 1`` is a delimiter row inside the
+            paragraph's containers."""
+            return (k + 1 < n and in_container(k + 1, quote, depth, base)
+                    and _is_table_sep(_past_container(_strip_quote(lines[k + 1], quote), base)))
+
+        # cmark-gfm tries a table once per delimiter row inside a
+        # paragraph; after one whose header row does not match, no later
+        # line of the paragraph starts a table.
+        tables_off = sep_after(i)
+        table_elsewhere = False
         while j < n:
             nxt = lines[j]
             if not nxt.strip():
@@ -1948,30 +2054,53 @@ def parse_blocks(text):
                 break
             sm = SETEXT_RE.match(nbc)
             if sm and same_container:
-                setext_level = 1 if sm.group(1)[0] == "=" else 2
-                j += 1
+                if _read_definitions(content)[1] < len(content):
+                    setext_level = 1 if sm.group(1)[0] == "=" else 2
+                    j += 1
+                    break
+            elif _starts_block(nbc, same_container):
                 break
-            if _starts_block(nbc, same_container):
-                break
-            if (j + 1 < n and _is_table_start(nbc, _strip_quote(lines[j + 1], quote))
-                    and in_container(j + 1, quote, depth, base)):
+            if (sep_after(j)
+                    and _is_table_start(nbc, _past_container(_strip_quote(lines[j + 1], quote), base))):
+                if tables_off:
+                    # Other parsers (markdown-it) start a table here; the
+                    # paragraph is kept byte for byte below.
+                    table_elsewhere = True
+                    content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
+                    j += 1
+                    continue
                 # A delimiter row that matches the paragraph's containers
                 # turns this line into a table's header row. One that does
-                # not is lazy paragraph text, and so is this line.
-                if not same_container:
-                    lazy_table_headers[j] = (quote, depth, base, ancestry)
+                # not is lazy paragraph text, and so is this line. A header
+                # row that is a lazy line, or that is indented four columns
+                # (no code block can start inside a paragraph), is read as
+                # one with the paragraph's containers.
+                if not same_container or _indent_of(nbc) >= 4:
+                    table_headers[j] = (quote, depth, base, ancestry, not same_container)
                 break
             # The original bytes after the line's quote markers, also when a
             # marker was moved for parsing: a tab inside a code span or math
             # that spans lines is compared as written.
             content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
+            if sep_after(j):
+                tables_off = True
             j += 1
-        if setext_level:
-            blocks.append(Block("heading", attrs(level=setext_level),
-                                "\n".join(lines[i:j]), ["\n".join(content)], start_line))
-        else:
-            blocks.append(Block("paragraph", attrs(), "\n".join(lines[i:j]), ["\n".join(content)],
-                                start_line))
+        defs, rest = _read_definitions(content)
+        for first, last, label, parsed in defs:
+            ref = (normalize_label(label), parsed) if label is not None else None
+            blocks.append(Block("refdef", attrs(), "\n".join(lines[i + first:i + last]), [],
+                                i + first + 1, ref))
+        if rest < len(content) and table_elsewhere:
+            blocks.append(Block("table_raw", attrs(table_elsewhere=True), "\n".join(lines[i + rest:j]),
+                                [], i + rest + 1))
+        elif rest < len(content):
+            units = ["\n".join([content[rest].lstrip(" \t")] + content[rest + 1:])]
+            if setext_level:
+                blocks.append(Block("heading", attrs(level=setext_level),
+                                    "\n".join(lines[i + rest:j]), units, i + rest + 1))
+            else:
+                blocks.append(Block("paragraph", attrs(), "\n".join(lines[i + rest:j]), units,
+                                    i + rest + 1))
         i = j
 
     # Raw blocks are compared byte for byte against the original lines; a
@@ -2084,6 +2213,18 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
     check_regions(source, candidate)
     src_blocks = parse_blocks(source)
     cand_blocks = parse_blocks(candidate)
+    total_src, total_cand = _compare_blocks(src_blocks, cand_blocks, block_ratio)
+    if any(b.kind == "list_item" and b.attrs.get("ws_open") for b in src_blocks + cand_blocks):
+        # cmark-gfm and the CommonMark text read the lines after such an
+        # item differently: the candidate must be safe under both.
+        _compare_blocks(parse_blocks(source, spec_blank_items=True),
+                        parse_blocks(candidate, spec_blank_items=True), block_ratio)
+    check_ratio(total_src, total_cand, doc_ratio, "document")
+
+
+def _compare_blocks(src_blocks, cand_blocks, block_ratio):
+    """Compare two block lists; return the prose lengths (source, candidate).
+    Raises GuardReject."""
     if len(src_blocks) != len(cand_blocks):
         detail = "source has %d blocks, candidate has %d" % (len(src_blocks), len(cand_blocks))
         for a, b in zip(src_blocks, cand_blocks):
@@ -2113,7 +2254,7 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
             s_len, c_len = compare_prose(su, cu, unit_where, block_ratio, refs=refs)
             total_src += s_len
             total_cand += c_len
-    check_ratio(total_src, total_cand, doc_ratio, "document")
+    return total_src, total_cand
 
 
 # ----------------------------------------------------------------------------
