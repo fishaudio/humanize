@@ -3411,4 +3411,53 @@ for name, src, cand in [
          '- [docs]: /guide\n  2. Read *the guide*.\n3. Read *the guide\n 4. Read *the guide\n  ---\n')]:
     accepts("R3 " + name, src, cand)
 
+# (Re-review of dd172ae: a line without quote markers after a quoted
+# definition in a list item only markdown-it opens is read in the quote
+# while the definition's reading takes it (a title), and ends the quote
+# otherwise; a deeper quote marker there opens a quote of its own; the label
+# after a shortcut reference counts only where a renderer reads those
+# brackets as a label; where such an item ends is recorded among cmark-gfm's
+# blocks; and a paragraph markdown-it reads before a range it may read in
+# another way is also compared together with that range.)
+for name, src, cand in [
+        ('a paragraph after a quoted definition with its title on the next lazy line moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide title"\n   Continue with care.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide title"\n  Continue with care.\n'),
+        ('a paragraph after a quoted definition with a title over two lazy lines moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide\n   title"\n   Continue with care.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide\n   title"\n  Continue with care.\n'),
+        ('a space added between a label defined in both renderers and an inline link with nested brackets',
+         'See [docs][manual [PDF]](/manual.pdf) for details.\n\n[docs]: /guide\n',
+         'See [docs] [manual [PDF]](/manual.pdf) for details.\n\n[docs]: /guide\n'),
+        ('a space added between a label only cmark-gfm defines and an inline link',
+         'See [docs][reference](/reference) for details.\n\n[docs]: file:///guide.md\n',
+         'See [docs] [reference](/reference) for details.\n\n[docs]: file:///guide.md\n'),
+        ('a list item marker moved into the paragraph after an underline in a list item only markdown-it opens',
+         '[docs]: /guide\n2. Run the steps.\n3. # Guide\n   ===\n4. # Notes\n5. Read *the guide*.\n',
+         '[docs]: /guide\n2. Run the steps.\n3. # Guide\n   ===\n   4. # Notes\n5. Read *the guide*.\n'),
+        ('a word changed inside an HTML comment markdown-it reads across a range it may read in another way',
+         '>   1. Read the guide\n      <!-- note\n>     - Install the tool first\n<img src="x">\n  -->\n',
+         '>   1. Read the guide\n      <!-- notes\n>     - Install the tool first\n<img src="x">\n  -->\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose reworded after a quoted definition with its title on the next lazy line',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide title"\n   Continue with care.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide title"\n   Go on with care.\n'),
+        ('prose rewrapped after a quoted definition with a title over two lazy lines',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide\n   title"\n   Continue with care.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   "Guide\n   title"\n   Continue with\n   care.\n'),
+        ('prose rewrapped after a title-like paragraph in a deeper quote',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   > > "Guide title"\n   Read these notes carefully.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   > > "Guide title"\n  Read these notes\n  carefully.\n'),
+        ('a space added between a label only cmark-gfm defines and an inline link with nested brackets',
+         'See [docs][manual [PDF]](/manual.pdf) for details.\n\n[docs]: file:///guide.md\n',
+         'See [docs] [manual [PDF]](/manual.pdf) for details.\n\n[docs]: file:///guide.md\n'),
+        ('prose reworded in a list item only markdown-it opens before an underline',
+         '[docs]: /guide\n2. Run the steps.\n3. # Guide\n   ===\n4. # Notes\n5. Read *the guide*.\n',
+         '[docs]: /guide\n2. Run all the steps.\n3. # Guide\n   ===\n4. # Notes\n5. Read *the guide*.\n'),
+        ('prose reworded before an HTML comment markdown-it reads across a range it may read in another way',
+         '>   1. Read the guide\n      <!-- note\n>     - Install the tool first\n<img src="x">\n  -->\n',
+         '>   1. Read this guide\n      <!-- note\n>     - Install the tool first\n<img src="x">\n  -->\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
