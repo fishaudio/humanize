@@ -508,27 +508,6 @@ def _ref_label_close(text, open_bracket):
     return None
 
 
-def _mdit_label_close(text, open_bracket):
-    """Index of the "]" ending the link label markdown-it reads from
-    ``open_bracket`` (nested brackets balance, a backslash escapes), or
-    None."""
-    level = 1
-    i = open_bracket + 1
-    while i < len(text):
-        ch = text[i]
-        if ch == "\\" and i + 1 < len(text):
-            i += 2
-            continue
-        if ch == "[":
-            level += 1
-        elif ch == "]":
-            level -= 1
-            if level == 0:
-                return i
-        i += 1
-    return None
-
-
 def _scan_refs(masked, original, resolve, offset=0):
     """Reference links and images in ``masked`` (a prose unit whose code,
     autolinks and inline link syntax are already masked; ``original`` has the
@@ -1029,9 +1008,11 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         if m.end() < len(text) and text[m.end()] == "[" and snapshot[m.end()] != "[":
             status = resolve(text[m.start() + (2 if m.group(0).startswith("!") else 1):m.end() - 1])
             close = _ref_label_close(text, m.end())
+            # (markdown-it finds the end of that link's text, so it reads
+            # those brackets as a label whatever they hold.)
             label_after = (status in ("yes", "maybe", "cm") and close is not None
                            and (close == m.end() + 1 or _label_ok(text[m.end() + 1:close]))) or (
-                status in ("yes", "maybe", "md") and _mdit_label_close(text, m.end()) is not None)
+                status in ("yes", "maybe", "md"))
         found.append((m.start(), "reflink", m.group(0) + ("[" if label_after else "")))
         if (m.group(0).startswith("!") and snapshot.startswith("(", m.end())
                 and not any(a <= m.start() < b for a, b in html_spans)):
@@ -1752,7 +1733,8 @@ def _mdit_interrupts(line, level):
     depth ``level`` (else it continues it lazily): a quote marker that opens
     a quote, or (indented less than four columns) a heading, a fence, a
     thematic break, a list item with text that is a bullet or numbered 1,
-    or an HTML block that may interrupt a paragraph."""
+    or an HTML block that may interrupt a paragraph; on a line with fewer
+    quote markers, any list marker (markdown-it ends the quote there)."""
     depth, body = _quote_depth(line)
     if depth > level:
         return True
@@ -1760,6 +1742,8 @@ def _mdit_interrupts(line, level):
     rest = expanded.lstrip(" ")
     if len(expanded) - len(rest) >= 4 or not rest:
         return False
+    if depth < level and re.match(r"(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)", rest):
+        return True
     return bool(ATX_RE.match(rest) or FENCE_RE.match(rest) or HR_RE.match(rest)
                 or re.match(r"(?:[-+*]|1[.)])[ \t]+\S", rest)
                 or _is_html_start(rest, interrupt=True))
@@ -3739,8 +3723,12 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # (Also an empty list item right after a definition, where the
             # walk reads no further: markdown-it starts a block there.)
             if r[0] in ("listitem", "item") or (
-                    r[0] == "unknown" and x and md_read[x - 1][0] == "definition"
-                    and md_read[x - 1][2] == r[1]
+                    r[0] == "unknown" and x and md_read[x - 1][2] == r[1]
+                    and (md_read[x - 1][0] == "definition" or (
+                        # (After a list item, one beside it or outside it:
+                        # the walk of that item reads one nested in it.)
+                        md_read[x - 1][0] in ("listitem", "item") and md_item_col is not None
+                        and _indent_of(_expand_indent(col_lines[r[1]])) < md_item_col))
                     and _MDIT_LIST_START_RE.match(_expand_indent(col_lines[r[1]]).lstrip(" "))):
                 md_item_line = i + r[1]
                 body = _expand_indent(col_lines[r[1]])
@@ -4382,6 +4370,20 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         k = item_line
         while k < stop:
             record = k >= start
+            if plines is not None and len(plines) >= 64:
+                # (A paragraph that starts like a definition and runs past
+                # what the markdown-it walk reads: the lines after it, up to
+                # a blank line, are kept byte for byte, wherever markdown-it
+                # reads them.)
+                if record:
+                    runs.append("long")
+                while k < stop and _strip_quote(view[k], min(level, _quote_depth(view[k])[0])).strip():
+                    if k >= start:
+                        md_kept[k] = level
+                    k += 1
+                para = quoted = False
+                qblock = plines = None
+                continue
             # (Read with the markers of the item's quotes where the parse
             # moved them into list items, and the rest at its columns.)
             text = relocated(k, level) if k in marker_quote_col else written[k]
@@ -4455,7 +4457,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 stripped = inner.lstrip(" ")
                 quote_line = rind < 4 and stripped.startswith(">")
                 if (plines is not None and quoted and not para and not quote_line and len(plines) < 64
-                        and not _mdit_interrupts(inner, 0)):
+                        and not _mdit_interrupts(inner, 1)):
                     if taken(k):
                         # (A line without quote markers that the reading of
                         # the quote's paragraph takes, such as a definition's
@@ -4502,7 +4504,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                     if record:
                         runs.append("underline")
                     para = False
-                elif (para or (plines is not None and not quoted)) and not quote_line and not _mdit_interrupts(inner, 0):
+                elif ((para or (plines is not None and not quoted)) and not quote_line
+                      and not _mdit_interrupts(inner, 1 if quoted else 0)):
                     para = go_on(inner, lazy=quoted)
                 else:
                     if record:

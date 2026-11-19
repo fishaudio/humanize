@@ -3460,4 +3460,37 @@ for name, src, cand in [
          '>   1. Read this guide\n      <!-- note\n>     - Install the tool first\n<img src="x">\n  -->\n')]:
     accepts("R3 " + name, src, cand)
 
+# (Re-review of c7ab94a: markdown-it reads the brackets of an inline link
+# right after a shortcut reference as a label whatever they hold; a list
+# item that starts with a block the walk reads no further is walked after a
+# list item too; markdown-it ends a quote at any list marker on a lazy line;
+# and the lines after a definition-like paragraph too long for the
+# markdown-it walk are kept byte for byte up to a blank line.)
+LONG_DEFS = ("[docs]: /guide\n2.\n" + "".join("   > [manual%d]: /guide/%d\n" % (i, i) for i in range(64))
+             + '   "Guide title"\n' + "   Continue with care.\n")
+for name, src, cand in [
+        ('a space removed between a defined shortcut reference and an inline link whose text holds a bracket in code',
+         'See [docs] [the `[` operator](/operators) for details.\n\n[docs]: /guide\n',
+         'See [docs][the `[` operator](/operators) for details.\n\n[docs]: /guide\n'),
+        ('a space removed between a defined shortcut reference and an inline link whose text holds a bracket in raw HTML',
+         'See [docs] [the <b title="[">op</b>](/o) now.\n\n[docs]: /guide\n',
+         'See [docs][the <b title="[">op</b>](/o) now.\n\n[docs]: /guide\n'),
+        ('a list item indented into the item before it that starts with a quote, in a list only markdown-it opens',
+         '[docs]: /guide\n2. Run the steps.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
+         '[docs]: /guide\n2. Run the steps.\n3. > Read the quoted notes.\n   > Continue with care.\n   4. More notes.\n')]:
+    rejects("R3 " + name, src, cand)
+rejects("R3 a paragraph after 64 quoted definitions and a lazy title moved out of a list item only markdown-it opens",
+        LONG_DEFS, LONG_DEFS.replace("\n   Continue", "\n  Continue"))
+rejects("R3 a list item moved out of the item it is nested in, after a list item only markdown-it opens",
+        "- [docs]: /guide\n  3. # Notes\n       - item one\n     - item two\n   - item three\n",
+        "- [docs]: /guide\n  3. # Notes\n       - item one\n    - item two\n   - item three\n")
+for name, src, cand in [
+        ('prose reworded in a list item after an item that starts with a quote, in a list only markdown-it opens',
+         '[docs]: /guide\n2. Run the steps.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
+         '[docs]: /guide\n2. Run the steps.\n3. > Read the quoted notes.\n   > Continue with care.\n4. Further notes.\n'),
+        ('prose reworded where a quote and a list item each hold a lone backtick',
+         '>   1. Read the guide\n>      A lone ` opens an inline code span.\n>     - Install the tool first\n2. More notes.\nUse another ` to close it.\n',
+         '>   1. Read the guide\n>      A lone ` starts an inline code span.\n>     - Install the tool first\n2. More notes.\nUse another ` to close it.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
