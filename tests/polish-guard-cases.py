@@ -3372,4 +3372,43 @@ for name, src, cand in [
          '1. [docs]: /guide\n   2. b">x</span>\n3. b">x</span>\n    ---\n')]:
     accepts("R3 " + name, src, cand)
 
+# (Re-review of 1866a46: a paragraph in a quote that starts like a
+# definition is read with the markdown-it walk also after the definition
+# (its title may follow); a quoted fence or HTML block ends with its quote;
+# the line after a lazy underline records which of the columns of the list
+# items around it it reaches; and an inline link right after a label that
+# may be defined is a label after it, so a shortcut reference cannot be
+# made by adding a space.)
+for name, src, cand in [
+        ('a paragraph after a quoted definition with its title on the next line moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   > "Guide title"\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   > "Guide title"\n  Read these notes.\n'),
+        ('a paragraph after a quoted definition with a title over two lines moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   > "Guide\n   > title"\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > [a]: /url\n   > "Guide\n   > title"\n  Read these notes.\n'),
+        ('a paragraph after a lazy underline moved out of the surviving outer list item',
+         '- Outer item.\n  - Procedure.\n    1. [docs]: /guide\n     Read the guide.\n    2. The notes explain everything.\n     ===\n  Continue with care.\n',
+         '- Outer item.\n  - Procedure.\n    1. [docs]: /guide\n     Read the guide.\n    2. The notes explain everything.\n     ===\n Continue with care.\n'),
+        ('a space added between a defined label and an inline link, which makes the label a shortcut reference',
+         'See [docs][reference](/reference) for details.\n\n[docs]: /guide\n',
+         'See [docs] [reference](/reference) for details.\n\n[docs]: /guide\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a lazy underline reworded in the surviving outer list item',
+         '- Outer item.\n  - Procedure.\n    1. [docs]: /guide\n     Read the guide.\n    2. The notes explain everything.\n     ===\n  Continue with care.\n',
+         '- Outer item.\n  - Procedure.\n    1. [docs]: /guide\n     Read the guide.\n    2. The notes explain everything.\n     ===\n  Go on with care.\n'),
+        ('prose reworded around a defined label before an inline link',
+         'See [docs][reference](/reference) for details.\n\n[docs]: /guide\n',
+         'See [docs][reference](/reference) for more.\n\n[docs]: /guide\n'),
+        ('a space added between an undefined label and an inline link',
+         'See [x][Docs](`a` b) for details.\n\n[other]: /guide\n',
+         'See [x] [Docs](`a` b) for details.\n\n[other]: /guide\n'),
+        ('prose rewrapped after a nested quote ends a fence in a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > > ~~~text\n   > > echo old\n   > Read these notes carefully.\n',
+         '[docs]: /guide\n2.\n   > > ~~~text\n   > > echo old\n   > Read these notes\n   carefully.\n'),
+        ('a list marker indented one column less after a lazy run in an outer list',
+         '- [docs]: /guide\n  2. Read *the guide*.\n3. Read *the guide\n  4. Read *the guide\n  ---\n',
+         '- [docs]: /guide\n  2. Read *the guide*.\n3. Read *the guide\n 4. Read *the guide\n  ---\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
