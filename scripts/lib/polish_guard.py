@@ -204,14 +204,14 @@ WORD_TOKEN_RE = re.compile(
       (?P<path>(?<![\w./~-])(?:(?:~[\w.-]*|\.{1,2})?/[\w@+.-]+(?:/[\w@+.-]*)*
                                 |[\w@+.-]+(?:/[\w@+.-]*)+))
     | (?P<call>[A-Za-z_][\w.]*\(\))
-    | (?P<scope>[A-Za-z_]\w*(?:::\w+)+)
+    | (?P<scope>[A-Za-z_]\w*(?:::\w+)+(?:\(\))?)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
     | (?P<qty>(?<![\w.])\d+(?:\.\d+)?
-        (?:[ ]?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
-                 |months?|years?|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz)
-          |(?:s|h|d|B|k|K|M|G|x|%))
+        [ ]?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
+               |months?|years?|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz
+               |s|h|d|B|k|K|M|G|x|%)
         (?![\w%]))
     | (?P<dotted>[\w-]+(?:\.[\w-]+)+)
     | (?P<camel>(?![A-Z]+s\b)[A-Za-z0-9]*(?:[a-z][A-Z]|[A-Z]{2}[a-z])[A-Za-z0-9]*)
@@ -241,7 +241,9 @@ PROSE_SLASH_PAIRS = frozenset([
 # Dotted abbreviations made of one-letter segments that are ordinary prose.
 PROSE_ABBREVIATIONS = frozenset(["e.g", "i.e", "a.k.a", "n.b", "p.s", "a.m", "p.m", "u.s", "u.k"])
 # Emphasis delimited by underscores, such as "_word_" or "__two words__".
-UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_])(?:(?!\1).)+?(?<=[^\s_])\1(?!\w)")
+# Underscores between letters inside it cannot close it (CommonMark), so
+# the text may hold them: "_a snake_case name_" is emphasis.
+UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_]).+?(?<=[^\s_])\1(?!\w)")
 MARKUP_TOKEN_KINDS = ("tag", "rawtag", "link", "image", "reflink", "autolink", "footnote", "escape")
 
 
@@ -729,11 +731,6 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         found.append((m.start(), "url", url))
         _mask(chars, m.start(), m.start() + len(url))
 
-    for m in LONG_RUN_RE.finditer(current()):
-        value = m.group(0).rstrip(".:,;")
-        found.append((m.start(), "word", value))
-        _mask(chars, m.start(), m.start() + len(value))
-
     # Hide underscore emphasis delimiters from the identifier patterns so
     # "_some text_" stays prose, then restore them for the emphasis count.
     # Dunder names such as "__init__" stay identifiers.
@@ -746,6 +743,12 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         for k in list(range(m.start(), m.start() + width)) + list(range(m.end() - width, m.end())):
             hidden.append((k, chars[k]))
             chars[k] = "\x01"
+
+    # After the emphasis underscores are hidden, so they stay delimiters.
+    for m in LONG_RUN_RE.finditer(current()):
+        value = m.group(0).rstrip(".:,;")
+        found.append((m.start(), "word", value))
+        _mask(chars, m.start(), m.start() + len(value))
 
     for m in WORD_TOKEN_RE.finditer(current()):
         kind = m.lastgroup
@@ -1095,8 +1098,10 @@ REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line. ``_match_definition``
 # reads it as cmark-gfm does; the destination needs a scanner of its own.
-# The label holds at most 999 characters, not all of them whitespace.
-_REFDEF_HEAD_RE = re.compile(r"[ ]{0,3}\[(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}\]:[ \t]*\n?[ \t]*")
+# The label (at most 1000 UTF-8 bytes, see ``_label_ok``) is not only ASCII
+# whitespace; other whitespace counts as text in cmark-gfm.
+_REFDEF_HEAD_RE = re.compile(
+    r"[ ]{0,3}\[(?![ \t\n\x0b\x0c\r]*\])((?:\\[\s\S]|[^\[\]\\])+)\]:[ \t]*\n?[ \t]*")
 _POINTY_DEST_RE = re.compile(r"<(?:\\.|[^<>\n\\])*>")
 # A title: a backslash escapes the next character, and one more backslash
 # may come right before the closing delimiter (a backslash, as in
@@ -1113,6 +1118,12 @@ _LINE_TITLE_RE = re.compile(_TITLE.replace(r"\s\S", r"^\n").replace(r"[^\"\\]", 
                             .replace(r"[^'\\]", r"[^'\\\n]").replace(r"[^()\\]", r"[^()\\\n]"))
 _ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 _ASCII_SPACE = frozenset(" \t\n\x0b\x0c\r")
+
+
+def _label_ok(label):
+    """Whether cmark-gfm takes ``label`` (between the brackets) as a link
+    label: at most 1000 bytes of UTF-8, not only ASCII whitespace."""
+    return bool(label.strip(" \t\n\x0b\x0c\r")) and len(label.encode("utf-8", "surrogatepass")) <= 1000
 
 
 def _scan_destination(text, pos):
@@ -1148,7 +1159,7 @@ def _match_definition(text):
     """End of the definition at the start of ``text`` (after the newline
     that ends it), or None when it is not one."""
     m = _REFDEF_HEAD_RE.match(text)
-    if not m:
+    if not m or not _label_ok(m.group(1)):
         return None
     end = _scan_destination(text, m.end())
     if end is None:
@@ -1492,7 +1503,7 @@ def _not_a_definition(line):
     m = REFDEF_LABEL_RE.match(line)
     if not m:
         return False
-    if not m.group(1).strip() or len(m.group(1)) > 999:
+    if not _label_ok(m.group(1)):
         return True
     pos = m.end()
     while pos < len(line) and line[pos] in " \t":
@@ -2429,9 +2440,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
 
 
 def normalize_label(label):
-    """A link label as CommonMark matches it: case-folded, with runs of
-    whitespace collapsed and the ends trimmed."""
-    return " ".join(label.split()).casefold()
+    """A link label as cmark-gfm matches it: case-folded, with runs of ASCII
+    whitespace collapsed and the ends trimmed (other whitespace is text)."""
+    return " ".join(re.split(r"[ \t\n\x0b\x0c\r]+", label.strip(" \t\n\x0b\x0c\r"))).casefold()
 
 
 def reference_labels(blocks):
