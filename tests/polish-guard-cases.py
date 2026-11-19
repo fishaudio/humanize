@@ -2184,4 +2184,58 @@ for name, src, cand in [
          'First set $HOME. Then run $build() today.\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of 425fbc4: cmark-gfm keeps a title it rolled back from the
+# paragraph text, markdown-it reads a lazy line after a definition outside
+# its quote or list item (a quote marker reopens a quote; a list item that
+# cannot interrupt a paragraph continues it), tab columns after quote
+# markers, labels behind list and quote markers in any order, "$" scoped
+# calls and long braced variables with calls; a list item with text after a
+# definition keeps its text editable, and an HTML block in a quote ends with
+# the quote.
+LONGVAR = '${' + 'createCachedAuthenticatedDatabaseConnectionForTenantWithFallbackAndAutomaticRetry' + '}'
+for name, src, cand in [
+        ('a title cmark-gfm keeps from the text after a definition changed',
+         'Read [r].\n\n[r]: /guide\n"Read the guide" extra.\n',
+         'Read [r].\n\n[r]: /guide\n"See the guide" extra.\n'),
+        ('a title cmark-gfm keeps over two lines changed',
+         'Read [r].\n\n[r]: /guide\n"multi\nline" extra\n',
+         'Read [r].\n\n[r]: /guide\n"multi\nrow" extra\n'),
+        ('code in a quote reopened after a lazy line edited',
+         '> [a]: /guide\nRead the guide.\n>     echo hello\n',
+         '> [a]: /guide\nRead the guide.\n>     echo world\n'),
+        ('an inline link next to a definition in a reopened quote changed',
+         'Read [x][r](alpha) now.\n\n> [a]: /guide\nRead the guide.\n> [r]: /target\n',
+         'Read [x][r](delta) now.\n\n> [a]: /guide\nRead the guide.\n> [r]: /target\n'),
+        ('an inline link next to a definition in a list item markdown-it reads as text changed',
+         'Read [guide][r](alpha) now.\n\n1. [a]: /guide\nRead the guide.\n2. [r]: /reference\n',
+         'Read [guide][r](delta) now.\n\n1. [a]: /guide\nRead the guide.\n2. [r]: /reference\n'),
+        ('code after a tab in a quoted list item edited',
+         '> - [a]: /guide\n>   \techo hello\n',
+         '> - [a]: /guide\n>   \techo world\n'),
+        ('emphasis around a reference defined behind a list and a quote marker added',
+         'Read [*guide][r]* now.\n\n[a]: /guide\n2. > [r]: /reference\n',
+         'Read *[guide][r]* now.\n\n[a]: /guide\n2. > [r]: /reference\n'),
+        ('the scope of a "$" call removed',
+         'Call $factory::make() now.\n',
+         'Call $factory make() now.\n'),
+        ('the member after calls on a long braced variable changed',
+         'Call ' + LONGVAR + '()().value now.\n',
+         'Call ' + LONGVAR + '()().other now.\n'),
+        ('the marker of a list item after a definition changed',
+         '[a]: /guide\n2. Install the package.\n',
+         '[a]: /guide\n2) Install the package.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('the text of a list item after a definition reworded',
+         '[a]: /guide\n2. Install the package.\n',
+         '[a]: /guide\n2. Set up the package.\n'),
+        ('prose after an HTML block in a quote reworded',
+         '> [a]: /guide\n> <img src="logo.png">\nRead the guide.\n',
+         '> [a]: /guide\n> <img src="logo.png">\nSee the guide.\n'),
+        ('prose after a definition whose next line holds no title reworded',
+         'Read [r].\n\n[r]: /guide\nRead the "guide" today.\n',
+         'Read [r].\n\n[r]: /guide\nSee the "guide" today.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
