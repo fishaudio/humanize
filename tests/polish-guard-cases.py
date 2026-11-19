@@ -3293,4 +3293,83 @@ accepts("R3 800 repeated item exit fences unchanged", EXITS, EXITS)
 report("R3 800 repeated item exit fences checked within two seconds", time.time() - started < 2.0,
        "%.2fs" % (time.time() - started))
 
+# (Re-review of d31cc76: kept lines strip only the quote markers of the
+# container markdown-it reads them in and keep their bytes, as runs that may
+# move with the prose before them; the item walk follows a fence, HTML block
+# or definition-like paragraph inside the item's quote, and records where
+# the item ends (the line's kind, quote depth and reach of the list item
+# around it); blank lines inside markdown-it's indented code after a
+# definition are kept; and a lazy run records where the line that ends it
+# stands against its list item's column.)
+for name, src, cand in [
+        ('a literal quote marker in a fence in a quoted list item only markdown-it opens lost its space',
+         '> [docs]: /guide\n> 2.\n>     ~~~\n>    > quoted\n',
+         '> [docs]: /guide\n> 2.\n>     ~~~\n>    >quoted\n'),
+        ('a tab in fence content after a quoted paragraph replaced with spaces',
+         '[docs]: /guide\n2.\n   > A quoted note.\n    ```text\n    \techo old\n',
+         '[docs]: /guide\n2.\n   > A quoted note.\n    ```text\n        echo old\n'),
+        ('a paragraph after a quoted HTML comment over two lines moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > <!-- note\n   > more notes -->\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > <!-- note\n   > more notes -->\n  Read these notes.\n'),
+        ('a paragraph after a quoted definition over two lines moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > [a]:\n   > /url\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > [a]:\n   > /url\n  Read these notes.\n'),
+        ('a paragraph after a quoted setext heading moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > Title\n   > ===\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > Title\n   > ===\n  Read these notes.\n'),
+        ('a quote marker added to the line where a list item only markdown-it opens ends',
+         '[docs]: /guide\n3. # Notes\n   > quoted\nRead the notes.\n# Heading\n',
+         '[docs]: /guide\n3. # Notes\n   > quoted\n> Read the notes.\n# Heading\n'),
+        ('the line that ends a list item only markdown-it opens moved out of the outer list item',
+         '- [docs]: /guide\n  3. # Notes\n     > quoted\n      ```\n  Read the notes.\n',
+         '- [docs]: /guide\n  3. # Notes\n     > quoted\n      ```\n Read the notes.\n'),
+        ('whitespace added to a blank line inside indented code markdown-it reads after a definition',
+         '[docs]: /guide\n    echo old\n\n    more old\n',
+         '[docs]: /guide\n    echo old\n     \n    more old\n'),
+        ('a heading after a lazy HTML line moved out of its nested list item by the marker indentation',
+         '- 1. Read the guide.\n  2. The notes explain everything.\n   <span>\n     # Notes\n',
+         '- 1. Read the guide.\n   2. The notes explain everything.\n   <span>\n     # Notes\n'),
+        ('a space removed after a literal quote marker in an HTML block markdown-it reads after an empty item',
+         '> > [docs]: /guide\nRead the guide\n2. # Notes\n===\n  echo old\n    echo old\necho old\n\nSee [ref].\n\n[docs]: /guide\n2.\n  <span>\n    - item\n  > quoted\n    ~~~\n [ref]: old\n\nSee [ref] and old words.\n\t\n<!-- note\nold -->\n',
+         '> > [docs]: /guide\nRead the guide\n2. # Notes\n===\n  echo old\n    echo old\necho old\n\nSee [ref].\n\n[docs]: /guide\n2.\n  <span>\n    - item\n  >quoted\n    ~~~\n [ref]: old\n\nSee [ref] and old words.\n\t\n<!-- note\nold -->\n'),
+        ('a paragraph after a lazy HTML line moved into the list item markdown-it continues',
+         '- item\n <span>\n\nSee words.\n',
+         '- item\n <span>\n\n  See words.\n'),
+        ('a paragraph moved into a list item after an empty item and a lazy HTML line',
+         '[docs]: /guide\n2.\n  - item\n <span>\n\nSee [ref] and old words.\n',
+         '[docs]: /guide\n2.\n- item\n <span>\n\n  See [ref] and old words.\n'),
+        ('a quote marker moved below a definition after a lazy underline',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n    <span>\n  [ref]: old\n> old "title"\necho old\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n    <span>\n  [ref]: old\nold "title"\n> echo old\n'),
+        ('the spaces after the marker of a list item before a lazy HTML line widened',
+         '- 1. [docs]: /guide\n     Read the guide.\n  2. The notes explain everything.\n  <span>\n    echo old\n     # Notes\n',
+         '- 1. [docs]: /guide\n     Read the guide.\n  2.  The notes explain everything.\n  <span>\n    echo old\n     # Notes\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('whitespace added to a blank line after indented code markdown-it reads after a definition',
+         '[docs]: /guide\n    echo old\n\nmore old\n',
+         '[docs]: /guide\n    echo old\n     \nmore old\n'),
+        ('prose rewrapped before a fence kept in a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > A quoted note with several ordinary words.\n    ```text\n    echo old\n',
+         '[docs]: /guide\n2.\n   > A quoted note with\n   > several ordinary words.\n    ```text\n    echo old\n'),
+        ('definition-like prose in a quote rewrapped in a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > [Warning]: Please read these notes carefully.\n   Continue with care.\n',
+         '[docs]: /guide\n2.\n   > [Warning]: Please read these\n   > notes carefully.\n   Continue with care.\n'),
+        ('a paragraph after a lazy HTML line reworded outside the list item',
+         '- item\n <span>\n\nSee words.\n',
+         '- item\n <span>\n\nRead words.\n'),
+        ('a paragraph after a lazy HTML line reworded inside the list item',
+         '- item\n <span>\n\n  See words.\n',
+         '- item\n <span>\n\n  Read words.\n'),
+        ('a nested marker indented one more column with a heading that stays in its item',
+         '- 1. [docs]: /guide\n     Read the guide.\n  2. The notes explain everything.\n    <span>\n      # Notes\n',
+         '- 1. [docs]: /guide\n     Read the guide.\n   2. The notes explain everything.\n    <span>\n      # Notes\n'),
+        ('a quote marker indented one more column inside an outer list item after a lazy run',
+         '1. > - 1. [docs]: /guide\n   >    Read the guide.\n   >   2. The notes explain everything.\n   >   Read old notes.\n   >  ```\n',
+         '1. > - 1. [docs]: /guide\n   >    Read the guide.\n   >   2. The notes explain everything.\n    >   Read old notes.\n   >  ```\n'),
+        ('a thematic break indented one more column after a lazy run in a nested list',
+         '1. [docs]: /guide\n   2. b">x</span>\n3. b">x</span>\n   ---\n',
+         '1. [docs]: /guide\n   2. b">x</span>\n3. b">x</span>\n    ---\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
