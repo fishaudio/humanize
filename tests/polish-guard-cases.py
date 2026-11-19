@@ -2361,4 +2361,71 @@ for name, src, cand in [
          '> > Note two.\n> continued here.\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of 9963ebb and a plausible-document fuzz with nested
+# containers: in the rest of a container that markdown-it closed, only the
+# lines it may read as a block of another kind (indented code, a fence, an
+# HTML block) and what follows them are kept byte for byte (a fence closes
+# only at markdown-it's indentation and quote depth); prose, list items and
+# headings there stay prose, and their definitions only possibly count. A
+# list item markdown-it starts after a definition keeps the spaces after its
+# marker; quoted indented code ends where a quote marker leaves a list item;
+# a list item only cmark-gfm opens is read as markdown-it's top level; an
+# HTML block in a quote markdown-it reopened runs over that quote.
+for name, src, cand in [
+        ('a nested list item after a quoted definition markdown-it closed reworded',
+         '- > [api]: /api\n[api]: /api\n  - Read the guide notes.\n',
+         '- > [api]: /api\n[api]: /api\n  - Read the setup notes.\n'),
+        ('a list item after a quote markdown-it closed reworded',
+         '> - [x]: /a\n> [r]: /r\n[r]: /r\n+ Another guide item\n',
+         '> - [x]: /a\n> [r]: /r\n[r]: /r\n+ Another setup item\n'),
+        ('a quoted heading after a definition markdown-it closed reworded',
+         '- > [api]: /api\n[w]: /w\n  > # Heading guide\n',
+         '- > [api]: /api\n[w]: /w\n  > # Heading setup\n'),
+        ('an inline link next to a definition both renderers take after a closed item changed',
+         'Read [x][c](alpha) now.\n\n- [a]: /guide\n[b]: /other\n  [c]: /c\n',
+         'Read [x][c](delta) now.\n\n- [a]: /guide\n[b]: /other\n  [c]: /c\n'),
+        ('a later paragraph in a list item markdown-it closed reworded',
+         '- [a]: /guide\nRead the guide.\n\n  Read the notes.\n',
+         '- [a]: /guide\nRead the guide.\n\n  See the notes.\n'),
+        ('a heading in a list item markdown-it closed reworded',
+         '- [a]: /guide\nRead the guide.\n  # Read the notes.\n',
+         '- [a]: /guide\nRead the guide.\n  # See the notes.\n'),
+        ('the next list item after one markdown-it closed reworded',
+         '- [a]: /guide\nRead the guide.\n- Read the notes.\n',
+         '- [a]: /guide\nRead the guide.\n- See the notes.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, src, cand in [
+        ('the spaces after a heading item marker after a definition changed',
+         '[a]: /guide\n2. # Read the guide.\n   ## Read the notes.\n',
+         '[a]: /guide\n2.  # Read the guide.\n   ## Read the notes.\n'),
+        ('the spaces after a list item marker after a definition changed',
+         '[a]: /guide\n2. Install the package.\n   # Read the notes.\n',
+         '[a]: /guide\n2.  Install the package.\n   # Read the notes.\n'),
+        ('code after quoted code that left a list item edited',
+         '- >     echo first\n>     echo second\n\n    echo hello\n',
+         '- >     echo first\n>     echo second\n\n    echo world\n'),
+        ('an inline link next to code that looks like a definition after a closed list changed',
+         'Read [x][ref](alpha) now.\n\n- >     echo first\n>     echo second\n\n    [ref]: /guide\n',
+         'Read [x][ref](delta) now.\n\n- >     echo first\n>     echo second\n\n    [ref]: /guide\n'),
+        ('code after an indented fence line in a fence markdown-it opened edited',
+         '- [a]: /guide\nRead the guide.\n  FFF\necho first\n    FFF\n\necho hello\nFFF\n',
+         '- [a]: /guide\nRead the guide.\n  FFF\necho first\n    FFF\n\necho world\nFFF\n'),
+        ('code after a quoted fence line in a fence markdown-it opened edited',
+         '- [a]: /guide\nRead the guide.\n  FFF\necho first\n> FFF\n\necho hello\nFFF\n',
+         '- [a]: /guide\nRead the guide.\n  FFF\necho first\n> FFF\n\necho world\nFFF\n'),
+        ('code in a list item only cmark-gfm opens edited',
+         '- [docs]: /guide\nRead the guide.\n2. Read the notes.\n\n    echo hello\n',
+         '- [docs]: /guide\nRead the guide.\n2. Read the notes.\n\n    echo world\n'),
+        ('text inside an HTML block in a quote markdown-it reopened edited',
+         '> - [docs]: /guide\nRead the guide.\n>   <span>\n> Keep this exact.\n> </span>\n',
+         '> - [docs]: /guide\nRead the guide.\n>   <span>\n> Retain this text.\n> </span>\n'),
+        ('text inside an HTML block after a closed list item in a quote edited',
+         'See [the docs][docs] now.\n\n> - [spec]: https://example.com/spec\n>   [r]: /reference\n> [guide]: ./docs/guide.md\n>   <img src="logo.png">\n> Title word here\n',
+         'See [the docs][docs] now.\n\n> - [spec]: https://example.com/spec\n>   [r]: /reference\n> [guide]: ./docs/guide.md\n>   <img src="logo.png">\n> Title text here\n'),
+        ('an inline link next to a definition after an underline markdown-it reads as text changed',
+         'Read [x][d](alpha) now.\n\n1. [c]: /c\n[i]: /i\n"t" more\n\t===\n[d]: /z\n',
+         'Read [x][d](delta) now.\n\n1. [c]: /c\n[i]: /i\n"t" more\n\t===\n[d]: /z\n')]:
+    rejects("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
+
 sys.exit(1 if FAILED else 0)
