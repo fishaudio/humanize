@@ -3493,4 +3493,39 @@ for name, src, cand in [
          '>   1. Read the guide\n>      A lone ` starts an inline code span.\n>     - Install the tool first\n2. More notes.\nUse another ` to close it.\n')]:
     accepts("R3 " + name, src, cand)
 
+# (Re-review of 38770d3: a later list item beside or outside the item
+# markdown-it opened is walked whatever reading ends that item; a title
+# the walk cannot read to its end, and the lines after it up to a blank
+# line, are kept byte for byte, while a long paragraph whose first line
+# starts no definition stays prose; and where such an item ends at a quote
+# markdown-it opens, a fence, HTML block or indented code in that quote is
+# kept byte for byte.)
+LONG_TITLE = ('[docs]: /guide\n2.\n   > [a]: /url\n   "Guide\n' + '   useful notes\n' * 63
+              + '   title"\n   Continue with care.\n')
+LONG_PROSE = ('[docs]: /guide\n2.\n   > [docs] explains the procedure.\n'
+              + '   > Read the next step carefully.\n' * 63 + '   > Continue with care.\n')
+for name, src, cand in [
+        ('a list item indented into an item that starts with a quote, after a paragraph in the item before it',
+         '[docs]: /guide\n2. # Step\n   Some prose.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
+         '[docs]: /guide\n2. # Step\n   Some prose.\n3. > Read the quoted notes.\n   > Continue with care.\n   4. More notes.\n'),
+        ('indented code changed in a quote markdown-it opens where a list item only it opens ends',
+         '[docs]: /guide\n2. Read the notes.\n   > Read the quoted notes.\n>     echo old\n',
+         '[docs]: /guide\n2. Read the notes.\n   > Read the quoted notes.\n>     echo new\n'),
+        ('indentation changed in code in a quote markdown-it opens after a nested quote in such an item',
+         '[docs]: /guide\n2.\n   > [manual]: /guide\n   > > Continue with care.\n>      4. *Read the notes.\n   Read the ` span.\n',
+         '[docs]: /guide\n2.\n   > [manual]: /guide\n   > > Continue with care.\n>       4. *Read the notes.\n   Read the ` span.\n')]:
+    rejects("R3 " + name, src, cand)
+rejects("R3 a paragraph after a lazy title over 64 lines moved out of a list item only markdown-it opens",
+        LONG_TITLE, LONG_TITLE.replace("   Continue with care.", "  Continue with care."))
+accepts("R3 prose reworded at the end of a long quoted paragraph that starts with a reference link",
+        LONG_PROSE, LONG_PROSE.replace("Continue with care.", "Continue with caution."))
+for name, src, cand in [
+        ('prose reworded in a quote markdown-it opens where a list item only it opens ends',
+         '[docs]: /guide\n2. Read the notes.\n   > Read the quoted notes.\n> Plain quoted text.\n',
+         '[docs]: /guide\n2. Read the notes.\n   > Read the quoted notes.\n> Plain quoted words.\n'),
+        ('prose reworded in a list item after an item that starts with a quote, after a paragraph',
+         '[docs]: /guide\n2. # Step\n   Some prose.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
+         '[docs]: /guide\n2. # Step\n   Some prose.\n3. > Read the quoted notes.\n   > Continue with care.\n4. Further notes.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
