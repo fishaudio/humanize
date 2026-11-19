@@ -610,9 +610,10 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     the labels of references that may or may not resolve go to ``maybe``,
     each as (start, end, key): labels with the same key resolve together.
 
-    Tildes inside a protected word (a path such as ``~/file`` or a long run)
-    stay in ``masked``, as the renderers do not know these words and may
-    pair them as strikethrough. ``url_marks`` collects the positions and
+    Underscores and tildes inside a protected word (an identifier such as
+    ``_private``, a path such as ``~/file``, a long run) stay in ``masked``:
+    the renderers do not know these words, so a marker at the edge of one
+    may pair with another (one between letters never does). ``url_marks`` collects the positions and
     characters of the emphasis markers inside bare URLs, which renderers
     without autolinks read as markers and GitHub reads as part of a link.
     """
@@ -759,7 +760,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     for m in LONG_RUN_RE.finditer(current()):
         value = m.group(0).rstrip(".:,;")
         found.append((m.start(), "word", value))
-        unhide.extend((k, "~") for k in range(m.start(), m.start() + len(value)) if chars[k] == "~")
+        unhide.extend((k, chars[k]) for k in range(m.start(), m.start() + len(value)) if chars[k] in "_~")
         _mask(chars, m.start(), m.start() + len(value))
 
     for m in WORD_TOKEN_RE.finditer(current()):
@@ -779,7 +780,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         if not value:
             continue
         found.append((m.start(), "word", value))
-        unhide.extend((k, "~") for k in range(m.start(), m.start() + len(value)) if chars[k] == "~")
+        unhide.extend((k, chars[k]) for k in range(m.start(), m.start() + len(value)) if chars[k] in "_~")
         _mask(chars, m.start(), m.start() + len(value))
 
     for k, ch in hidden:
