@@ -2865,4 +2865,62 @@ for name, src, cand in [
          '1. [docs]: /guide\nRead the notes\n  and more here.\n2. Next item\n')]:
     accepts("R3 " + name, src, cand)
 
+# (An underline below a paragraph markdown-it continues over a list item
+# only cmark-gfm opens is read from the column markdown-it reads that
+# paragraph at: four columns there are lazy text, three an underline.)
+for name, src, cand in [
+        ('an underline markdown-it reads after a list item it continues indented less',
+         '- [docs]: /guide\nRead the guide\n3. More notes\nand words\n    ---\n',
+         '- [docs]: /guide\nRead the guide\n3. More notes\nand words\n   ---\n'),
+        ('an underline markdown-it reads after a list item it continues indented more',
+         '- [docs]: /guide\nRead the guide\n3. More notes\nand words\n   ---\n',
+         '- [docs]: /guide\nRead the guide\n3. More notes\nand words\n    ---\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose above an underline markdown-it reads as text reworded',
+         '- [docs]: /guide\nRead the guide\n3. More notes\nand words\n    ---\n',
+         '- [docs]: /guide\nSee the guide\n3. More notes\nand words\n    ---\n')]:
+    accepts("R3 " + name, src, cand)
+
+# (A paragraph markdown-it continues keeps its owner over the list items it
+# continues; which lazy lines start inside a code span or raw HTML is
+# structure, not only how many; each list item only markdown-it opens is a
+# prose unit; a paragraph markdown-it reads outside its item is measured
+# from its own column; and an underline outside a quote is read from the
+# column of the list item still open there.)
+for name, src, cand in [
+        ('indented code after a paragraph markdown-it continues over list items changed',
+         '- 1. [docs]: /guide\nRead the guide\n  2. Read the notes\n  3. More notes\n===\n    Run old code.\n',
+         '- 1. [docs]: /guide\nRead the guide\n  2. Read the notes\n  3. More notes\n===\n    Run new code.\n'),
+        ('which line of a multi-line attribute is lazy swapped',
+         '> <span title="Read\n these\n>  notes">tip</span> here.\n',
+         '> <span title="Read\n>  these\n notes">tip</span> here.\n'),
+        ('emphasis in list items only markdown-it opens moved across items',
+         '[docs]: /guide\n2. Read *the guide*.\n3. Read *the notes*.\n',
+         '[docs]: /guide\n2. Read *the guide.\n3. Read* *the notes*.\n'),
+        ('a code span markdown-it continues over an indented HTML line changed',
+         '1. [docs]: /guide\nUse `old\n    <div>\ntext` here.\n',
+         '1. [docs]: /guide\nUse `new\n    <div>\ntext` here.\n'),
+        ('a code span over a lazy underline in an outer list item changed',
+         '- > [docs]: /guide\n  Read `old\n===\n  2. text`\n',
+         '- > [docs]: /guide\n  Read `new\n===\n  2. text`\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose between separate code spans in a quote reflowed',
+         '> Run `alpha` for setup,\n then use `beta` to finish.\n',
+         '> For setup, run `alpha`, then use `beta` to finish.\n'),
+        ('a blank line added before a heading after a lazy paragraph',
+         '> [docs]: /guide\nRead the guide.\n# Next\n',
+         '> [docs]: /guide\nSee the guide.\n\n# Next\n'),
+        ('prose in list items only markdown-it opens reworded',
+         '[docs]: /guide\n2. Read *the guide*.\n3. Read *the notes*.\n',
+         '[docs]: /guide\n2. See *the guide*.\n3. Read *the notes*.\n'),
+        ('prose after a multi-line attribute with a lazy line reworded',
+         '> <span title="Read\n these\n>  notes">tip</span> here.\n',
+         '> <span title="Read\n these\n>  notes">tip</span> now.\n'),
+        ('prose around a code span over a lazy underline reworded',
+         '- > [docs]: /guide\n  Read `old\n===\n  2. text`\n',
+         '- > [docs]: /guide\n  See `old\n===\n  2. text`\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
