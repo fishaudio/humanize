@@ -1473,4 +1473,87 @@ rejects("R3 a delimiter row indented under a lazy header that only markdown-it r
         "  - a | b\n  - | a | b |\n  | a | b |\n  |---|---|\n  - | text two |\na | b\n",
         "  - a | b\n  - | a | b |\n  | a | b |\n    |---|---|\n  - | text two |\na | b\n")
 
+# Re-review of a6e43fe: a footnote definition's extent comes from parsing its
+# content (lazy lines need an open paragraph there; only an empty line, or one
+# indented four columns, continues it); quote relocation stops at the first
+# line without a marker; destinations may hold balanced parentheses and a
+# backslash before a space ends them; table cells split at pipes inside
+# backticks, as in GFM.
+for name, src, cand in [
+        ('a destination with nested parentheses above an underline changed',
+         '[ref]: a(b(c)d)e\n===\n\n[ref]\n',
+         '[ref]: a(b(x)d)e\n===\n\n[ref]\n'),
+        ('a lazy line in a list inside a footnote reworded (footnotes are kept byte for byte)',
+         'See[^1].\n\n[^1]: - # Heading\n        Body.\nRead prose.\n',
+         'See[^1].\n\n[^1]: - # Heading\n        Body.\nSee prose.\n'),
+        ('paragraph text after an HTML block inside a quoted list item turned into a quote',
+         '- Item.\n    > <div></div>\n    > Body.\nOutside.\n    > Next.\n',
+         '- Item.\n    > <div></div>\n    > Body.\nOutside.\n  > Next.\n'),
+        ('code after a heading whose definition-like line has a backslash before a space edited',
+         '[ref]: /a\\ b\n===\n    codewords\n',
+         '[ref]: /a\\ b\n===\n    codeother\n'),
+        ('a lazy line after a fence opened and closed in a footnote reworded',
+         'See[^1].\n\n[^1]: ```\n    ```\n    Body.\nRead prose.\n',
+         'See[^1].\n\n[^1]: ```\n    ```\n    Body.\nSee prose.\n'),
+        ('code after a table whose header has a pipe inside backticks edited',
+         'Intro.\n2. `x|y`\n|---|---|\n    codewords\n',
+         'Intro.\n2. `x|y`\n|---|---|\n    codeother\n'),
+        ('code after a lazy table header with a pipe inside backticks in a quote edited',
+         '> Intro.\n`x|y`\n> |---|---|\n>     codewords\n',
+         '> Intro.\n`x|y`\n> |---|---|\n>     codeother\n'),
+        ('a whitespace line that ends a footnote inside a fence changed',
+         'See[^1].\n\n[^1]: note\n    ```\n    code\n\n    more\n',
+         'See[^1].\n\n[^1]: note\n    ```\n    code\n\n    other\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a setext heading in a quoted footnote reworded',
+         'See[^1].\n\n> [^1]: Header\n>     ===\nRead prose.\n',
+         'See[^1].\n\n> [^1]: Header\n>     ===\nSee prose.\n'),
+        ('prose after a table in a quoted footnote reworded',
+         'See[^1].\n\n> [^1]: Name\n>     :---\nRead prose.\n',
+         'See[^1].\n\n> [^1]: Name\n>     :---\nSee prose.\n'),
+        ('prose after an unclosed fence in a quoted footnote reworded',
+         'See[^1].\n\n> [^1]: ```\n>     Body.\nRead prose.\n',
+         'See[^1].\n\n> [^1]: ```\n>     Body.\nSee prose.\n'),
+        ('prose after closed raw HTML in a quoted footnote reworded',
+         'See[^1].\n\n> [^1]: <pre>\n>     words\n>     </pre>\nRead prose.\n',
+         'See[^1].\n\n> [^1]: <pre>\n>     words\n>     </pre>\nSee prose.\n'),
+        ('prose after a quoted footnote that a marker-only line ends reworded',
+         'See[^1].\n\n> [^1]: note\n>\n>     Body.\nRead prose.\n',
+         'See[^1].\n\n> [^1]: note\n>\n>     Body.\nSee prose.\n'),
+        ('a cell with a pipe inside backticks reworded',
+         '| a | `x|y` |\n|---|---|---|\n| Read | b | c |\n',
+         '| a | `x|y` |\n|---|---|---|\n| See | b | c |\n')]:
+    accepts("R3 " + name, src, cand)
+
+rejects("R3 an HTML line after a nested footnote's lazy line indented into it",
+        '  [^1]: note\n    1. Alpha prose.\n    [^1]: note\n  Alpha prose.\n  <img src="x">\n',
+        '  [^1]: note\n    1. Alpha prose.\n    [^1]: note\n  Alpha prose.\n        <img src="x">\n')
+
+# A footnote definition reads its content with a bounded number of inner
+# parses: plain text lines need none, and past the bound the definition keeps
+# lazy lines and trailing blank lines byte for byte.
+LONG_NOTE = "See[^1].\n\n[^1]: x\n" + "    a\nb\n" * 3000
+accepts("R3 a long footnote with alternating lazy lines unchanged", LONG_NOTE, LONG_NOTE)
+rejects("R3 the last lazy line of a long footnote reworded",
+        LONG_NOTE, LONG_NOTE[:-2] + "c\n")
+MANY_PARSES = "See[^1].\n\n[^1]: x\n" + "    - a\nb\n" * 60
+rejects("R3 trailing blank lines of a footnote past the parse bound changed",
+        MANY_PARSES + "    ```\n    code\n\n\nRead prose.\n",
+        MANY_PARSES + "    ```\n    code\n\nRead prose.\n")
+rejects("R3 a lazy line of a footnote past the parse bound reworded",
+        MANY_PARSES + "    # Head\nRead prose.\n",
+        MANY_PARSES + "    # Head\nSee prose.\n")
+for name, src, cand in [
+        ('prose after a setext underline that follows plain footnote lines reworded',
+         'See[^1].\n\n[^1]: Title\n    more\n    ===\nRead prose.\n',
+         'See[^1].\n\n[^1]: Title\n    more\n    ===\nSee prose.\n'),
+        ('prose after a fence that follows plain footnote lines reworded',
+         'See[^1].\n\n[^1]: Title\n    more\n    ```\n    code\n    ```\nRead prose.\n',
+         'See[^1].\n\n[^1]: Title\n    more\n    ```\n    code\n    ```\nSee prose.\n')]:
+    accepts("R3 " + name, src, cand)
+rejects("R3 a lazy line after plain footnote lines reworded",
+        'See[^1].\n\n[^1]: Title\n    more\n    words\nRead prose.\n',
+        'See[^1].\n\n[^1]: Title\n    more\n    words\nSee prose.\n')
+
 sys.exit(1 if FAILED else 0)

@@ -1077,9 +1077,26 @@ REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # A complete definition: label, colon, destination (on the same or the next
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line.
+# A character of a bare link destination: an escaped ASCII punctuation
+# character, any other non-space character except parentheses, or a
+# backslash that escapes nothing (a backslash before a space does not make
+# the space part of the destination).
+_DEST_CHAR = r"(?:\\[!-/:-@\[-`{-~]|[^\s()\\]|\\(?![!-/:-@\[-`{-~]))"
+
+
+def _balanced_parens(depth):
+    pattern = r"\((?:" + _DEST_CHAR + r")*\)"
+    for _ in range(depth - 1):
+        pattern = r"\((?:" + _DEST_CHAR + "|" + pattern + r")*\)"
+    return pattern
+
+
+# A bare destination may hold balanced parentheses (read here up to eight
+# levels deep).
+_DEST_BARE = r"(?:" + _DEST_CHAR + "|" + _balanced_parens(8) + r")+"
 REFDEF_FULL_RE = re.compile(
     r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*\n?[ \t]*"
-    r"(?:<(?:\\.|[^<>\n\\])*>|(?!<)(?:\\.|[^\s()\\]|\((?:\\.|[^\s()\\])*\))+)"
+    r"(?:<(?:\\.|[^<>\n\\])*>|(?!<)" + _DEST_BARE + r")"
     r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
     r"(?:\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^()\\])*\)))?"
     r"[ \t]*(?:\n|$)")
@@ -1121,7 +1138,8 @@ class Block(object):
         self.units = units
         self.line = line
         # For a reference definition: (normalized label, whether the parser
-        # read the whole definition). Not part of the comparison.
+        # read the whole definition); for a footnote definition: how its
+        # content ends. Not part of the comparison.
         self.ref = ref
 
     def describe(self):
@@ -1230,11 +1248,9 @@ def _is_html_start(body, interrupt=False):
 
 
 def _split_cells(row):
-    tokens_masked = list(row)
-    for m in CODE_SPAN_RE.finditer(row):
-        for k in range(m.start(), m.end()):
-            tokens_masked[k] = " "
-    masked = "".join(tokens_masked)
+    # GFM splits a row at every pipe that is not escaped, also inside a
+    # code span ("`x|y`" is two cells; "`x\\|y`" is one).
+    masked = row
     positions = [k for k, ch in enumerate(masked)
                  if ch == "|" and (k == 0 or masked[k - 1] != "\\")]
     stripped_start = len(row) - len(row.lstrip())
@@ -1318,32 +1334,50 @@ def _starts_block(body, in_paragraph):
     return False
 
 
-def _paragraph_left_open(text):
-    """Whether a line whose content is ``text`` (past its containers) leaves
-    a paragraph open, so that the next line may continue it lazily. Text in
-    a quote or a list item does; a blank line, indented code, a fence, an
-    HTML block, a heading, a thematic break, an empty list item or an empty
-    quote does not."""
-    for _ in range(64):
-        depth, _ = _quote_depth(text)
-        if depth:
-            text = _strip_quote(text, depth)
-            continue
-        if not text.strip() or _indent_of(text) >= 4 or HR_RE.match(text):
-            return False
-        lm = LIST_ITEM_RE.match(text)
-        if lm:
-            after = text[lm.end("marker"):]
-            if lm.group("task"):
-                after = lm.group("rest")
-            elif _indent_of(after) >= 5:
-                # Indented code inside the item (or an empty item).
-                return False
-            text = after.lstrip(" \t")
-            continue
-        return not (_is_fence_open(text) or ATX_RE.match(text) or _is_html_start(text))
-    return False
+# Inner parses allowed per footnote definition (see ``footnote_end``).
+FOOTNOTE_PARSE_LIMIT = 50
 
+
+def _plain_text_line(text):
+    """Whether ``text`` can only be paragraph text: it starts no block, no
+    quote, no setext underline and no table delimiter row at any
+    indentation."""
+    t = text.lstrip(" \t")
+    return bool(t) and not (_starts_block(t, False) or _starts_quote(t) or SETEXT_RE.match(t)
+                            or _is_table_sep(t))
+
+
+def _end_state(blocks, nlines):
+    """How the last of ``nlines`` lines parsed into ``blocks`` leaves its
+    content: "paragraph" when it ends in a paragraph that a lazy line may
+    continue (also one that holds only reference definitions so far, or
+    one kept byte for byte because another parser reads a table in it),
+    "raw_open" when it ends inside an unclosed fence or raw HTML block of
+    types 1 to 5, "unread" when it ends in a footnote definition too long
+    to read (see ``footnote_end``), else "closed"."""
+    if not blocks:
+        return "closed"
+    b = blocks[-1]
+    end = b.line - 1 + b.raw.count("\n")
+    if end != nlines - 1:
+        return "closed"
+    if b.kind in ("paragraph", "refdef") or (b.kind == "table_raw" and b.attrs.get("table_elsewhere")):
+        return "paragraph"
+    if b.kind == "footnote_def":
+        return b.ref or "closed"
+    raw_lines = [_strip_quote(line, b.attrs.get("quote", 0)) for line in b.raw.split("\n")]
+    if b.kind == "fence":
+        opener = _is_fence_open(raw_lines[0].lstrip(" "))
+        if opener and len(raw_lines) > 1:
+            cm = FENCE_CLOSE_RE.match(raw_lines[-1].lstrip(" "))
+            if cm and cm.group(1)[0] == opener[0] and len(cm.group(1)) >= len(opener):
+                return "closed"
+        return "raw_open"
+    if b.kind == "html":
+        end_re = _html_end_marker(raw_lines[0].lstrip(" "))
+        if end_re is not None and not end_re.search("\n".join(raw_lines)):
+            return "raw_open"
+    return "closed"
 
 FENCE_CLOSE_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*$")
 
@@ -1484,7 +1518,7 @@ def _expand_structure(line):
     return "".join(out) + line[m.end():]
 
 
-def parse_blocks(text, spec_blank_items=False):
+def parse_blocks(text, spec_blank_items=False, inner=False):
     """Split Markdown or plain text into an ordered list of blocks.
 
     By default the parser follows cmark-gfm (GitHub). With
@@ -1493,6 +1527,8 @@ def parse_blocks(text, spec_blank_items=False):
     only whitespace ends there even when that whitespace reaches the item's
     content column. ``check_document`` compares documents in that mode too
     when the difference applies, so a change must be safe under both.
+    ``inner`` parses the content of a container (a footnote definition):
+    there is no front matter.
 
     List items are containers: a ``list_item`` block carries the marker, its
     nesting depth, and whether a blank line separates it from the previous
@@ -1513,7 +1549,7 @@ def parse_blocks(text, spec_blank_items=False):
     blocks = []
     i = 0
 
-    if n > 1 and lines[0] in ("---", "+++"):
+    if not inner and n > 1 and lines[0] in ("---", "+++"):
         closer = lines[0]
         for j in range(1, n):
             if lines[j] == closer or (closer == "---" and lines[j] == "..."):
@@ -1717,6 +1753,100 @@ def parse_blocks(text, spec_blank_items=False):
             j += 1
         return last
 
+    def footnote_end(start, quote, base, first):
+        """Index of the last line of the footnote definition that starts on
+        line ``start``, whose first line holds ``first`` after the label.
+
+        cmark-gfm reads a footnote definition as a container: a line
+        belongs to it when it is indented four columns past the
+        definition's own container, or when it is empty (a line of only
+        spaces, or a quote line with only its marker, counts only when it
+        is indented four columns too). While the definition's content ends
+        in an open paragraph, a line with less indentation or fewer quote
+        markers continues it lazily, unless it starts a block of its own or
+        leaves an enclosing list item. Whether a paragraph is open is read
+        by parsing the content so far, so lists, quotes, headings, fences,
+        HTML and tables inside the definition count as they do outside.
+        Blank lines at its end belong to it only when its content ends
+        inside an unclosed fence or raw HTML block. Returns the index and
+        how the content ends (see ``_end_state``)."""
+        content = [first]
+        last = start
+        pending = []
+        state = None  # cached: "paragraph", "raw_open", "closed" or "unread"
+        # Each inner parse reads the whole content, so their number is
+        # bounded. Past the bound the state is "unread": a lazy line then
+        # continues the definition and trailing blank lines belong to it,
+        # which only keeps more lines byte for byte.
+        parses = [0]
+
+        def content_state():
+            if parses[0] >= FOOTNOTE_PARSE_LIMIT:
+                return "unread"
+            parses[0] += 1
+            return _content_end_state(content)
+
+        k = start + 1
+        while k < n:
+            if not lines[k]:
+                if quote:
+                    break
+                pending.append(k)
+                k += 1
+                continue
+            if not lines[k].strip():
+                if quote or _indent_of(lines[k]) - base < 4:
+                    break
+                pending.append(k)
+                k += 1
+                continue
+            kq = relocate_quotes(k, quote)
+            if kq > quote:
+                break
+            if kq > 0 and _leaves_list_item(qcols_of(k, kq), kq, level_stacks):
+                break
+            kb = _strip_quote(lines[k], kq)
+            if kq == quote and _indent_of(kb) - base >= 4:
+                if not kb.strip():
+                    pending.append(k)
+                    k += 1
+                    continue
+                inner_line = _past_container(kb, base + 4)
+                # A line that cannot start or end a block continues an open
+                # paragraph wherever it sits, so the state needs no parse.
+                if pending or state != "paragraph" or not _plain_text_line(inner_line):
+                    state = None
+                content.extend("" for _ in pending)
+                pending = []
+                content.append(inner_line)
+                last = k
+                k += 1
+                continue
+            if pending or not kb.strip():
+                break
+            if state is None:
+                state = content_state()
+            if state not in ("paragraph", "unread"):
+                break
+            lazy = past_matched(kb, kq)
+            if _starts_quote(lazy) or _starts_block(lazy, False):
+                break
+            content.append(lazy.lstrip(" \t"))
+            last = k
+            k += 1
+        if state is None:
+            state = content_state()
+        if pending:
+            if state in ("raw_open", "unread"):
+                last = pending[-1]
+            else:
+                state = "closed"
+        return last, state
+
+    def _content_end_state(content):
+        inner_blocks = parse_blocks("\n".join(content), spec_blank_items, inner=True)
+        return _end_state(inner_blocks, len(content))
+
     def emit_table(i, quote, depth, base, attrs):
         """Emit the table whose header row is line ``i`` and whose delimiter
         row is the next line, and return the index after it. Body rows run
@@ -1866,12 +1996,11 @@ def parse_blocks(text, spec_blank_items=False):
             # line). Move each marker line of the quote left, keep the
             # marker's true column for the container check, and read the
             # lines again, so the quote is parsed like any other and stays
-            # inside its list items. Lazy lines in between are left alone; a
-            # line after a marker line that leaves no paragraph open (an
-            # empty quote, an HTML block, a fence, a heading) is not lazy, so
-            # the quote ends there.
+            # inside its list items. The loop stops at the first line that
+            # is not such a marker line: whether that line continues the
+            # quote lazily depends on the blocks inside the quote, and the
+            # paragraph parser decides it (moving later markers itself).
             k = i
-            text_open = False
             while k < n and lines[k].strip() and _quote_depth(lines[k])[0] == quote:
                 kb = _strip_quote(lines[k], quote)
                 kind = _indent_of(kb)
@@ -1882,8 +2011,7 @@ def parse_blocks(text, spec_blank_items=False):
                     marker_quote_col.setdefault(k, {})[quote] = kind
                     lines[k] = ((_quote_prefix(lines[k], quote) + " ") if quote else "") \
                         + " " * min(kind, 3) + kb.lstrip(" ")
-                    text_open = _paragraph_left_open(rel)
-                elif not text_open or rel.lstrip(" ").startswith(">") or _starts_block(rel, False):
+                else:
                     break
                 k += 1
             continue
@@ -1915,64 +2043,12 @@ def parse_blocks(text, spec_blank_items=False):
 
         fm = FOOTNOTE_DEF_RE.match(cbody)
         if fm:
-            # cmark-gfm reads a footnote definition as a container whose
-            # lines are indented four columns past its own container (blank
-            # lines in between too). While a paragraph is open inside it, a
-            # line with less indentation or fewer quote markers continues
-            # that paragraph lazily, unless it starts a block of its own (a
-            # fence, HTML, a list item, a heading and so on) or leaves an
-            # enclosing list item: then the definition ends. A fence inside
-            # it has no lazy lines, and when the definition ends inside a
-            # fence, the blank lines before its end are code too.
-            j = i
-            k = i + 1
-            open_fence = None
-            para_open = _paragraph_left_open(cbody[fm.end():].lstrip(" \t"))
-            while k < n:
-                if not lines[k].strip():
-                    if quote:
-                        break
-                    para_open = False
-                    k += 1
-                    continue
-                kq = relocate_quotes(k, quote)
-                if kq > quote:
-                    break
-                if kq > 0 and _leaves_list_item(qcols_of(k, kq), kq, level_stacks):
-                    break
-                kb = _strip_quote(lines[k], kq)
-                if kq == quote and not kb.strip():
-                    # Only quote markers: a blank line inside the quote.
-                    para_open = False
-                    k += 1
-                    continue
-                if kq == quote and _indent_of(kb) - base >= 4:
-                    rel = _past_container(kb, base + 4)
-                    if open_fence:
-                        cm = FENCE_CLOSE_RE.match(rel.lstrip(" "))
-                        if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == open_fence[0]
-                                and len(cm.group(1)) >= len(open_fence)):
-                            open_fence = None
-                    elif not (para_open and not _starts_quote(rel) and not SETEXT_RE.match(rel)
-                              and not _starts_block(rel, True)):
-                        # Not a continuation line of the open paragraph: a
-                        # block of its own starts here.
-                        open_fence = _is_fence_open(rel) if _indent_of(rel) < 4 else None
-                        para_open = not open_fence and _paragraph_left_open(rel)
-                    j = k
-                    k += 1
-                    continue
-                if para_open and not open_fence:
-                    lazy = past_matched(kb, kq)
-                    if not (_starts_quote(lazy) or _starts_block(lazy, False)):
-                        j = k
-                        k += 1
-                        continue
-                break
-            if open_fence:
-                j = k - 1
-            blocks.append(Block("footnote_def", attrs(base=base), "\n".join(lines[i:j + 1]), [], start_line))
-            i = j + 1
+            end, end_state = footnote_end(i, quote, base, cbody[fm.end():].lstrip(" \t"))
+            # The block remembers how its content ends, so a definition
+            # inside another one can keep that one's paragraph open.
+            blocks.append(Block("footnote_def", attrs(base=base), "\n".join(lines[i:end + 1]), [], start_line,
+                                end_state))
+            i = end + 1
             continue
 
         hm = ATX_RE.match(cbody)
