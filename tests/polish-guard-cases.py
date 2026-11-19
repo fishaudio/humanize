@@ -3145,4 +3145,67 @@ for k in (2000, 20000):
     report("R3 a malformed tag with %d spaces checked within two seconds" % k,
            time.time() - started < 2.0, "took %.2f s" % (time.time() - started))
 
+# (Inside a list item only markdown-it opens, a quote holding a heading
+# continues no paragraph, a block that starts in the item's column ends the
+# item's paragraph, and a fence or HTML block opened in the item keeps the
+# lines it holds after cmark-gfm's paragraph; an empty such item right after
+# a definition is tracked too; where it ends, markdown-it's fence, HTML
+# block or indented code is measured from the list item around it and ends
+# with it; every lazy run is read from the column of the list item
+# markdown-it reads it in; a reference label is consumed without a link
+# tail too, and span records resolve labels against the document; the
+# stray-backtick rule holds in every reading.)
+for name, src, cand in [
+        ('a paragraph after a quoted heading moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > # Notes\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > # Notes\n  Read these notes.\n'),
+        ('indented code after an underline of a paragraph read in an outer list item changed',
+         '- 1. [docs]: /guide\n  Read the guide.\n  2. # Notes\n    ===\n      echo old\n',
+         '- 1. [docs]: /guide\n  Read the guide.\n  2. # Notes\n    ===\n      echo new\n'),
+        ('a fence content line after a nested item exit changed',
+         '100. [docs]: /guide\n     2.\n        ```text\n        Keep these notes.\n     ```\n     Read old notes.\n\n     More old notes.\n',
+         '100. [docs]: /guide\n     2.\n        ```text\n        Keep these notes.\n     ```\n     Read old notes.\n\n     More new notes.\n'),
+        ('code after a full reference whose label holds a backtick changed',
+         'See [the backtick][`] and `echo old` now.\n\n[`]: /syntax\n',
+         'See [the backtick][`] and `echo new` now.\n\n[`]: /syntax\n'),
+        ('a line of an HTML block in a list item only markdown-it opens changed',
+         '[docs]: /guide\n2.\n   <img src="diagram.svg">\n   # Read old notes.\n',
+         '[docs]: /guide\n2.\n   <img src="diagram.svg">\n   # Read new notes.\n'),
+        ('a quote-only line added to an HTML block after a lazy underline',
+         '> > [docs]: /guide\nRead the guide\n2. # Notes\n===\n    Continue with care.\n<span>\n> old "title"\n\nSee [ref].\n',
+         '> > [docs]: /guide\nRead the guide\n2. # Notes\n===\n    Continue with care.\n<span>\n> old "title"\n> \nSee [ref].\n'),
+        ('a bracket added before a link markdown-it refuses, next to a stray backtick in its reading',
+         '1. See [the option][ref](file:///a "` t") then `a` and `b`.\n',
+         '1. See[[the option][ref](file:///a "` t") then `a` and `b`.\n'),
+        ('code indentation after a heading in a surviving outer list item changed',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n     # Notes\n      ===\n <span>\n',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n     # Notes\n       ===\n <span>\n'),
+        ('a heading moved out of a fence in a list item only markdown-it opens',
+         '> [docs]: /guide\n> 2.\n>    echo old\n>     ~~~\n>    # Heading\n> [ref]: old\n',
+         '> [docs]: /guide\n> 2.\n>    echo old\n>     ~~~\n>   # Heading\n> [ref]: old\n'),
+        ('a nested list moved out of an empty list item only markdown-it opens',
+         '- [docs]: /guide\n  2.\n      ---\n     - item\n     ---\n',
+         '- [docs]: /guide\n  2.\n      ---\n    - item\n     ---\n'),
+        ('a nested list in a list item only markdown-it opens turned into text',
+         '- [docs]: /guide\n  3. # Notes\n     echo old\n      - item\n    # Heading\n',
+         '- [docs]: /guide\n  3. # Notes\n     echo old\n     "- item\n    # Heading\n'),
+        ('a line after a fence that leaves a list item only markdown-it opens, after a fence of its own',
+         '[docs]: /guide\n3. # Notes\n   ```text\n   ---\n```\n\nSee [ref] and old words.\n',
+         '[docs]: /guide\n3. # Notes\n   ```text\n   ---\n```\n\nSee [ref] and new words.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a paragraph after an inline link with a backtick in its title rewrapped',
+         '> Read [the note][x](guide "a `") carefully and `echo old` now.\n',
+         '> Read [the note][x](guide "a `") carefully\n and `echo old` now.\n'),
+        ('prose after a fence that leaves a list item only markdown-it opens, outside the outer item',
+         '- [docs]: /guide\n  2.\n     ```text\n     Keep these notes.\n  ```\nRead old notes.\n',
+         '- [docs]: /guide\n  2.\n     ```text\n     Keep these notes.\n  ```\nRead new notes.\n'),
+        ('prose around a full reference whose label holds a backtick reworded',
+         'See [the backtick][`] and `echo old` now.\n\n[`]: /syntax\n',
+         'Read [the backtick][`] and `echo old` now.\n\n[`]: /syntax\n'),
+        ('a paragraph after a quoted paragraph in a list item only markdown-it opens reworded',
+         '[docs]: /guide\n2.\n   > Some notes\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > Some notes\n   Read the notes.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
