@@ -2238,4 +2238,67 @@ for name, src, cand in [
          'Read [r].\n\n[r]: /guide\nSee the "guide" today.\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of 746ec63: list item text after a definition is classified
+# (indented code, fences and headings are not prose), markdown-it's quote
+# depth is tracked per line, a lazy line keeps its leading whitespace for
+# cmark-gfm, markdown-it reads lines anew once it closed a list item or a
+# quote, front matter may hold definitions, and "$" words keep their
+# members and scopes.
+for name, src, cand in [
+        ('indented code in a list item after a definition edited',
+         '[a]: /guide\n2.     echo hello\n',
+         '[a]: /guide\n2.     echo world\n'),
+        ('a fence in a list item after a definition edited',
+         '[a]: /guide\n2. FFF\n   echo hello\n   FFF\n',
+         '[a]: /guide\n2. FFF\n   echo world\n   FFF\n'),
+        ('the heading marker in a list item after a definition removed',
+         '[a]: /guide\n2. # Install the package.\n',
+         '[a]: /guide\n2. Install the package.\n'),
+        ('code in a quote reopened at a shallower depth edited',
+         '> > [a]: /guide\nRead the guide.\n>     echo hello\n',
+         '> > [a]: /guide\nRead the guide.\n>     echo world\n'),
+        ('an inline link next to a definition after two list boundaries changed',
+         'Read [guide][r](alpha) now.\n\n1. [a]: /guide\nRead the guide.\n2. Normal text.\n3. [r]: /reference\n',
+         'Read [guide][r](delta) now.\n\n1. [a]: /guide\nRead the guide.\n2. Normal text.\n3. [r]: /reference\n'),
+        ('code after a definition in a quoted list item edited',
+         '> - [a]: /guide\n    echo hello\n',
+         '> - [a]: /guide\n    echo world\n'),
+        ('an inline link next to an indented lazy definition changed',
+         'Read [guide][r](alpha) now.\n\n> [a]: /guide\n  [r]: /reference\n',
+         'Read [guide][r](delta) now.\n\n> [a]: /guide\n  [r]: /reference\n'),
+        ('the member of a "$" variable changed',
+         'Read $config.timeout before continuing.\n',
+         'Read $config.interval before continuing.\n'),
+        ('the scope of a call on a long braced variable removed',
+         'Call ' + LONGVAR + '::make() now.\n',
+         'Call ' + LONGVAR + ' make() now.\n'),
+        ('an inline link next to a definition after an underline in a reopened quote changed',
+         'Read [x][c](alpha) now.\n\n> [n]: /n\nlazy\n[j]:\n/j\n> ===\n> [c]: <u v>\n',
+         'Read [x][c](delta) now.\n\n> [n]: /n\nlazy\n[j]:\n/j\n> ===\n> [c]: <u v>\n'),
+        ('an inline link next to a definition in front matter changed',
+         '---\n[r]: /guide\n---\n\nRead [x][r](alpha) now.\n',
+         '---\n[r]: /guide\n---\n\nRead [x][r](delta) now.\n'),
+        ('an inline link next to a definition after code outside a list item changed',
+         'Read [x][b](alpha) now.\n\n- [k]: /k\n[a]: /x\n\tTab\n[b]: /y\n',
+         'Read [x][b](delta) now.\n\n- [k]: /k\n[a]: /x\n\tTab\n[b]: /y\n'),
+        ('an inline link next to a definition after a heading outside a list item changed',
+         'Read [x][i](alpha) now.\n\n- [e]: /w\n[e]: /w\n  [g]: /a(b\n--\n[i]: /i\n',
+         'Read [x][i](delta) now.\n\n- [e]: /w\n[e]: /w\n  [g]: /a(b\n--\n[i]: /i\n')]:
+    rejects("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
+for name, src, cand in [
+        ('prose after an indented lazy line that holds no definition reworded',
+         'Read [a] and [r].\n\n> [a]: /guide\n  [r]: /reference\n  "Read the guide" extra.\n',
+         'Read [a] and [r].\n\n> [a]: /guide\n  [r]: /reference\n  "See the guide" extra.\n'),
+        ('a heading after inline HTML in list item text reworded',
+         '[a]: /guide\n2. Install the package.\n<span>\n# Read the guide\n',
+         '[a]: /guide\n2. Install the package.\n<span>\n# See the guide\n'),
+        ('prose after a "$" variable that ends a sentence reworded',
+         'Set $config. Then go.\n',
+         'Set $config. Then continue.\n'),
+        ('an inline link next to a definition in a quote after a heading kept',
+         'Read [x][n](alpha) now.\n\n[c]: /c\n---\n--\n> [n]: /n\n',
+         'Read [x][n](delta) now.\n\n[c]: /c\n---\n--\n> [n]: /n\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
