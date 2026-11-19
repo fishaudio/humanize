@@ -1899,4 +1899,38 @@ accepts("R3 a paragraph of 16000 reference links unchanged",
 report("R3 a paragraph of 16000 reference links checked within three seconds",
        time.time() - started < 3.0, "%.2fs" % (time.time() - started))
 
+
+# Own probes on d6af219: block readings that only markdown-it has. An
+# underline right below definitions is text to cmark-gfm but a thematic
+# break or heading to markdown-it, and a definition with a label over 1000
+# bytes is text to cmark-gfm but a definition to markdown-it.
+for name, src, cand in [
+        ('the underline below a definition changed from = to -',
+         '[a]: /u\n===\n',
+         '[a]: /u\n---\n'),
+        ('the underline below a no-break space definition changed',
+         '[\u00a0]: /u\n===\n',
+         '[\u00a0]: /u\n---\n'),
+        ('prose below a definition turned into an underline',
+         '[a]: /u\nRead prose.\n',
+         '[a]: /u\n---\n'),
+        ('the destination of a definition only markdown-it reads changed',
+         '[' + 'a' * 1001 + ']: alpha\n\n[link][' + 'a' * 1001 + ']\n',
+         '[' + 'a' * 1001 + ']: delta\n\n[link][' + 'a' * 1001 + ']\n'),
+        ('the destination of a later definition only markdown-it reads changed',
+         '[a]: /u\n[' + '\u00e9' * 501 + ']: alpha\n\n[x][' + '\u00e9' * 501 + ']\n',
+         '[a]: /u\n[' + '\u00e9' * 501 + ']: delta\n\n[x][' + '\u00e9' * 501 + ']\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('an underline below a definition lengthened',
+         '[a]: /u\n===\n',
+         '[a]: /u\n====\n'),
+        ('prose after an underline below a definition reworded',
+         '[a]: /u\n===\nRead prose.\n',
+         '[a]: /u\n===\nSee prose.\n'),
+        ('prose after a definition only markdown-it reads reworded',
+         '[' + 'a' * 1001 + ']: /u\n\nRead prose.\n',
+         '[' + 'a' * 1001 + ']: /u\n\nSee prose.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)

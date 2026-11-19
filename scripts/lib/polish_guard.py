@@ -2542,11 +2542,24 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                                 [], i + rest + 1))
         elif rest < len(content):
             units = ["\n".join([content[rest].lstrip(" \t")] + content[rest + 1:])]
+            # An underline right below definitions is text to cmark-gfm, but
+            # markdown-it reads "---" there as a thematic break (and, below a
+            # definition it does not take, either underline as a heading), so
+            # the underline is part of the structure.
+            under = re.match(r"[ ]{0,3}(=+|-+)[ \t]*$", content[rest]) if defs else None
+            marks = {"after_definition": under.group(1)[0]} if under else {}
+            # A definition-like line whose label cmark-gfm does not take (over
+            # 1000 bytes) is text there but a definition to markdown-it: the
+            # paragraph is kept byte for byte.
+            head = _REFDEF_HEAD_RE.match(content[rest])
+            if head and not _label_ok(head.group(1)) and mdit_label_key(head.group(1)):
+                raw = "\n".join(lines[i + rest:j])
+                marks["markdown_it_definition"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
             if setext_level:
-                blocks.append(Block("heading", attrs(level=setext_level),
+                blocks.append(Block("heading", attrs(level=setext_level, **marks),
                                     "\n".join(lines[i + rest:j]), units, i + rest + 1))
             else:
-                blocks.append(Block("paragraph", attrs(), "\n".join(lines[i + rest:j]), units,
+                blocks.append(Block("paragraph", attrs(**marks), "\n".join(lines[i + rest:j]), units,
                                     i + rest + 1))
         i = j
 
