@@ -26,6 +26,7 @@ conversion are not detectable here and need a human or model review.
 This module performs no I/O and uses only the Python standard library.
 """
 
+import bisect
 import html
 import html.entities
 import html.parser
@@ -209,7 +210,7 @@ WORD_TOKEN_RE = re.compile(
     | (?P<call>[A-Za-z_][\w.]*\(\)(?:\(\)|(?:\.|::)\w+)*)
     | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\)(?:\(\)|(?:\.|::)\w+)*)?)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
-    | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
+    | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?(?:[\w.]*\(\)(?:\(\)|(?:\.|::)\w+)*)?)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
     | (?P<qty>(?<![\w.])\d+(?:\.\d+)?
         [ \t\u00a0\u2007\u2009\u200a\u202f]*(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
@@ -1305,10 +1306,6 @@ _POINTY_DEST_RE = re.compile(r"<(?:\\.|[^<>\n\\])*>")
 # fails in linear time.
 _TITLE = (r"(?:\"(?:\\[\s\S]|[^\"\\])*\\?\"|'(?:\\[\s\S]|[^'\\])*\\?'"
           r"|\((?:\\[\s\S]|[^()\\])*\\?\))")
-# An optional title, separated from the destination by spaces or a line end,
-# then the end of the line. Without a title that ends its line, the
-# destination must end the line itself.
-_REFDEF_TAIL_RE = re.compile(r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)" + _TITLE + r")?[ \t]*(?:\n|$)")
 # A title that starts and ends on one line.
 _LINE_TITLE_RE = re.compile(_TITLE.replace(r"\s\S", r"^\n").replace(r"[^\"\\]", r"[^\"\\\n]")
                             .replace(r"[^'\\]", r"[^'\\\n]").replace(r"[^()\\]", r"[^()\\\n]"))
@@ -1360,29 +1357,97 @@ def _scan_destination(text, pos, balanced=False):
 
 _MDIT_BAD_PROTO_RE = re.compile(r"(?:vbscript|javascript|file|data):")
 _MDIT_GOOD_DATA_RE = re.compile(r"data:image/(?:gif|png|jpeg|webp);")
+_MDIT_UNESCAPE_RE = re.compile(r"\\([!-/:-@\[-`{-~])|&([A-Za-z#][A-Za-z0-9]{1,31});")
+_MDIT_NUMERIC_RE = re.compile(r"#(?:[xX]([0-9a-fA-F]{1,8})|([0-9]{1,8}))")
 
 
-def _mdit_definition_end(text, pos):
+def _mdit_unescape(text):
+    """``text`` with backslash escapes and character references decoded as
+    markdown-it decodes a link destination before it validates it."""
+    def decode(m):
+        if m.group(1):
+            return m.group(1)
+        name = m.group(2)
+        num = _MDIT_NUMERIC_RE.fullmatch(name)
+        if num:
+            code = int(num.group(1), 16) if num.group(1) else int(num.group(2))
+            bad = (0xD800 <= code <= 0xDFFF or 0xFDD0 <= code <= 0xFDEF
+                   or (code & 0xFFFF) in (0xFFFE, 0xFFFF) or code <= 0x08 or code == 0x0B
+                   or 0x0E <= code <= 0x1F or 0x7F <= code <= 0x9F or code > 0x10FFFF)
+            return m.group(0) if bad else chr(code)
+        return html.entities.html5.get(name + ";", m.group(0))
+    return _MDIT_UNESCAPE_RE.sub(decode, text)
+
+
+def _mdit_scan_destination(text, pos, n):
+    """End of the link destination that starts at ``pos`` as markdown-it
+    scans one (reading ``text[:n]``), or None: inside angle brackets, or a
+    bare run that ends at a space or control character, or at a closing
+    parenthesis with none open, and closes every parenthesis it opens. A
+    backslash escapes any next character but a space; before a line end it
+    ends the destination with that line (markdown-it has not read the next
+    line yet), and nothing more of the definition follows."""
+    k = pos
+    if k < n and text[k] == "<":
+        k += 1
+        while k < n:
+            ch = text[k]
+            if ch in "\n<" or (ch == "\\" and text[k + 1:k + 2] == "\n"):
+                return None
+            if ch == ">":
+                return k + 1
+            k += 2 if ch == "\\" and k + 1 < n else 1
+        return None
+    depth = 0
+    while k < n:
+        ch = text[k]
+        if ch == " " or ch < " " or ch == "\x7f":
+            break
+        if ch == "\\" and k + 1 < n:
+            if text[k + 1] == " ":
+                break
+            if text[k + 1] == "\n":
+                return k + 2 if not depth else None
+            k += 2
+            continue
+        if ch == "(":
+            depth += 1
+            if depth > 32:
+                return None
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        k += 1
+    return k if k > pos and not depth else None
+
+
+def _mdit_definition_end(text, pos, limit=None):
     """End of the definition whose destination starts at ``pos`` (after the
-    line it ends on), as markdown-it reads it, or None when it does not:
-    the destination closes every parenthesis it opens and is not a
+    line it ends on), as markdown-it reads it, or None when it does not
+    (reading ``text[:limit]``): a destination (see _mdit_scan_destination)
+    that, once escapes and character references are decoded, is not a
     "javascript:", "vbscript:", "file:" or "data:" link (images in data
-    links excepted), and a title ends at its closing quote (a backslash right
-    before it escapes it) with only spaces after it on its line; without a
-    title, only spaces may follow the destination on its line."""
-    end = _scan_destination(text, pos, balanced=True)
+    links excepted), then a title that ends at its closing quote (a
+    backslash right before it escapes it) with only spaces after it on its
+    line (else, unless the title is empty, the definition ends after the
+    destination); without a title, only spaces may follow the destination
+    on its line."""
+    n = len(text) if limit is None else limit
+    end = _mdit_scan_destination(text, pos, n)
     if end is None:
         return None
     dest = text[pos:end]
     if dest.startswith("<") and dest.endswith(">"):
         dest = dest[1:-1]
-    dest = dest.strip().lower()
+    dest = _mdit_unescape(dest).strip().lower()
     if _MDIT_BAD_PROTO_RE.match(dest) and not _MDIT_GOOD_DATA_RE.match(dest):
         return None
-    n = len(text)
+    if text[end - 1] == "\n":
+        return end
 
     def line_end(k):
-        nl = text.find("\n", k)
+        nl = text.find("\n", k, n)
         return n if nl < 0 else nl + 1
 
     j = end
@@ -1405,47 +1470,175 @@ def _mdit_definition_end(text, pos):
             k += 1
         if k < n and not text[k + 1:line_end(k + 1)].strip(" \t\n"):
             return line_end(k + 1)
+        if k < n and k == j + 1:
+            # An empty title with more text after it: markdown-it does not
+            # go back to the destination.
+            return None
     if not text[end:line_end(end)].strip(" \t\n"):
         return line_end(end)
     return None
 
 
-def _mdit_definitions(lines):
-    """The labels (as markdown-it matches them) of the definitions markdown-it
-    reads at the start of a paragraph with these lines, in order, up to the
-    first line that is not one (the rest of the paragraph is text)."""
-    text = "\n".join(line.lstrip(" \t") for line in lines)
-    keys = []
-    pos = 0
-    while pos < len(text):
-        head = _REFDEF_HEAD_RE.match(text, pos)
-        if not head or not mdit_label_key(head.group(1)):
+_MDIT_LIST_START_RE = re.compile(r"(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)")
+_MDIT_UNDERLINE_RE = re.compile(r"(?:=+|-+)[ \t]*$")
+_MDIT_BREAK_RE = re.compile(r"(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
+
+
+def _mdit_columns(line, base):
+    """Indentation of a paragraph line relative to its container (``base``
+    columns), as markdown-it measures it after a definition; a lazy line
+    that does not reach the container counts from the line start."""
+    ind = _indent_of(line)
+    return ind - base if ind >= base else ind
+
+
+def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset()):
+    """How markdown-it reads the lines of one cmark-gfm paragraph (inside a
+    container ``base`` columns deep): a list of (kind, first, last) line
+    ranges (``last`` excluded) covering the lines in order, where kind is
+    "definition" (with the label as markdown-it matches it as a fourth
+    item), "code", "break", "item" (an empty list item), "html", "heading"
+    (a paragraph that ends at a setext underline, its last line),
+    "paragraph" (to the end) or "unknown" (a list item with content, read
+    no further). ``continuing`` is the kind of a block markdown-it opened
+    before these lines and continues on them: "paragraph", or "html" and
+    "unknown" (which take all of them). ``quote_lazy`` holds the indexes of
+    lazy lines outside the paragraph's quotes, which continue a definition
+    and are never an underline.
+
+    markdown-it reads a definition only at the start of a block, and starts
+    a new block after each one, so a line that only continues the paragraph
+    to cmark-gfm can start indented code, a thematic break, a list item that
+    cannot interrupt a paragraph (an empty one, or a number other than 1) or
+    an HTML block of the seventh kind there. A list item or a thematic break
+    also ends the lines a definition may continue on."""
+    n = len(lines)
+    if continuing in ("html", "unknown"):
+        return [(continuing, 0, n)]
+    stripped = [line.lstrip(" \t") for line in lines]
+    bodies = [_expand_indent(line).lstrip(" ") for line in lines]
+    cols = [_mdit_columns(line, base) for line in lines]
+    text = "\n".join(stripped)
+    starts = [0]
+    for line in stripped:
+        starts.append(starts[-1] + len(line) + 1)
+    # The first line after each line that ends a definition's lines.
+    next_end = [n] * (n + 1)
+    for k in range(n - 1, -1, -1):
+        ends = k > 0 and k not in quote_lazy and cols[k] < 4 and bool(
+            _MDIT_LIST_START_RE.match(bodies[k]) or _MDIT_BREAK_RE.match(bodies[k]))
+        next_end[k] = k if ends else next_end[k + 1]
+    out = []
+    p = 0
+    while p < n:
+        body = bodies[p]
+        if p and cols[p] >= 4:
+            q = p + 1
+            while q < n and cols[q] >= 4:
+                q += 1
+            out.append(("code", p, q))
+            p = q
+            continue
+        if p and _MDIT_BREAK_RE.match(body):
+            out.append(("break", p, p + 1))
+            p += 1
+            continue
+        marker = _MDIT_LIST_START_RE.match(body) if p else None
+        if marker:
+            # An empty item ends at the next line unless that line is
+            # indented into it; any other item is not read further.
+            if not body[marker.end():].strip(" \t") and (p + 1 == n or cols[p + 1] == 0):
+                out.append(("item", p, p + 1))
+                p += 1
+                continue
+            out.append(("unknown", p, n))
             break
-        end = _mdit_definition_end(text, head.end())
+        if p and _is_html_start(body) and not _is_html_start(body, interrupt=True):
+            out.append(("html", p, n))
+            break
+        t = next_end[p + 1]
+        limit = starts[t] - 1
+        head = None if continuing and not p else _REFDEF_HEAD_RE.match(text, starts[p], limit)
+        key = mdit_label_key(head.group(1)) if head else ""
+        end = _mdit_definition_end(text, head.end(), limit) if key else None
         if end is None:
+            # A paragraph, up to the first setext underline in its own
+            # container (then a heading, and new blocks after it).
+            q = p + 1
+            while q < n and not (q not in quote_lazy and _indent_of(lines[q]) >= base and cols[q] < 4
+                                 and _MDIT_UNDERLINE_RE.match(bodies[q])):
+                q += 1
+            if q < n:
+                out.append(("heading", p, q + 1))
+                p = q + 1
+                continue
+            out.append(("paragraph", p, n))
             break
-        keys.append(mdit_label_key(head.group(1)))
-        pos = end
-    return keys
+        last = max(p + 1, min(bisect.bisect_left(starts, end + (end == limit)), t))
+        out.append(("definition", p, last, key))
+        p = last
+    return out
 
 
-def _mdit_definition_ok(text):
-    """Whether markdown-it reads the definition at the start of ``text``."""
-    head = _REFDEF_HEAD_RE.match(text.lstrip(" \t"))
-    return bool(head) and _mdit_definition_end(text.lstrip(" \t"), head.end()) is not None
+def _cmark_title_end(text, j):
+    """End of the link title that starts at ``text[j]`` as cmark-gfm's
+    scanner matches it, or None. The scanner takes the longest match: a
+    closing delimiter right after a backslash may also be an escaped one
+    inside the title, so the title runs to the first closing delimiter
+    without a backslash before it (or else the last one with one); an
+    opening parenthesis without a backslash before it ends a parenthesized
+    title's reach."""
+    n = len(text)
+    if j >= n or text[j] not in "\"'(":
+        return None
+    opener = text[j]
+    close = ")" if opener == "(" else opener
+    last = None
+    for k in range(j + 1, n):
+        ch = text[k]
+        if ch == "\x00" or (opener == "(" and ch == "(" and text[k - 1] != "\\"):
+            break
+        if ch == close:
+            if text[k - 1] != "\\":
+                return k + 1
+            last = k + 1
+    return last
 
 
-def _match_definition(text):
-    """End of the definition at the start of ``text`` (after the newline
-    that ends it), or None when it is not one."""
-    m = _REFDEF_HEAD_RE.match(text)
+def _match_definition(text, pos=0):
+    """End of the definition at ``pos`` in ``text`` (after the newline
+    that ends it), or None when it is not one, as cmark-gfm reads it: a
+    title (see _cmark_title_end) must be followed by only spaces on its
+    line, or else the definition ends after the destination, which then
+    must end its line."""
+    m = _REFDEF_HEAD_RE.match(text, pos)
     if not m or not _label_ok(m.group(1)):
         return None
     end = _scan_destination(text, m.end())
     if end is None:
         return None
-    tail = _REFDEF_TAIL_RE.match(text, end)
-    return tail.end() if tail else None
+    n = len(text)
+
+    def line_end_after_spaces(k):
+        while k < n and text[k] in " \t":
+            k += 1
+        if k == n:
+            return n
+        return k + 1 if text[k] == "\n" else None
+
+    k = end
+    while k < n and text[k] in " \t":
+        k += 1
+    if k < n and text[k] == "\n":
+        k += 1
+        while k < n and text[k] in " \t":
+            k += 1
+    title_end = _cmark_title_end(text, k) if k > end else None
+    if title_end is not None:
+        after = line_end_after_spaces(title_end)
+        if after is not None:
+            return after
+    return line_end_after_spaces(end)
 
 
 # The label of a definition, which may continue over lines.
@@ -1823,16 +2016,22 @@ def _read_definitions(content, parsed_only=False):
     parts = [line.lstrip(" \t") for line in content]
     out = []
     k = 0
+    # After a definition this parser cannot read, cmark-gfm may have
+    # stopped reading definitions: the ones after it only possibly count.
+    unsure = False
+    joined = "\n".join(parts)
+    starts = [0]
+    for part in parts:
+        starts.append(starts[-1] + len(part) + 1)
     while k < len(parts):
         if FOOTNOTE_DEF_RE.match(parts[k]) or not REFDEF_START_RE.match(parts[k]):
             break
-        joined = "\n".join(parts[k:])
-        dm = _match_definition(joined)
-        lm = REFDEF_LABEL_RE.match(joined)
+        dm = _match_definition(joined, starts[k])
+        lm = REFDEF_LABEL_RE.match(joined, starts[k])
         label = lm.group(1) if lm else None
         if dm is not None:
-            end = k + joined[:dm].rstrip("\n").count("\n") + 1
-            out.append((k, end, label, True))
+            end = bisect.bisect_right(starts, dm - 1)
+            out.append((k, end, label, not unsure))
             k = end
             continue
         if parsed_only or not REFDEF_RE.match(parts[k]) or _not_a_definition(parts[k]):
@@ -1842,6 +2041,7 @@ def _read_definitions(content, parsed_only=False):
                and not FOOTNOTE_DEF_RE.match(parts[end])):
             end += 1
         out.append((k, end, label, False))
+        unsure = True
         k = end
     return out, k
 
@@ -2318,6 +2518,12 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # containers, by line index: (quote, depth, base, ancestry, mark), where
     # mark is "lazy", "indented" or "".
     table_headers = {}
+    # The line at which a paragraph markdown-it opened on a setext
+    # underline continues (see below), or -1.
+    md_open = -1
+    # (line, quote depth) where an HTML block or a list item markdown-it
+    # opened inside a paragraph continues past it, up to a blank line.
+    md_raw_from = []
 
     while i < n:
         line = lines[i]
@@ -2586,6 +2792,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         # definition continues the same paragraph (an indented line is text,
         # not code), and an underline below nothing but definitions is text.
         content = [cbody.lstrip(" \t")]
+        # Lazy lines with fewer quote markers than the paragraph, by index
+        # in ``content`` (markdown-it never reads one as an underline).
+        quote_lazy = set()
+        resolved = None
         j = i + 1
         setext_level = 0
 
@@ -2626,10 +2836,17 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 break
             sm = SETEXT_RE.match(nbc)
             if sm and same_container:
-                if _read_definitions(content, parsed_only=True)[1] < len(content):
+                early = _read_definitions(content, parsed_only=True)
+                if early[1] < len(content):
                     setext_level = 1 if sm.group(1)[0] == "=" else 2
                     j += 1
                     break
+                if resolved is None:
+                    # cmark-gfm reads the definitions at the first underline
+                    # with the lines so far (a title cannot reach past it);
+                    # nothing but definitions there, the underline is text,
+                    # and the lines from it on start with no definition.
+                    resolved = early
             elif _starts_block(nbc, same_container):
                 break
             sep_text = (_past_container(_strip_quote(lines[j + 1], quote), base)
@@ -2644,6 +2861,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 # line, so no later line of the paragraph starts one.)
                 table_elsewhere = True
                 tables_off = True
+                if nq < quote:
+                    quote_lazy.add(len(content))
                 content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
                 j += 1
                 continue
@@ -2666,30 +2885,44 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # The original bytes after the line's quote markers, also when a
             # marker was moved for parsing: a tab inside a code span or math
             # that spans lines is compared as written.
+            if nq < quote:
+                quote_lazy.add(len(content))
             content.append(orig_lines[j][_loose_quote_end(orig_lines[j], nq):])
             if sep_after(j):
                 tables_off = True
             j += 1
-        defs, rest = _read_definitions(content, parsed_only=bool(setext_level))
+        defs, rest = resolved or _read_definitions(content, parsed_only=bool(setext_level))
         # cmark-gfm does not read definitions in the lines above a table's
         # header row (they render as text), while markdown-it does: such a
         # definition only possibly defines its label, and is marked, so a
         # blank line added or removed before the header changes structure.
         above_table = j in table_headers
-        md_broken = False
+        # markdown-it reads definitions by its own rules, each at the start
+        # of a block (see _mdit_reading). It takes a definition cmark-gfm
+        # reads when one of its own starts on the same line, and possibly
+        # takes one inside a list item it did not read further.
+        md_read = _mdit_reading(content, base, "paragraph" if i == md_open else None, quote_lazy)
+        md_defs = {r[1]: r[3] for r in md_read if r[0] == "definition"}
+        md_unknown = next((r[1] for r in md_read if r[0] == "unknown"), None)
+        cm_firsts = {first for first, _last, _label, _parsed in defs}
+        # Labels only markdown-it defines (or may define) in these lines.
+        md_only = [r[3] for r in md_read if r[0] == "definition" and r[1] not in cm_firsts]
+        for kind, first, last, *_rest in md_read:
+            if kind == "unknown":
+                md_only += [mdit_label_key(m.group(1))
+                            for m in LOOSE_REFDEF_RE.finditer("\n".join(content[first:last]))]
         for first, last, label, parsed in defs:
-            # markdown-it takes the definition too when it reads it by its
-            # own rules; after one it does not take, the rest of the
-            # paragraph is text to it.
-            md_ok = not md_broken and _mdit_definition_ok(
-                "\n".join(line.lstrip(" \t") for line in content[first:last]))
-            md_broken = md_broken or not md_ok
-            ref = ((normalize_label(label), parsed and not above_table,
-                    mdit_label_key(label) if md_ok else "")
+            maybe = md_unknown is not None and first >= md_unknown
+            md_key = md_defs.get(first, mdit_label_key(label) if maybe else "")
+            ref = ((normalize_label(label), parsed and not above_table, md_key, not maybe)
                    if label is not None else None)
             marks = {"above_table": True} if above_table else {}
             blocks.append(Block("refdef", attrs(**marks), "\n".join(lines[i + first:i + last]), [],
                                 i + first + 1, ref))
+        if defs and md_only:
+            blocks[-1].md_label = tuple(md_only)
+        if md_read[-1][0] in ("html", "unknown") and j < n:
+            md_raw_from.append((j, quote))
         if defs and rest == len(content) and depth > 0 and j < n and not _strip_quote(lines[j], quote).strip():
             # cmark-gfm drops a paragraph of definitions when the blank line
             # after it closes it. A list item that held nothing else is then
@@ -2727,15 +2960,46 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 # an h2 underline below a definition markdown-it does not take).
                 run = under.group(1)
                 marks["after_definition"] = "=" if run[0] == "=" else "-" * min(len(run), 3)
-            # A definition-like line whose label cmark-gfm does not take (over
-            # 1000 bytes) is text there but a definition to markdown-it: the
-            # paragraph is kept byte for byte.
+            # Lines that markdown-it reads as anything but a paragraph (a
+            # definition, such as one whose label cmark-gfm does not take
+            # because it is over 1000 bytes; indented code; a thematic break;
+            # a list item that cannot interrupt a paragraph; an HTML block)
+            # are not prose to it: they are kept byte for byte, in order (a
+            # paragraph markdown-it reads after them is prose). The underline
+            # right below the definitions is compared through after_definition.
+            over = []
+            for r in md_read:
+                if r[2] <= rest or r[0] == "paragraph":
+                    continue
+                if r[0] == "heading":
+                    # Its text is prose to both; its underline is not.
+                    if r[2] - 1 >= rest and not (under and r[2] - 1 == rest):
+                        over.append(("underline", r[2] - 1, r[2]))
+                    continue
+                if not (under and r[1] == rest and r[0] in ("break", "item")):
+                    over.append(r)
+            kept_lines = list(content)
+            if setext_level and md_read[-1][0] != "paragraph":
+                # cmark-gfm's underline is not one to markdown-it, which has
+                # no paragraph open there: it reads the line anew, and a
+                # paragraph it starts there ("=" or "--") continues into the
+                # lines after the heading.
+                uline = _past_container(_strip_quote(lines[j - 1], quote), base).lstrip(" ")
+                over.append(("underline", len(content), len(content) + 1))
+                kept_lines.append(uline)
+                if md_read[-1][0] in ("paragraph", "heading", "code", "break", "item", "definition") \
+                        and not (_MDIT_BREAK_RE.match(uline) or re.match(r"-[ \t]*$", uline)):
+                    md_open = j
+            if over:
+                kept = "\x00".join(r[0] + "\x00" + "\n".join(kept_lines[max(r[1], rest):r[2]])
+                                   for r in over)
+                digest = hashlib.sha256(kept.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                kind = ("markdown_it_definition" if any(r[0] == "definition" for r in over)
+                        else "markdown_it_block")
+                marks[kind] = digest
             md_label = None
-            md_keys = [] if md_broken else _mdit_definitions(content[rest:])
-            if md_keys:
-                md_label = tuple(md_keys)
-                raw = "\n".join(lines[i + rest:j])
-                marks["markdown_it_definition"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+            if not defs:
+                md_label = tuple(r[3] for r in md_read if r[0] == "definition") or None
             if setext_level:
                 blocks.append(Block("heading", attrs(level=setext_level, **marks),
                                     "\n".join(lines[i + rest:j]), units, i + rest + 1))
@@ -2753,6 +3017,22 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             first = block.line - 1
             last = first + block.raw.count("\n")
             block.raw = "\n".join(orig_lines[first:last + 1])
+    # The blocks markdown-it reads as part of an HTML block (or a list item
+    # it was not read further) that it opened inside a paragraph before them
+    # are kept byte for byte, and their definitions only possibly count.
+    for start, quote in md_raw_from:
+        end = start
+        while end < n and _strip_quote(lines[end], quote).strip():
+            end += 1
+        for block in blocks:
+            if start <= block.line - 1 < end:
+                block.attrs["markdown_it_raw"] = hashlib.sha256(
+                    block.raw.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                if block.kind == "refdef" and block.ref and block.ref[2]:
+                    block.ref = block.ref[:3] + (False,)
+                labels = [mdit_label_key(m.group(1)) for m in LOOSE_REFDEF_RE.finditer(block.raw)]
+                if labels:
+                    block.md_label = tuple(block.md_label or ()) + tuple(labels)
     return blocks
 
 
@@ -2784,7 +3064,7 @@ def reference_labels(blocks):
         if block.kind == "refdef" and block.ref:
             (definite if block.ref[1] else possible).add(block.ref[0])
             if block.ref[2]:
-                (md_definite if block.ref[1] else md_possible).add(block.ref[2])
+                (md_definite if block.ref[1] and block.ref[3] else md_possible).add(block.ref[2])
         elif block.kind in ("protected", "footnote_def"):
             for m in LOOSE_REFDEF_RE.finditer(block.raw):
                 possible.add(normalize_label(m.group(1)))
