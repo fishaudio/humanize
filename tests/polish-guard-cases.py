@@ -2472,4 +2472,75 @@ for name, src, cand in [
          '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n\nSee the notes.\n')]:
     accepts("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
 
+
+# Re-review of 798b312: the freeze of a container markdown-it closed runs on
+# over HTML blocks frozen before it and reads fences and raw HTML inside an
+# HTML block as its text; lazy lines and further list items only cmark-gfm
+# opens stay in the container markdown-it closed; an indented quote marker
+# under a paragraph markdown-it reads outside the quote is lazy text;
+# cmark-gfm keeps no whitespace on a lazy line that reaches an outer list
+# item's content column; markdown-it ends raw HTML in a list item at a blank
+# line short of the item's content column; an HTML block in a quote
+# markdown-it reopened ends with that quote. Own additions: a lazy line
+# indented four columns but short of a wide list item's content column that
+# looks like a block start ends markdown-it's paragraph and item (indented
+# code); an HTML block inside a container that swallows a nested list item;
+# a block markdown-it reads past an unknown stretch; a quoted HTML block
+# markdown-it continues over a quote marker indented four columns.
+for name, src, cand in [
+        ('code after a quoted HTML line markdown-it reads inside an HTML block edited',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n  > <img src="logo.png">\n\n    echo hello\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n  > <img src="logo.png">\n\n    echo world\n'),
+        ('code after an HTML block that ends a closed item edited',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n  <div>\n\n    echo hello\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n  <div>\n\n    echo world\n'),
+        ('a heading after a fence inside an HTML block after a closed item edited',
+         '- [docs]: /guide\nRead the guide.\n\n  <img src="logo.png">\n  FFF\n  FFF\n# Keep this exact.\n',
+         '- [docs]: /guide\nRead the guide.\n\n  <img src="logo.png">\n  FFF\n  FFF\n# Retain this text.\n'),
+        ('code after a lazy line in a list item only cmark-gfm opens edited',
+         '1. [docs]: /guide\nRead the guide.\n2. Read notes.\nMore details.\n\n    echo hello\n',
+         '1. [docs]: /guide\nRead the guide.\n2. Read notes.\nMore details.\n\n    echo world\n'),
+        ('code in a further list item only cmark-gfm opens edited',
+         '1. [docs]: /guide\nRead the guide.\n2. Read notes.\n3. More details.\n\n    echo hello\n',
+         '1. [docs]: /guide\nRead the guide.\n2. Read notes.\n3. More details.\n\n    echo world\n'),
+        ('an inline link next to a definition after an indented quoted underline changed',
+         'Read [guide][ref](online).\n\n- > [docs]: /guide\nRead the guide.\n    > ---\n[ref]: /reference\n',
+         'Read [guide][ref](latest).\n\n- > [docs]: /guide\nRead the guide.\n    > ---\n[ref]: /reference\n'),
+        ('an inline link next to text after definitions in a nested list item changed',
+         'Read [guide][ref](online).\n\n- Outer list.\n  - [docs]: /guide\n  [notes]: /notes\n    ---\n[ref]: /reference\n',
+         'Read [guide][ref](latest).\n\n- Outer list.\n  - [docs]: /guide\n  [notes]: /notes\n    ---\n[ref]: /reference\n'),
+        ('code after a wide ordered item and a lazy thematic break edited',
+         '  2. Read notes.\n    ---\n        echo hello\n',
+         '  2. Read notes.\n    ---\n        echo world\n'),
+        ('a heading-like lazy line markdown-it reads as code under a wide item edited',
+         '   - Read the guide.\n    # Setup\n',
+         '   - Read the guide.\n    # Install\n'),
+        ('an inline link next to a definition after a list HTML comment with a blank line changed',
+         'Read [guide][ref](online).\n\n- Notes.\n  <!-- start\n\n  -->\n[ref]: /reference\n',
+         'Read [guide][ref](latest).\n\n- Notes.\n  <!-- start\n\n  -->\n[ref]: /reference\n'),
+        ('code after a nested list item an HTML block in a list item swallows edited',
+         '- [docs]: /guide\n  <img src="x">\n  - Setup notes.\n\n      echo hello\n',
+         '- [docs]: /guide\n  <img src="x">\n  - Setup notes.\n\n      echo world\n'),
+        ('code after a nested list item an HTML block in a quote swallows edited',
+         '> [docs]: /guide\n> <img src="x">\n> - Setup notes.\n>\n>     echo hello\n',
+         '> [docs]: /guide\n> <img src="x">\n> - Setup notes.\n>\n>     echo world\n'),
+        ('a list item markdown-it reads inside an HTML block after nested quotes it ended edited',
+         '> >  [notes]: /notes\n    # Notes\n> > <img src="x">\n> >   - Keep this item\n',
+         '> >  [notes]: /notes\n    # Notes\n> > <img src="x">\n> >   - Retain this item\n'),
+        ('a quote markdown-it reads inside a quoted HTML block over an indented quote marker edited',
+         '> <span>\n>[d]: /g\n    > Read more.\n> Keep this exact.\n',
+         '> <span>\n>[d]: /g\n    > Read more.\n> Retain this text.\n')]:
+    rejects("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
+for name, src, cand in [
+        ('a heading after an HTML block in a quote markdown-it reopened reworded',
+         '> [docs]: /guide\nRead the guide.\n> <img src="logo.png">\n# Read the notes.\n',
+         '> [docs]: /guide\nRead the guide.\n> <img src="logo.png">\n# See the notes.\n'),
+        ('a lazy line under a wide list item reworded',
+         '   1. Run this:\n    and that line.\n',
+         '   1. Run this:\n    and this line.\n'),
+        ('a heading indented inside a narrow list item reworded',
+         '1. Run this:\n    # Not a header\n',
+         '1. Run this:\n    # Not a heading\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
