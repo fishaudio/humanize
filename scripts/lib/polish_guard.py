@@ -197,9 +197,11 @@ HTML_CLOSE_TAG = r"</[A-Za-z][A-Za-z0-9-]*\s*>"
 HTML_OTHER_RAW = (r"<!---?>|<!--.*?-->|<\?.*?\?>|<![A-Za-z][^>]*>"
                   r"|<!\[CDATA\[.*?\]\]>")
 HTML_STRICT_TAG_RE = re.compile(HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
+_ELEMENT_TAG_RE = re.compile(HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
+_LOOSE_TAG = r"</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>"
 HTML_TAG_RE = re.compile(
-    HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
-    + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s+[^<>]*?)?\s*/?>", re.S)
+    HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG + "|" + _LOOSE_TAG, re.S)
+_LOOSE_TAG_RE = re.compile(_LOOSE_TAG, re.S)
 ENTITY_RE = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});")
 URL_RE = re.compile(r"\b(?:https?|ftp|file)://[^\s<>\"'`]+|\bwww\.[^\s<>\"'`]+")
 
@@ -306,9 +308,10 @@ def _opaque_end(text, i):
             j = k
         return i + run
     if text[i] == "<":
-        m = OPAQUE_RE.match(text, i)
+        m = AUTOLINK_RE.match(text, i)
         if m:
             return m.end()
+        return _html_end(text, i)
     return None
 
 
@@ -584,16 +587,76 @@ def _scan_refs(masked, original, resolve, offset=0):
     return out
 
 
-def _scan_inline(text):
-    """Find code spans, TeX math and backslash escapes in one left-to-right pass.
+_HTML_TERMS = {}
 
-    Returns (kind, start, end, value) tuples. Scanning in order gets escape
-    parity right: in "\\\\*" the backslash is escaped and the star is active,
-    an escaped backtick never opens a code span, and backslashes inside a
-    code span are literal.
-    """
+
+def _html_terms(text):
+    """Where the last terminator of each kind of raw HTML starts in
+    ``text`` (-1 when there is none). Cached by the text object itself (an
+    equal text compared by value would cost its length on every call)."""
+    hit = _HTML_TERMS.get(id(text))
+    if hit is not None and hit[0] is text:
+        return hit[1]
+    if len(_HTML_TERMS) >= 16:
+        _HTML_TERMS.clear()
+    terms = {term: text.rfind(term) for term in ("-->", "?>", "]]>", ">")}
+    _HTML_TERMS[id(text)] = (text, terms)
+    return terms
+
+
+def _html_end(text, i):
+    """End of the raw inline HTML that starts at ``text[i]`` (a "<"), by the
+    grammar of HTML_STRICT_TAG_RE, or None. An opener that no terminator
+    follows fails at once, so many of them do not each scan to the end of
+    the text (as the lazy patterns of HTML_STRICT_TAG_RE do)."""
+    if text.startswith("<!-->", i):
+        return i + 5
+    if text.startswith("<!--->", i):
+        return i + 6
+    for head, term in (("<!--", "-->"), ("<?", "?>"), ("<![CDATA[", "]]>")):
+        if text.startswith(head, i):
+            if _html_terms(text)[term] < i + len(head):
+                return None
+            return text.find(term, i + len(head)) + len(term)
+    if text.startswith("<!", i) and text[i + 2:i + 3].isalpha():
+        if _html_terms(text)[">"] < i + 2:
+            return None
+        return text.find(">", i + 2) + 1
+    m = _ELEMENT_TAG_RE.match(text, i)
+    return m.end() if m else None
+
+
+def _iter_html(text, loose=False):
+    """(start, end) of each raw inline HTML element in ``text``, as
+    HTML_STRICT_TAG_RE (or, with ``loose``, HTML_TAG_RE) finds them, in
+    linear time."""
+    i = text.find("<")
+    while i >= 0:
+        end = _html_end(text, i)
+        if end is None and loose:
+            m = _LOOSE_TAG_RE.match(text, i)
+            end = m.end() if m else None
+        if end is not None:
+            yield i, end
+            i = text.find("<", end)
+        else:
+            i = text.find("<", i + 1)
+
+
+def _inline_constructs(text):
+    """Code spans, raw HTML, autolinks, inline link tails, TeX math and
+    backslash escapes, in one left-to-right pass, as (kind, start, end,
+    value) tuples (kinds "code", "html", "autolink", "linktail", "math",
+    "escape"). Scanning in order gets escape parity right (in "\\\\*" the
+    backslash is escaped and the star is active, an escaped backtick never
+    opens a code span, and backslashes inside a code span are literal) and
+    precedence too, as CommonMark has it: whichever of a code span, raw HTML
+    or an autolink starts first wins, so a backtick inside a tag's attribute
+    opens no code span, and the destination and title after "](" that close
+    an open bracket belong to the link, not to a code span."""
     out = []
     n = len(text)
+    brackets = 0
     i = 0
     while i < n:
         ch = text[i]
@@ -635,8 +698,38 @@ def _scan_inline(text):
             else:
                 i += run
             continue
+        if ch == "<":
+            end = _html_end(text, i)
+            kind = "html"
+            if end is None:
+                m = AUTOLINK_RE.match(text, i)
+                end = m.end() if m else None
+                kind = "autolink"
+            if end is not None:
+                out.append((kind, i, end, text[i:end]))
+                i = end
+                continue
+            i += 1
+            continue
+        if ch == "[":
+            brackets += 1
+        elif ch == "]" and brackets:
+            brackets -= 1
+            if i + 1 < n and text[i + 1] == "(":
+                end, _ = _link_tail(text, i + 1)
+                if end is not None:
+                    out.append(("linktail", i + 1, end, text[i + 1:end]))
+                    i = end
+                    continue
         i += 1
     return out
+
+
+def _scan_inline(text):
+    """Find code spans, TeX math and backslash escapes (see
+    _inline_constructs, which also reads raw HTML, autolinks and link tails
+    so that no code span starts inside them)."""
+    return [c for c in _inline_constructs(text) if c[0] in ("code", "math", "escape")]
 
 
 def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
@@ -793,7 +886,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         _mask(chars, m.start(), m.end())
 
     snapshot = current()
-    html_spans = [(t.start(), t.end()) for t in HTML_TAG_RE.finditer(snapshot)]
+    html_spans = list(_iter_html(snapshot, loose=True))
     for m in SHORTCUT_REF_RE.finditer(snapshot):
         found.append((m.start(), "reflink", m.group(0)))
         if (m.group(0).startswith("!") and snapshot.startswith("(", m.end())
@@ -808,9 +901,10 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         unhide.extend((k, snapshot[k]) for k in range(m.start(), m.end()) if snapshot[k] in "*_~")
         _mask(chars, m.start(), m.end())
 
-    for m in HTML_TAG_RE.finditer(current()):
-        found.append((m.start(), "tag", _normalize_tag(m.group(0))))
-        _mask(chars, m.start(), m.end())
+    snapshot = current()
+    for start, end in _iter_html(snapshot, loose=True):
+        found.append((start, "tag", _normalize_tag(snapshot[start:end])))
+        _mask(chars, start, end)
 
     for m in ENTITY_RE.finditer(current()):
         found.append((m.start(), "entity", m.group(0)))
@@ -885,8 +979,8 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         found.append((m.start(), "dest", m.group(0)))
     # HTML tags that fit the strict grammar, read from the original text too,
     # so code or math masking elsewhere in the unit cannot split a tag.
-    for m in HTML_STRICT_TAG_RE.finditer(text):
-        found.append((m.start(), "rawtag", _normalize_tag(m.group(0))))
+    for start, end in _iter_html(text):
+        found.append((start, "rawtag", _normalize_tag(text[start:end])))
     for m in URL_RE.finditer(text):
         found.append((m.start(), "dest", _strip_url(m.group(0))))
 
@@ -1131,9 +1225,11 @@ def hard_break_count(text):
     for kind, start, end, _ in _scan_inline(text):
         if kind in ("code", "math"):
             _blank_out(chars, start, end, "\x02")
-    for regex in (INLINE_MATH_RE, AUTOLINK_RE, HTML_STRICT_TAG_RE):
+    for regex in (INLINE_MATH_RE, AUTOLINK_RE):
         for m in regex.finditer("".join(chars)):
             _blank_out(chars, m.start(), m.end(), "\x02")
+    for start, end in list(_iter_html("".join(chars))):
+        _blank_out(chars, start, end, "\x02")
     count = 0
     for line in "".join(chars).split("\n")[:-1]:
         body = line.rstrip(" ")
@@ -1256,12 +1352,15 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
     # closes) is markup too: adding or removing one can pair others
     # differently, and markdown-it, after an unclosed "[", reads every code
     # span of that length before an unmatched string as text.
-    if re.findall(r"`+", src_masked) != re.findall(r"`+", cand_masked):
+    stray = re.findall(r"`+", src_masked)
+    if stray != re.findall(r"`+", cand_masked):
         raise GuardReject("inline_markup", "%s: backtick strings outside code changed" % where)
     # (markdown-it's scan for the end of link text from an unclosed "[" can
-    # leave that state behind, so where the text holds backticks, the
-    # brackets outside code are markup too.)
-    if ("`" in src or "`" in cand) and (re.findall(r"[][]", src_masked) != re.findall(r"[][]", cand_masked)):
+    # leave its backtick state behind when it passes a backtick string
+    # nothing closes, and later code spans of that length then render as
+    # text: where the text holds such a string, the brackets outside code
+    # are markup too.)
+    if stray and re.findall(r"[][]", src_masked) != re.findall(r"[][]", cand_masked):
         raise GuardReject("inline_markup", "%s: brackets next to code changed" % where)
     if src_marks or cand_marks:
         # Markers inside bare URLs: checked again as markers, the way the
@@ -1544,85 +1643,26 @@ def _mdit_ends_paragraph(line, level, base, marker_indent=None):
             and bool(re.match(r"(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)", body[ind:])))
 
 
-# (The tag name ends where the attributes start, so a long name without a
-# closing ">" fails in one pass.)
-_HTML_SPAN_TAG_RE = re.compile(r"</?[A-Za-z][A-Za-z0-9-]*(?![A-Za-z0-9-])(?:[^<>\"']|\"[^\"]*\"|'[^']*')*>")
-_SPAN_START_RE = re.compile(r"[`<]")
-_HTML_SPAN_ENDS = (("<!--", "-->"), ("<?", "?>"), ("<![CDATA[", "]]>"), ("<!", ">"))
-
-
 def _spanned_lines(lines, ks):
     """Where the lines ``ks`` (indexes into ``lines``, a paragraph's lines)
-    start inside a code span or raw HTML that opened on an earlier line: a
-    tuple of (span number, line number inside the span), so rewrapping the
-    prose around a span keeps it. The text is read from left to right as
-    CommonMark reads it: a backtick string opens a code span when a later
-    string of the same length closes it (a backslash before it takes one
-    backtick), a "<" starts raw HTML when a tag (to its first ">" outside a
-    quoted attribute value), a comment, a processing instruction, a CDATA
-    section or a declaration ends after it; whichever starts first wins,
-    and a construct without its end is text."""
+    start inside a code span, raw HTML or an inline link's destination and
+    title that opened on an earlier line (read as _inline_constructs reads
+    them): a tuple of (span number, line number inside the span), so
+    rewrapping the prose around a span keeps it."""
     if not ks:
         return ()
     text = "\n".join(lines)
-    n = len(text)
     starts = [0]
     for line in lines:
         starts.append(starts[-1] + len(line) + 1)
-    runs = [(m.start(), m.end()) for m in re.finditer(r"`+", text)]
-    run_at = {s: x for x, (s, _e) in enumerate(runs)}
-    by_size = {}
-    for x, (s, e) in enumerate(runs):
-        by_size.setdefault(e - s, []).append(x)
-
-    def escaped(at):
-        back = at
-        while back and text[back - 1] == "\\":
-            back -= 1
-        return (at - back) % 2
-
-    spans = []
-    pos = 0
-    while True:
-        m = _SPAN_START_RE.search(text, pos)
-        if not m:
-            break
-        at = m.start()
-        if text[at] == "`":
-            x = run_at[at]
-            s, e = runs[x]
-            skip = escaped(s)
-            size = e - s - skip
-            later = by_size.get(size, []) if size else []
-            y = bisect.bisect_right(later, x)
-            if y < len(later):
-                spans.append((s + skip, runs[later[y]][1]))
-                pos = runs[later[y]][1]
-            else:
-                pos = e
-            continue
-        end = None
-        if not escaped(at):
-            for head, term in _HTML_SPAN_ENDS:
-                if text.startswith(head, at) and (head != "<!" or text[at + 2:at + 3].isalpha()):
-                    k = text.find(term, at + len(head))
-                    end = None if k < 0 else k + len(term)
-                    break
-            else:
-                tag = _HTML_SPAN_TAG_RE.match(text, at, min(n, at + 20000))
-                end = tag.end() if tag else None
-        if end is None:
-            pos = at + 1
-            continue
-        spans.append((at, end))
-        pos = end
+    spans = [(s, e) for kind, s, e, _ in _inline_constructs(text) if kind in ("code", "html", "linktail")]
     heads = [s for s, _ in spans]
     out = []
     for k in ks:
         at = starts[k]
         x = bisect.bisect_left(heads, at) - 1
         if x >= 0 and spans[x][0] < at < spans[x][1]:
-            out.append((x, text.count("\n", spans[x][0], at)))
+            out.append((x, k - (bisect.bisect_right(starts, spans[x][0]) - 1)))
     return tuple(out)
 
 
@@ -2913,7 +2953,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 break
             rows.append(j)
             j += 1
-        has_html = any(HTML_TAG_RE.search(_strip_quote(lines[r], quote)) for r in rows)
+        has_html = any(next(_iter_html(_strip_quote(lines[r], quote), loose=True), None) for r in rows)
         for idx, r in enumerate(rows):
             row_body = _strip_quote(lines[r], quote)
             cells = _split_cells(row_body)
@@ -2952,7 +2992,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # (line, end) where markdown-it's reading of a paragraph stops being
     # known before its end: a block it reads there may run on past it.
     md_unknown_from = []
-    md_unknown_tail = []
+    md_item_open = []
     # (line, quote depth) where a paragraph markdown-it keeps open continues
     # lazily past the end of cmark-gfm's paragraph.
     md_lazy_from = []
@@ -3412,15 +3452,34 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                                 tuple(c for _, c in level_stacks[quote]) if quote < len(level_stacks) else (),
                                 tuple(tuple(c for _, c in stack) for stack in level_stacks))
         md_defs = {r[1]: r[3] for r in md_read if r[0] == "definition"}
+        # A list item markdown-it opens in these lines and still reads at
+        # their end: its content column decides whether it takes the lines
+        # after cmark-gfm's paragraph (see md_item_open below).
+        md_item_col = None
+        for r in md_read:
+            if r[0] in ("listitem", "item"):
+                body = _expand_indent(col_lines[r[1]])
+                ind = len(body) - len(body.lstrip(" "))
+                body = body[ind:]
+                mark = _MDIT_LIST_START_RE.match(body)
+                mark = mark.group(0).rstrip(" \t") if mark else ""
+                inner = body[len(mark):].lstrip(" \t")
+                gap = len(body) - len(mark) - len(inner)
+                md_item_col = ind + len(mark) + (gap if inner and 1 <= gap <= 4 else 1)
+            elif md_item_col is not None and r[1] and _indent_of(col_lines[r[1]]) < md_item_col:
+                md_item_col = None
+        if md_item_col is not None and j < n:
+            md_item_open.append((i, j, quote, md_item_col))
         md_unknown = next((r[1] for r in md_read if r[0] == "unknown"), None)
         if md_unknown is not None and md_unknown in quote_lazy and j < n:
             # (After markdown-it ended nested quotes there; a list item it
             # closed is the rest of that container, below.)
             md_unknown_from.append((i + md_unknown, j))
-        elif md_unknown is not None and j < n:
+        elif md_unknown is not None and j < n and lines[j].strip() and not _mdit_interrupts(lines[j], quote):
             # (What markdown-it reads there, such as a paragraph, may run on
-            # over the lines after cmark-gfm's paragraph.)
-            md_unknown_tail.append((j, quote))
+            # over the lines after cmark-gfm's paragraph: they are compared
+            # with it as one prose unit, its own lines kept byte for byte.)
+            md_lazy_run.append((i + md_unknown, j, quote, False, False))
         cm_firsts = {first for first, _last, _label, _parsed in defs}
         # Labels only markdown-it defines (or may define) in these lines.
         md_only = [r[3] for r in md_read if r[0] == "definition" and r[1] not in cm_firsts]
@@ -3713,6 +3772,15 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             lazy_ws = _spanned_lines(content[rest:], [k - rest for k in sorted(cm_lazy) if k > rest])
             if lazy_ws:
                 marks["lazy_ws"] = lazy_ws
+            if base and len(content) - rest > 1:
+                # In a list item, how much indentation the renderers remove
+                # from the paragraph's later lines depends on the item's
+                # content column: where a code span, raw HTML or a link title
+                # spans lines, that column is structure too.
+                joined = "\n".join(content[rest:])
+                if any("\n" in joined[s:e] for kind, s, e, _ in _inline_constructs(joined)
+                       if kind in ("code", "html", "linktail")):
+                    marks["span_base"] = base
             if setext_level:
                 blocks.append(Block("heading", attrs(level=setext_level, **marks),
                                     "\n".join(lines[i + rest:j]), units, i + rest + 1))
@@ -3841,14 +3909,6 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # later one stops there; it runs on over HTML blocks frozen above).
     closed_line = [False] * n
     lazy_line = [False] * n
-    # The lines after an unknown range that may continue a paragraph
-    # markdown-it reads there (to a blank line or a line that interrupts
-    # one) are kept byte for byte.
-    for start, level in md_unknown_tail:
-        end = start
-        while end < n and written[end].strip() and not _mdit_interrupts(written[end], level):
-            raw_line[end] = True
-            end += 1
     for start, level in md_lazy_from:
         end = start
         while end < n and not lazy_line[end] and written[end].strip() and (
@@ -3872,6 +3932,25 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     for block in blocks:
         if block.kind not in ("quote", "list_item"):
             block_at.setdefault(block.line - 1, block)
+    # Which lines after such a paragraph reach the content column of the
+    # list item markdown-it still reads there (or are blank), up to the
+    # first that does not (it closes the item), as runs: structure of the
+    # block on the paragraph's first line, so a line indented into or out of
+    # that item is a structure change.
+    for x, (at, start, level, col) in enumerate(md_item_open):
+        stop = md_item_open[x + 1][1] if x + 1 < len(md_item_open) else n
+        runs = []
+        k = start
+        while k < stop:
+            body = _strip_quote(written[k], min(level, _quote_depth(written[k])[0]))
+            flag = "blank" if not body.strip() else ("in" if _indent_of(body) >= col else "out")
+            if not runs or runs[-1] != flag:
+                runs.append(flag)
+            if flag == "out":
+                break
+            k += 1
+        if at in block_at:
+            block_at[at].attrs["md_item_lines"] = tuple(runs)
     for at, shape, texts in md_shapes:
         if at in block_at:
             block_at[at].attrs["md_shape"] = shape
@@ -4119,14 +4198,23 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 covered = k
                 if k < n and k > first and setext_at(k, level):
                     # A setext underline ends markdown-it's paragraph as a
-                    # heading, and markdown-it reads the lines after it anew
-                    # (indented code, for example): they are kept byte for
-                    # byte, with the block that holds the underline.
+                    # heading, and markdown-it reads the lines after it anew,
+                    # where cmark-gfm may continue a paragraph: the underline
+                    # and the lines markdown-it reads as indented code there
+                    # (four columns past the quote markers) are kept byte for
+                    # byte by the block that holds the underline.
                     hold = bisect.bisect_right(starts, k) - 1
-                    if hold >= 0 and starts[hold] < k:
-                        raw_line[starts[hold]] = True
-                    freeze_run(k, k + 1)
-                    drain()
+                    holder = block_at[starts[hold]] if hold >= 0 else None
+                    kept = [written[k]]
+                    x = k + 1
+                    while (x < n and _quote_depth(written[x])[1].strip()
+                           and not _mdit_interrupts(written[x], level)):
+                        if _indent_of(_strip_quote(written[x], level)) >= 4:
+                            kept.append(written[x])
+                        x += 1
+                    if holder is not None:
+                        holder.attrs["md_underline"] = holder.attrs.get("md_underline", ()) + (
+                            hashlib.sha256("\n".join(kept).encode("utf-8", "surrogatepass")).hexdigest()[:32],)
                 # (The whitespace at the start of each line after the first
                 # stays as written: markdown-it keeps what lies past the
                 # paragraph's column inside a code span or raw HTML.)

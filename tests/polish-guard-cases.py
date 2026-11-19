@@ -618,8 +618,10 @@ accepts("an item after a quoted sibling stays editable",
         "- Parent.\n  - > Read the quote.\n  - Read the guide with care.\n")
 
 # Round 1 second re-review.
+# (The destination belongs to the link, so its escapes are not TeX math:
+# the change is a link change, as for any other destination.)
 rejects("link destination suffix after TeX-like escapes changed", "Read [guide](folder\\(old\\)tail) carefully.\n",
-        "Read [guide](folder\\(old\\)evil) carefully.\n", "protected_token")
+        "Read [guide](folder\\(old\\)evil) carefully.\n", "inline_markup")
 rejects("link destination suffix after dollar signs changed",
         "Read [guide](https://example.com/$token$old) carefully.\n",
         "Read [guide](https://example.com/$token$new) carefully.\n", "protected_token")
@@ -3004,5 +3006,63 @@ for name, src, cand in [
          'Use `a` and `b x here.\n',
          'See `a` and `b x here.\n')]:
     accepts("R3 " + name, src, cand)
+
+# (Code spans, raw HTML, autolinks and link tails are read from left to
+# right in CommonMark's precedence, also for the protected tokens; a tag
+# has no length limit; in a list item, the content column is structure for
+# a paragraph whose code span, raw HTML or link title spans lines; which
+# later lines reach the column of a list item only markdown-it opens is
+# structure; the lines after an unknown range are a markdown-it unit, and
+# after a lazy run's underline only the lines markdown-it reads as code are
+# kept byte for byte; brackets count next to a stray backtick only.)
+LONG_IMG = '> See <img src="data:image/png;base64,' + 'A' * 20000 + '" title="Read\n these notes"> here.\n'
+for name, src, cand in [
+        ('a quote marker added inside the title of a tag longer than 20,000 characters',
+         LONG_IMG, LONG_IMG.replace('\n these', '\n>  these')),
+        ('code after a tag whose attribute holds a backtick changed',
+         'Read <span title="`">the note</span> and `echo old` now.\n',
+         'Read <span title="`">the note</span> and `echo new` now.\n'),
+        ('code after a comment that holds a backtick changed',
+         'Read <!-- Type ` to begin --> and `echo old` now.\n',
+         'Read <!-- Type ` to begin --> and `echo new` now.\n'),
+        ('a quote marker added inside a code span after a link title holding a backtick',
+         '> Read [the note](guide "a `") and `echo\n hello` now.\n',
+         '> Read [the note](guide "a `") and `echo\n>  hello` now.\n'),
+        ('a quote marker added inside a multi-line link title',
+         '> Read [the note](guide "old\n title") now.\n',
+         '> Read [the note](guide "old\n>  title") now.\n'),
+        ('a list marker indented less where a code span spans the item lines',
+         '  4. Run `echo\n     hello` now.\n',
+         ' 4. Run `echo\n     hello` now.\n'),
+        ('a heading moved out of an empty list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   # Notes\n',
+         '[docs]: /guide\n2.\n # Notes\n'),
+        ('a quote line indented into a list item only markdown-it opens',
+         '[docs]: /guide\n2. # Notes\n   > Read the notes.\n     <!-- comment -->\n  > 3. Use echo\n',
+         '[docs]: /guide\n2. # Notes\n   > Read the notes.\n     <!-- comment -->\n      3. Use echo\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after an unknown range reworded',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes cover everything.\n'),
+        ('prose after the underline of a lazy run reworded',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\nRead these notes carefully.\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\nRead these notes closely.\n'),
+        ('a literal bracket next to code spelled out',
+         'Use `check`; the prompt ends with [ to request more input.\n',
+         'Use `check`; the prompt ends with an opening square bracket to request more input.\n'),
+        ('prose around code after a tag holding a backtick reworded',
+         'Read <span title="`">the note</span> and `echo old` now.\n',
+         'See <span title="`">the note</span> and `echo old` now.\n'),
+        ('prose in a list item whose code span spans its lines reworded',
+         '  4. Run `echo\n     hello` now.\n',
+         '  4. Use `echo\n     hello` now.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, src in [('unclosed comment openers', 'See ' + '<!-- a ' * 8000 + '\n'),
+                  ('unclosed processing instruction openers', 'See ' + '<? a ' * 8000 + '\n')]:
+    started = time.time()
+    accepts("R3 8000 %s unchanged" % name, src, src)
+    report("R3 8000 %s checked within two seconds" % name,
+           time.time() - started < 2.0, "took %.2f s" % (time.time() - started))
 
 sys.exit(1 if FAILED else 0)
