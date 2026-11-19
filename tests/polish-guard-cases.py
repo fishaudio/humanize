@@ -3065,4 +3065,84 @@ for name, src in [('unclosed comment openers', 'See ' + '<!-- a ' * 8000 + '\n')
     report("R3 8000 %s checked within two seconds" % name,
            time.time() - started < 2.0, "took %.2f s" % (time.time() - started))
 
+# (A text that reads in two ways, a reference label that may or may not be
+# defined or a link that only cmark-gfm takes, has the code, raw HTML,
+# autolinks and link tails of each reading protected; which blocks after a
+# list item only markdown-it opens are inside it is structure block by
+# block, and a fence markdown-it opens where the item ends is kept byte for
+# byte; a lazy run after an unknown range is read from the content column
+# of the list item that survives; after a lazy run's underline, what
+# markdown-it reads before a paragraph starts is kept byte for byte; a
+# malformed tag with a long whitespace run is matched in linear time.)
+for name, src, cand in [
+        ('code in parentheses after a full reference link changed',
+         'See [the option][docs](`old`) for details.\n\n[docs]: /guide\n',
+         'See [the option][docs](`new`) for details.\n\n[docs]: /guide\n'),
+        ('code in parentheses after a collapsed reference link changed',
+         'See [docs][](`old`) for details.\n\n[docs]: /guide\n',
+         'See [docs][](`new`) for details.\n\n[docs]: /guide\n'),
+        ('code after an undefined reference whose link title holds a backtick changed',
+         'Read [the note][x](guide "a `") and `echo old` now.\n',
+         'Read [the note][x](guide "a `") and `echo new` now.\n'),
+        ('words markdown-it reads as code after a link it refuses changed',
+         'See [local help](file:///tmp/help.html "Use ` for commands") and `open` then `close`.\n',
+         'See [local help](file:///tmp/help.html "Use ` for commands") and `open` next `close`.\n'),
+        ('code after an autolink markdown-it refuses changed',
+         'Open <file:///a`b> and `echo old` now.\n',
+         'Open <file:///a`b> and `echo new` now.\n'),
+        ('a heading moved out of a list item only markdown-it opens, before another',
+         '[docs]: /guide\n2.\n   # First\n   # Second\n # Last\n',
+         '[docs]: /guide\n2.\n   # First\n # Second\n # Last\n'),
+        ('an underline moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   Title\n   ===\n',
+         '[docs]: /guide\n2.\n   Title\n===\n'),
+        ('a line after a fence that leaves a list item only markdown-it opens changed',
+         '[docs]: /guide\n2.\n   ```text\n   Keep these notes.\n```\nRead old notes.\n',
+         '[docs]: /guide\n2.\n   ```text\n   Keep these notes.\n```\nRead new notes.\n'),
+        ('a line after fence content that leaves such a list item changed',
+         '[docs]: /guide\n2.\n   ```\n   code\nfoo\n```\nRead old notes.\n',
+         '[docs]: /guide\n2.\n   ```\n   code\nfoo\n```\nRead new notes.\n'),
+        ('indented code after an underline in a surviving outer list item changed',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n     ---\n      echo old\n',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n     ---\n      echo new\n'),
+        ('a heading in a surviving outer list item indented into the paragraph',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n     # Notes\n',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n      # Notes\n'),
+        ('a definition after the underline of a lazy run changed',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n[ref]: old\nRead the notes.\n\nSee [ref].\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n[ref]: new\nRead the notes.\n\nSee [ref].\n'),
+        ('a reference to a definition after the underline of a lazy run reworded',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n[ref]: old\nRead the notes.\n\nSee [ref].\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n[ref]: old\nRead the notes.\n\nSee [the ref].\n'),
+        ('an HTML block after the underline of a lazy run changed',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n<span>\nRead old notes.\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n<span>\nRead new notes.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a full reference link reworded',
+         'See [the option][docs](`old`) for details.\n\n[docs]: /guide\n',
+         'See [the option][docs](`old`) to learn more.\n\n[docs]: /guide\n'),
+        ('prose before an autolink markdown-it refuses reworded',
+         'Open <file:///a`b> and `echo old` now.\n',
+         'See <file:///a`b> and `echo old` now.\n'),
+        ('prose under an underline in a surviving outer list item reworded',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n   ---\n     Read old notes.\n',
+         '- 1. [docs]: /guide\n    Read the guide.\n  2. The notes explain everything.\n   ---\n     Read new notes.\n'),
+        ('an indented continuation after prose under a lazy underline reworded',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\nRead these notes.\n    Continue with care.\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\nRead these notes.\n    Continue with caution.\n'),
+        ('a paragraph in a list item only markdown-it opens rewrapped lazily',
+         '[docs]: /guide\n2.\n   # Notes\n   Read these notes carefully.\n',
+         '[docs]: /guide\n2.\n   # Notes\n   Read these notes\ncarefully.\n'),
+        ('prose after a definition after the underline of a lazy run reworded',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n[ref]: old\nRead the notes.\n\nSee [ref].\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n[ref]: old\nRead these notes.\n\nSee [ref].\n')]:
+    accepts("R3 " + name, src, cand)
+for k in (2000, 20000):
+    src = 'See <a ' + ' ' * k + '\n'
+    started = time.time()
+    accepts("R3 a malformed tag with %d spaces unchanged" % k, src, src)
+    report("R3 a malformed tag with %d spaces checked within two seconds" % k,
+           time.time() - started < 2.0, "took %.2f s" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
