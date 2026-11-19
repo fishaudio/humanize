@@ -1078,10 +1078,11 @@ REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line.
 # A character of a bare link destination: an escaped ASCII punctuation
-# character, any other non-space character except parentheses, or a
-# backslash that escapes nothing (a backslash before a space does not make
-# the space part of the destination).
-_DEST_CHAR = r"(?:\\[!-/:-@\[-`{-~]|[^\s()\\]|\\(?![!-/:-@\[-`{-~]))"
+# character, any other character except ASCII whitespace and parentheses
+# (cmark-gfm ends a destination only there), or a backslash that escapes
+# nothing (a backslash before a space does not make the space part of the
+# destination).
+_DEST_CHAR = r"(?:\\[!-/:-@\[-`{-~]|[^ \t\n\x0b\x0c\r()\\]|\\(?![!-/:-@\[-`{-~]))"
 
 
 def _balanced_parens(depth):
@@ -1091,15 +1092,19 @@ def _balanced_parens(depth):
     return pattern
 
 
-# A bare destination may hold balanced parentheses (read here up to eight
-# levels deep).
-_DEST_BARE = r"(?:" + _DEST_CHAR + "|" + _balanced_parens(8) + r")+"
+# A bare destination may hold balanced parentheses up to 32 levels deep, as
+# in cmark-gfm (a deeper one makes the line text).
+_DEST_BARE = r"(?:" + _DEST_CHAR + "|" + _balanced_parens(32) + r")+"
 REFDEF_FULL_RE = re.compile(
     r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*\n?[ \t]*"
     r"(?:<(?:\\.|[^<>\n\\])*>|(?!<)" + _DEST_BARE + r")"
     r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
     r"(?:\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^()\\])*\)))?"
     r"[ \t]*(?:\n|$)")
+# A label, colon and destination on one line, for ``_not_a_definition``.
+_REFDEF_DEST_RE = re.compile(
+    r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*"
+    r"(?:(<(?:\\.|[^<>\n\\])*>)|(?!<)" + _DEST_BARE + r")")
 # The label of a definition, which may continue over lines.
 REFDEF_LABEL_RE = re.compile(r"[ ]{0,3}\[((?:\\[\s\S]|[^\[\]\\])+)\]:")
 # A line in a protected region or footnote that may be a definition: the
@@ -1334,8 +1339,12 @@ def _starts_block(body, in_paragraph):
     return False
 
 
-# Inner parses allowed per footnote definition (see ``footnote_end``).
+# Bounds on reading footnote content (see ``footnote_end``): parses per
+# definition, content lines parsed in all, at least this many and two per
+# line of the document, and definitions nested inside each other.
 FOOTNOTE_PARSE_LIMIT = 50
+FOOTNOTE_LINE_BUDGET = 5000
+FOOTNOTE_DEPTH_LIMIT = 8
 
 
 def _plain_text_line(text):
@@ -1367,12 +1376,7 @@ def _end_state(blocks, nlines):
         return b.ref or "closed"
     raw_lines = [_strip_quote(line, b.attrs.get("quote", 0)) for line in b.raw.split("\n")]
     if b.kind == "fence":
-        opener = _is_fence_open(raw_lines[0].lstrip(" "))
-        if opener and len(raw_lines) > 1:
-            cm = FENCE_CLOSE_RE.match(raw_lines[-1].lstrip(" "))
-            if cm and cm.group(1)[0] == opener[0] and len(cm.group(1)) >= len(opener):
-                return "closed"
-        return "raw_open"
+        return "closed" if b.attrs.get("fence_closed") else "raw_open"
     if b.kind == "html":
         end_re = _html_end_marker(raw_lines[0].lstrip(" "))
         if end_re is not None and not end_re.search("\n".join(raw_lines)):
@@ -1411,6 +1415,22 @@ def _html_end_marker(body):
     return None
 
 
+def _not_a_definition(line):
+    """Whether ``line``, which starts with a label and a colon, can only be
+    paragraph text: its destination is followed on the same line by a
+    character that cannot follow one (a parenthesis right after a bare
+    destination, which is unbalanced or nested too deep, or after spaces
+    something other than a title)."""
+    m = _REFDEF_DEST_RE.match(line)
+    if not m:
+        return False
+    rest = line[m.end():]
+    if m.group(1) is None and rest[:1] in ("(", ")"):
+        return True
+    after = rest.lstrip(" \t")
+    return after != rest and after[:1] not in ("", '"', "'", "(")
+
+
 def _read_definitions(content, parsed_only=False):
     """Read the reference definitions at the start of a paragraph whose
     lines are ``content`` (leading whitespace is ignored), as CommonMark
@@ -1418,7 +1438,8 @@ def _read_definitions(content, parsed_only=False):
     parsed) entries in line indices, and the index of the first line after
     them. A line that starts like a definition this parser cannot read is
     kept with the lines up to the next one that starts a definition, as an
-    unparsed definition. With ``parsed_only``, reading stops there instead
+    unparsed definition, unless it can only be text (``_not_a_definition``),
+    where reading stops. With ``parsed_only``, reading stops there instead
     (cmark-gfm checks a setext underline against the definitions it can
     read; a line it cannot read as one is paragraph text)."""
     parts = [line.lstrip(" \t") for line in content]
@@ -1436,7 +1457,7 @@ def _read_definitions(content, parsed_only=False):
             out.append((k, end, label, True))
             k = end
             continue
-        if parsed_only or not REFDEF_RE.match(parts[k]):
+        if parsed_only or not REFDEF_RE.match(parts[k]) or _not_a_definition(parts[k]):
             break
         end = k + 1
         while (end < len(parts) and not REFDEF_RE.match(parts[end])
@@ -1518,7 +1539,7 @@ def _expand_structure(line):
     return "".join(out) + line[m.end():]
 
 
-def parse_blocks(text, spec_blank_items=False, inner=False):
+def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     """Split Markdown or plain text into an ordered list of blocks.
 
     By default the parser follows cmark-gfm (GitHub). With
@@ -1528,7 +1549,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
     content column. ``check_document`` compares documents in that mode too
     when the difference applies, so a change must be safe under both.
     ``inner`` parses the content of a container (a footnote definition):
-    there is no front matter.
+    there is no front matter. ``_budget`` is shared by those inner parses
+    (see ``footnote_end``).
 
     List items are containers: a ``list_item`` block carries the marker, its
     nesting depth, and whether a blank line separates it from the previous
@@ -1546,6 +1568,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
     orig_lines = text.split("\n")
     lines = [_expand_structure(line) for line in orig_lines]
     n = len(lines)
+    # [content lines left to parse, definitions open around this parse]
+    budget = _budget if _budget is not None else [max(FOOTNOTE_LINE_BUDGET, 2 * n), 0]
     blocks = []
     i = 0
 
@@ -1685,7 +1709,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
         the closing fence, or the last line before the fence's blockquote or
         list item ends (fenced code has no lazy continuation lines). A
         closing fence is indented at most three columns past its container.
-        Blank and whitespace-only lines inside the container are code too."""
+        Blank and whitespace-only lines inside the container are code too.
+        Returns the index and whether a closing fence ends the block."""
         last = start - 1
         j = start
         while j < n:
@@ -1707,10 +1732,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
                 cm = FENCE_CLOSE_RE.match(rel.lstrip(" "))
                 if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == fence[0]
                         and len(cm.group(1)) >= len(fence)):
-                    return j
+                    return j, True
             last = j
             j += 1
-        return last
+        return last, False
 
     def html_end(start, quote, depth, base, body):
         """Index of the last line of the HTML block that starts on line
@@ -1769,35 +1794,52 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
         HTML and tables inside the definition count as they do outside.
         Blank lines at its end belong to it only when its content ends
         inside an unclosed fence or raw HTML block. Returns the index and
-        how the content ends (see ``_end_state``)."""
+        how the content ends (see ``_end_state``).
+
+        The content keeps each line's whitespace past the definition's
+        column; a blank line that is not empty (cmark-gfm then checks the
+        indentation of a definition nested inside) keeps at least one space.
+        A lazy line is paragraph text, but read again inside the content it
+        could start a block, a setext underline, a table delimiter row, or
+        (with its leading whitespace dropped) a header row with a different
+        number of cells; after such a line the state is "unread". It is
+        "unread" too past the bounds on parsing (``FOOTNOTE_PARSE_LIMIT``
+        parses per definition, a budget of content lines shared by every
+        parse of the document, ``FOOTNOTE_DEPTH_LIMIT`` nested
+        definitions). An "unread" definition keeps every lazy line and its
+        trailing blank lines byte for byte."""
         content = [first]
         last = start
-        pending = []
+        pending = []  # (index, text in the content)
         state = None  # cached: "paragraph", "raw_open", "closed" or "unread"
-        # Each inner parse reads the whole content, so their number is
-        # bounded. Past the bound the state is "unread": a lazy line then
-        # continues the definition and trailing blank lines belong to it,
-        # which only keeps more lines byte for byte.
         parses = [0]
+        unread = [False]
 
         def content_state():
-            if parses[0] >= FOOTNOTE_PARSE_LIMIT:
+            if (unread[0] or parses[0] >= FOOTNOTE_PARSE_LIMIT or budget[1] >= FOOTNOTE_DEPTH_LIMIT
+                    or budget[0] < len(content)):
+                unread[0] = True
                 return "unread"
             parses[0] += 1
-            return _content_end_state(content)
+            budget[0] -= len(content)
+            budget[1] += 1
+            try:
+                return _content_end_state(content)
+            finally:
+                budget[1] -= 1
 
         k = start + 1
         while k < n:
             if not lines[k]:
                 if quote:
                     break
-                pending.append(k)
+                pending.append((k, ""))
                 k += 1
                 continue
             if not lines[k].strip():
                 if quote or _indent_of(lines[k]) - base < 4:
                     break
-                pending.append(k)
+                pending.append((k, _past_container(lines[k], base + 4) or " "))
                 k += 1
                 continue
             kq = relocate_quotes(k, quote)
@@ -1808,7 +1850,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
             kb = _strip_quote(lines[k], kq)
             if kq == quote and _indent_of(kb) - base >= 4:
                 if not kb.strip():
-                    pending.append(k)
+                    pending.append((k, _past_container(kb, base + 4) or " "))
                     k += 1
                     continue
                 inner_line = _past_container(kb, base + 4)
@@ -1816,7 +1858,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
                 # paragraph wherever it sits, so the state needs no parse.
                 if pending or state != "paragraph" or not _plain_text_line(inner_line):
                     state = None
-                content.extend("" for _ in pending)
+                content.extend(text for _, text in pending)
                 pending = []
                 content.append(inner_line)
                 last = k
@@ -1831,20 +1873,26 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
             lazy = past_matched(kb, kq)
             if _starts_quote(lazy) or _starts_block(lazy, False):
                 break
+            if not _plain_text_line(lazy) or (lazy[:1] in (" ", "\t")
+                                              and lazy.lstrip(" \t").startswith("|")):
+                unread[0] = True
+                state = "unread"
             content.append(lazy.lstrip(" \t"))
             last = k
             k += 1
-        if state is None:
+        # Only a parse of footnote content reads the state of a definition
+        # that ends without trailing blank lines.
+        if state is None and (pending or inner):
             state = content_state()
         if pending:
             if state in ("raw_open", "unread"):
-                last = pending[-1]
+                last = pending[-1][0]
             else:
                 state = "closed"
         return last, state
 
     def _content_end_state(content):
-        inner_blocks = parse_blocks("\n".join(content), spec_blank_items, inner=True)
+        inner_blocks = parse_blocks("\n".join(content), spec_blank_items, inner=True, _budget=budget)
         return _end_state(inner_blocks, len(content))
 
     def emit_table(i, quote, depth, base, attrs):
@@ -2018,8 +2066,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
 
         fence = _is_fence_open(cbody)
         if fence:
-            end = fence_end(i + 1, quote, depth, base, fence)
-            blocks.append(Block("fence", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
+            end, closed = fence_end(i + 1, quote, depth, base, fence)
+            blocks.append(Block("fence", attrs(fence_closed=closed), "\n".join(lines[i:end + 1]), [],
+                                start_line))
             i = end + 1
             continue
 
@@ -2090,8 +2139,16 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
                 else:
                     next_body = _strip_quote(lines[i + 1], quote)
                     if not next_body.strip():
-                        ws_open = (_quote_depth(lines[i + 1])[0] == quote
-                                   and _indent_of(next_body) >= content_col)
+                        # cmark-gfm keeps the empty item open while each
+                        # blank line reaches its content column.
+                        ws_open = True
+                        j = i + 1
+                        while j < n and not _strip_quote(lines[j], quote).strip():
+                            if not (_quote_depth(lines[j])[0] == quote
+                                    and _indent_of(_strip_quote(lines[j], quote)) >= content_col):
+                                ws_open = False
+                                break
+                            j += 1
                         empty_item = spec_blank_items or not ws_open
             blocks.append(Block("list_item", {
                 "quote": quote,
@@ -2107,8 +2164,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
                 # An item may start with at most one blank line: one that
                 # starts empty and is followed by a blank line is empty, and
                 # what follows is outside it. cmark-gfm keeps the item open
-                # when that line holds whitespace up to the item's content
-                # column.
+                # when every blank line after it holds whitespace up to the
+                # item's content column.
                 level_stacks[quote].pop()
             # Read the rest of the marker line again as the item's first
             # content line, at the item's content column.
@@ -2226,9 +2283,15 @@ def parse_blocks(text, spec_blank_items=False, inner=False):
                 tables_off = True
             j += 1
         defs, rest = _read_definitions(content, parsed_only=bool(setext_level))
+        # cmark-gfm does not read definitions in the lines above a table's
+        # header row (they render as text), while markdown-it does: such a
+        # definition only possibly defines its label, and is marked, so a
+        # blank line added or removed before the header changes structure.
+        above_table = j in table_headers
         for first, last, label, parsed in defs:
-            ref = (normalize_label(label), parsed) if label is not None else None
-            blocks.append(Block("refdef", attrs(), "\n".join(lines[i + first:i + last]), [],
+            ref = (normalize_label(label), parsed and not above_table) if label is not None else None
+            marks = {"above_table": True} if above_table else {}
+            blocks.append(Block("refdef", attrs(**marks), "\n".join(lines[i + first:i + last]), [],
                                 i + first + 1, ref))
         if rest < len(content) and table_elsewhere:
             blocks.append(Block("table_raw", attrs(table_elsewhere=True), "\n".join(lines[i + rest:j]),

@@ -9,6 +9,7 @@ Multilingual fixtures use \\u escapes so this file stays ASCII-only.
 
 import os
 import sys
+import time
 
 sys.dont_write_bytecode = True
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1555,5 +1556,93 @@ for name, src, cand in [
 rejects("R3 a lazy line after plain footnote lines reworded",
         'See[^1].\n\n[^1]: Title\n    more\n    words\nRead prose.\n',
         'See[^1].\n\n[^1]: Title\n    more\n    words\nSee prose.\n')
+
+# Re-review of e769075: destinations follow cmark-gfm (32 levels of
+# parentheses, ASCII whitespace; a line that can only be text is text), a
+# lazy line that would read differently inside a footnote's content makes the
+# definition unread, blank lines keep their whitespace in the content, a fence
+# records its closing fence, and one budget bounds nested content parses.
+for name, src, cand in [
+        ('a destination nested nine parentheses deep changed',
+         '[ref]: a(((((((((word)))))))))\n===\n\n[ref]\n',
+         '[ref]: a(((((((((other)))))))))\n===\n\n[ref]\n'),
+        ('a destination nested 32 parentheses deep changed',
+         '[ref]: a((((((((((((((((((((((((((((((((word))))))))))))))))))))))))))))))))\n\n[ref]\n',
+         '[ref]: a((((((((((((((((((((((((((((((((other))))))))))))))))))))))))))))))))\n\n[ref]\n'),
+        ('a lazy line after a lazy setext-like line in a footnote reworded',
+         'See[^1].\n\n[^1]: Body.\n===\n        # Head\nRead prose.\n',
+         'See[^1].\n\n[^1]: Body.\n===\n        # Head\nSee prose.\n'),
+        ('a lazy line after a lazy delimiter-like line in a footnote reworded',
+         'See[^1].\n\n[^1]: Body.\n|---|\n        # Head\nRead prose.\n',
+         'See[^1].\n\n[^1]: Body.\n|---|\n        # Head\nSee prose.\n'),
+        ('a lazy line after an indented lazy fence-like line in a quoted footnote reworded',
+         'See[^1].\n\n> [^1]: Body.\n    ```\n>     more\nRead prose.\n',
+         'See[^1].\n\n> [^1]: Body.\n    ```\n>     more\nSee prose.\n'),
+        ('a lazy line after a lazy header row with leading whitespace in a footnote reworded',
+         'See[^1].\n\n[^1]: Body.\n | a |\n    |---|\nRead prose.\n',
+         'See[^1].\n\n[^1]: Body.\n | a |\n    |---|\nSee prose.\n'),
+        ('a lazy line after a whitespace line that keeps an empty item open in a footnote reworded',
+         'See[^1].\n\n[^1]: -\n      \n      Body.\n    ===\nRead prose.\n',
+         'See[^1].\n\n[^1]: -\n      \n      Body.\n    ===\nSee prose.\n'),
+        ('blank lines after an over-indented closing fence in a footnote changed',
+         'See[^1].\n\n[^1]: ```\n        ```\n\n\nRead prose.\n',
+         'See[^1].\n\n[^1]: ```\n        ```\n\nRead prose.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a definition-like line with a backslash before a space reworded',
+         '[ref]: /a\\ b\nRead prose.\n',
+         '[ref]: /a\\ b\nSee prose.\n'),
+        ('prose after a definition-like line nested 33 parentheses deep reworded',
+         '[ref]: a(((((((((((((((((((((((((((((((((w)))))))))))))))))))))))))))))))))\nRead prose.\n',
+         '[ref]: a(((((((((((((((((((((((((((((((((w)))))))))))))))))))))))))))))))))\nSee prose.\n'),
+        ('prose after a definition-like line with an unbalanced parenthesis reworded',
+         '[ref]: /a)b\nRead prose.\n',
+         '[ref]: /a)b\nSee prose.\n'),
+        ('prose after a whitespace line that ends a nested footnote reworded',
+         'See[^1][^2].\n\n[^1]: [^2]: note\n    \n        Body.\nRead prose.\n',
+         'See[^1][^2].\n\n[^1]: [^2]: note\n    \n        Body.\nSee prose.\n'),
+        ('prose after a closed fence in a footnote reworded',
+         'See[^1].\n\n[^1]: ```\n    ```\n\nRead prose.\n',
+         'See[^1].\n\n[^1]: ```\n    ```\n\nSee prose.\n')]:
+    accepts("R3 " + name, src, cand)
+rejects("R3 a lazy quote-marker-like line keeps the rest of a quoted footnote byte for byte",
+        "See[^1][^2].\n\n> [^1]: [^2]: note\n    >\n    [ref]: /url\n>     ---\nRead prose.\n",
+        "See[^1][^2].\n\n> [^1]: [^2]: note\n    >\n    [ref]: /url\n>     ---\nSee prose.\n")
+NESTED = "[^z]: x\n"
+for depth in range(20):
+    NESTED = ("[^n%d]: x\n" % depth + "".join("    " + line + "\n" for line in NESTED.splitlines())
+              + "lazy\n    - a\nlazy\n")
+CHAIN = "[^1]: " * 3000 + "note\n"
+for name, doc in (("twenty nested footnotes", NESTED), ("a chain of 3000 footnote labels", CHAIN)):
+    started = time.time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.time() - started < 2.0,
+           "%.2fs" % (time.time() - started))
+
+# Found by a footnote-content fuzz against cmark-gfm: an empty item stays open
+# only while every blank line after it reaches its content column, and a
+# definition above a table header is text in cmark-gfm (markdown-it reads it).
+for name, src, cand in [
+        ('a blank line that closes an empty item added after a whitespace line',
+         '>\n-\n    \n  \n    Alpha body.\nTail.\n          Beta body.\n',
+         '>\n-\n    \n  \n \n    Alpha body.\nTail.\n          Beta body.\n'),
+        ('a second whitespace line after an empty item narrowed',
+         '-\n  \n  \n  Alpha body.\n',
+         '-\n  \n \n  Alpha body.\n'),
+        ('a blank line added between a definition and a table header',
+         '[ref]: /url\nTail.\n  |---|\n',
+         '[ref]: /url\n\nTail.\n  |---|\n'),
+        ('a blank line removed between a definition and a table header',
+         '[ref]: /url\n\nTail.\n|---|\n',
+         '[ref]: /url\nTail.\n|---|\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose in an empty item kept open by whitespace lines reworded',
+         '-\n  \n  \n  Alpha body.\n',
+         '-\n  \n  \n  Delta body.\n'),
+        ('a header cell below a definition reworded',
+         '[ref]: /url\nRead prose.\n|---|\n',
+         '[ref]: /url\nSee prose.\n|---|\n')]:
+    accepts("R3 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)
