@@ -220,6 +220,12 @@ WORD_TOKEN_RE = re.compile(
     re.X | re.A,
 )
 
+# A run of ASCII letters, digits and path punctuation long enough to be a
+# hash, encoded data or a long identifier rather than a prose word. It is one
+# protected word: the word patterns would otherwise retry every alternative
+# at each position of the run, which takes time quadratic in its length.
+LONG_RUN_RE = re.compile(r"[\w@+.:/~-]{%d,}" % 48, re.A)
+
 # Slash pairs that are ordinary prose rather than paths.
 # Word pairs with a slash that are ordinary prose, not paths.
 PROSE_SLASH_PAIRS = frozenset([
@@ -717,6 +723,11 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         found.append((m.start(), "url", url))
         _mask(chars, m.start(), m.start() + len(url))
 
+    for m in LONG_RUN_RE.finditer(current()):
+        value = m.group(0).rstrip(".:,;-")
+        found.append((m.start(), "word", value))
+        _mask(chars, m.start(), m.start() + len(value))
+
     # Hide underscore emphasis delimiters from the identifier patterns so
     # "_some text_" stays prose, then restore them for the emphasis count.
     # Dunder names such as "__init__" stay identifiers.
@@ -1076,35 +1087,64 @@ REFDEF_RE = re.compile(r"^[ ]{0,3}\[(?!\^)(?:\\[\s\S]|[^\[\]\\])+\]:")
 REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # A complete definition: label, colon, destination (on the same or the next
 # line) and an optional title, which may start on the next line and continue
-# over several lines. It must end at the end of a line.
-# A character of a bare link destination: an escaped ASCII punctuation
-# character, any other character except ASCII whitespace and parentheses
-# (cmark-gfm ends a destination only there), or a backslash that escapes
-# nothing (a backslash before a space does not make the space part of the
-# destination).
-_DEST_CHAR = r"(?:\\[!-/:-@\[-`{-~]|[^ \t\n\x0b\x0c\r()\\]|\\(?![!-/:-@\[-`{-~]))"
-
-
-def _balanced_parens(depth):
-    pattern = r"\((?:" + _DEST_CHAR + r")*\)"
-    for _ in range(depth - 1):
-        pattern = r"\((?:" + _DEST_CHAR + "|" + pattern + r")*\)"
-    return pattern
-
-
-# A bare destination may hold balanced parentheses up to 32 levels deep, as
-# in cmark-gfm (a deeper one makes the line text).
-_DEST_BARE = r"(?:" + _DEST_CHAR + "|" + _balanced_parens(32) + r")+"
-REFDEF_FULL_RE = re.compile(
-    r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*\n?[ \t]*"
-    r"(?:<(?:\\.|[^<>\n\\])*>|(?!<)" + _DEST_BARE + r")"
+# over several lines. It must end at the end of a line. ``_match_definition``
+# reads it as cmark-gfm does; the destination needs a scanner of its own.
+_REFDEF_HEAD_RE = re.compile(r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*\n?[ \t]*")
+_POINTY_DEST_RE = re.compile(r"<(?:\\.|[^<>\n\\])*>")
+# An optional title, separated from the destination by spaces or a line end,
+# then the end of the line (a backslash before the closing delimiter is a
+# backslash, as in cmark-gfm). Without a title that ends its line, the
+# destination must end the line itself.
+_REFDEF_TAIL_RE = re.compile(
     r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
-    r"(?:\"(?:\\[\s\S]|[^\"\\])*\"|'(?:\\[\s\S]|[^'\\])*'|\((?:\\[\s\S]|[^()\\])*\)))?"
+    r"(?:\"(?:\\[\s\S]|\\|[^\"\\])*\"|'(?:\\[\s\S]|\\|[^'\\])*'|\((?:\\[\s\S]|\\|[^()\\])*\)))?"
     r"[ \t]*(?:\n|$)")
-# A label, colon and destination on one line, for ``_not_a_definition``.
-_REFDEF_DEST_RE = re.compile(
-    r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*"
-    r"(?:(<(?:\\.|[^<>\n\\])*>)|(?!<)" + _DEST_BARE + r")")
+_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+_ASCII_SPACE = frozenset(" \t\n\x0b\x0c\r")
+
+
+def _scan_destination(text, pos):
+    """End of the link destination that starts at ``pos``, or None, as
+    cmark-gfm scans one: inside angle brackets, or a bare run that ends at
+    ASCII whitespace or at a closing parenthesis with none open. A backslash
+    escapes ASCII punctuation; at most 32 parentheses may be open, and
+    parentheses still open where the run ends are allowed."""
+    if text.startswith("<", pos):
+        m = _POINTY_DEST_RE.match(text, pos)
+        return m.end() if m else None
+    i, depth = pos, 0
+    while i < len(text):
+        ch = text[i]
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in _ASCII_PUNCT:
+            i += 2
+            continue
+        if ch == "(":
+            depth += 1
+            if depth > 32:
+                return None
+        elif ch == ")":
+            if depth == 0:
+                break
+            depth -= 1
+        elif ch in _ASCII_SPACE:
+            break
+        i += 1
+    return i if i > pos else None
+
+
+def _match_definition(text):
+    """End of the definition at the start of ``text`` (after the newline
+    that ends it), or None when it is not one."""
+    m = _REFDEF_HEAD_RE.match(text)
+    if not m:
+        return None
+    end = _scan_destination(text, m.end())
+    if end is None:
+        return None
+    tail = _REFDEF_TAIL_RE.match(text, end)
+    return tail.end() if tail else None
+
+
 # The label of a definition, which may continue over lines.
 REFDEF_LABEL_RE = re.compile(r"[ ]{0,3}\[((?:\\[\s\S]|[^\[\]\\])+)\]:")
 # A line in a protected region or footnote that may be a definition: the
@@ -1356,6 +1396,23 @@ def _plain_text_line(text):
                             or _is_table_sep(t))
 
 
+# A content line that may start a reference definition, after any quote and
+# list markers.
+MAYBE_REFDEF_LINE_RE = re.compile(r"^[ \t>]*(?:(?:[-+*]|\d{1,9}[.)])[ \t]+)*\[(?!\^)")
+
+
+def _lazy_stand_in(lazy):
+    """Plain text that continues a paragraph as the lazy line ``lazy`` does
+    in cmark-gfm, with as many cells if it ends up a table's header row (the
+    line keeps its leading whitespace there, so a pipe after it opens an
+    empty first cell)."""
+    body = lazy.lstrip(" \t")
+    cells = len(_split_cells(body))
+    if body != lazy and body.startswith("|"):
+        cells += 1
+    return "|".join(["x"] * cells)
+
+
 def _end_state(blocks, nlines):
     """How the last of ``nlines`` lines parsed into ``blocks`` leaves its
     content: "paragraph" when it ends in a paragraph that a lazy line may
@@ -1417,18 +1474,25 @@ def _html_end_marker(body):
 
 def _not_a_definition(line):
     """Whether ``line``, which starts with a label and a colon, can only be
-    paragraph text: its destination is followed on the same line by a
-    character that cannot follow one (a parenthesis right after a bare
-    destination, which is unbalanced or nested too deep, or after spaces
-    something other than a title)."""
-    m = _REFDEF_DEST_RE.match(line)
+    paragraph text whatever follows it: a destination starts on the line
+    and cannot be read, or is followed on the line by something other than
+    spaces and the start of a title."""
+    m = REFDEF_LABEL_RE.match(line)
     if not m:
         return False
-    rest = line[m.end():]
-    if m.group(1) is None and rest[:1] in ("(", ")"):
+    pos = m.end()
+    while pos < len(line) and line[pos] in " \t":
+        pos += 1
+    if pos == len(line):
+        return False
+    end = _scan_destination(line, pos)
+    if end is None:
         return True
+    rest = line[end:]
     after = rest.lstrip(" \t")
-    return after != rest and after[:1] not in ("", '"', "'", "(")
+    if not after:
+        return False
+    return after == rest or after[0] not in "\"'("
 
 
 def _read_definitions(content, parsed_only=False):
@@ -1449,11 +1513,11 @@ def _read_definitions(content, parsed_only=False):
         if FOOTNOTE_DEF_RE.match(parts[k]) or not REFDEF_START_RE.match(parts[k]):
             break
         joined = "\n".join(parts[k:])
-        dm = REFDEF_FULL_RE.match(joined)
+        dm = _match_definition(joined)
         lm = REFDEF_LABEL_RE.match(joined)
         label = lm.group(1) if lm else None
-        if dm:
-            end = k + joined[:dm.end()].rstrip("\n").count("\n") + 1
+        if dm is not None:
+            end = k + joined[:dm].rstrip("\n").count("\n") + 1
             out.append((k, end, label, True))
             k = end
             continue
@@ -1800,14 +1864,19 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         column; a blank line that is not empty (cmark-gfm then checks the
         indentation of a definition nested inside) keeps at least one space.
         A lazy line is paragraph text, but read again inside the content it
-        could start a block, a setext underline, a table delimiter row, or
-        (with its leading whitespace dropped) a header row with a different
-        number of cells; after such a line the state is "unread". It is
-        "unread" too past the bounds on parsing (``FOOTNOTE_PARSE_LIMIT``
-        parses per definition, a budget of content lines shared by every
-        parse of the document, ``FOOTNOTE_DEPTH_LIMIT`` nested
-        definitions). An "unread" definition keeps every lazy line and its
-        trailing blank lines byte for byte."""
+        could start a block, a setext underline or a table delimiter row, or
+        (with its leading whitespace dropped) be a header row with a
+        different number of cells. Such a line enters the content as plain
+        text with the same number of cells (``_lazy_stand_in``), unless the
+        content may hold a reference definition, whose reading depends on
+        the text; then the state is "unread". It is "unread" too past the
+        bounds on parsing (``FOOTNOTE_PARSE_LIMIT`` parses per definition,
+        a budget of content lines shared by every parse of the document,
+        ``FOOTNOTE_DEPTH_LIMIT`` nested definitions). Whether an "unread"
+        definition continues on a lazy line is not known, and that line
+        decides how the lines after it read, so the definition then runs to
+        the end of the text, kept byte for byte. Its trailing blank lines
+        belong to it too."""
         content = [first]
         last = start
         pending = []  # (index, text in the content)
@@ -1866,18 +1935,23 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 continue
             if pending or not kb.strip():
                 break
-            if state is None:
-                state = content_state()
-            if state not in ("paragraph", "unread"):
-                break
             lazy = past_matched(kb, kq)
             if _starts_quote(lazy) or _starts_block(lazy, False):
                 break
+            if state is None:
+                state = content_state()
+            if state == "unread":
+                return n - 1, state
+            if state != "paragraph":
+                break
             if not _plain_text_line(lazy) or (lazy[:1] in (" ", "\t")
                                               and lazy.lstrip(" \t").startswith("|")):
-                unread[0] = True
-                state = "unread"
-            content.append(lazy.lstrip(" \t"))
+                if any(MAYBE_REFDEF_LINE_RE.match(line) for line in content):
+                    unread[0] = True
+                    return n - 1, "unread"
+                content.append(_lazy_stand_in(lazy))
+            else:
+                content.append(lazy.lstrip(" \t"))
             last = k
             k += 1
         # Only a parse of footnote content reads the state of a definition
@@ -2293,6 +2367,25 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             marks = {"above_table": True} if above_table else {}
             blocks.append(Block("refdef", attrs(**marks), "\n".join(lines[i + first:i + last]), [],
                                 i + first + 1, ref))
+        if defs and rest == len(content) and depth > 0 and j < n and not _strip_quote(lines[j], quote).strip():
+            # cmark-gfm drops a paragraph of definitions when the blank line
+            # after it closes it. A list item that held nothing else is then
+            # empty again, and stays open only while each further blank line
+            # reaches its content column.
+            empty = False
+            for b in reversed(blocks):
+                if b.kind == "list_item" and b.attrs.get("quote") == quote and b.attrs.get("depth") == depth - 1:
+                    empty = True
+                    break
+                if b.kind != "refdef":
+                    break
+            m = j + 1
+            while empty and m < n and not _strip_quote(lines[m], quote).strip():
+                if not (_quote_depth(lines[m])[0] == quote
+                        and _indent_of(_strip_quote(lines[m], quote)) >= base):
+                    level_stacks[quote].pop()
+                    break
+                m += 1
         if rest < len(content) and table_elsewhere:
             blocks.append(Block("table_raw", attrs(table_elsewhere=True), "\n".join(lines[i + rest:j]),
                                 [], i + rest + 1))
