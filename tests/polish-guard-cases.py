@@ -2923,4 +2923,86 @@ for name, src, cand in [
          '- > [docs]: /guide\n  See `old\n===\n  2. text`\n')]:
     accepts("R3 " + name, src, cand)
 
+# (A setext underline after markdown-it's lazy paragraph is part of the
+# reading shape; which line of which span is lazy is recorded, with code
+# spans and raw HTML read from left to right; the indentation of a list
+# item only markdown-it opens is structure, and a marker outside its
+# column ends its paragraph; a definition cmark-gfm may take at a setext
+# underline counts; an unknown range and an underline in a lazy run freeze
+# what markdown-it reads after them; a stray backtick, and brackets next to
+# code, are markup.)
+for name, src, cand in [
+        ('a blank line added between a lazy paragraph and an underline after a definition',
+         '> [docs]: /guide\nRead the guide.\n---\n',
+         '> [docs]: /guide\nRead the guide.\n\n---\n'),
+        ('a lazy attribute line swapped while the prose before it is reflowed',
+         '> Read this\n> <span title="Read\n these\n>  notes">tip</span> here.\n',
+         '> Read this <span title="Read\n>  these\n notes">tip</span> here.\n'),
+        ('a quote marker added inside a code span after a tag holding a backtick',
+         '> Read <span title="`">the note</span> and `echo\n hello` now.\n',
+         '> Read <span title="`">the note</span> and `echo\n>  hello` now.\n'),
+        ('a list item only markdown-it opens indented into the item before it',
+         '[docs]: /guide\n2. Read the guide.\n3. Read the notes.\n',
+         '[docs]: /guide\n2. Read the guide.\n   3. Read the notes.\n'),
+        ('the title of a definition cmark-gfm takes at a setext underline changed',
+         'See [the reference][r].\n\n- > [a]: /guide\n  [r]: file:///guide "Old title"\n  > ===\n',
+         'See [the reference][r].\n\n- > [a]: /guide\n  [r]: file:///guide "New title"\n  > ===\n'),
+        ('a code span markdown-it continues after an unknown line changed',
+         '- 1. [docs]: /guide\n    Run `echo\n  2. old` now.\n',
+         '- 1. [docs]: /guide\n    Run `echo\n  2. new` now.\n'),
+        ('indented code after an underline that ends a lazy run changed',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n    Run old code.\n',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n    Run new code.\n'),
+        ('the indentation of a list marker only markdown-it reads changed',
+         '[docs]: /guide\n2. # guide*\n   ===\n3. Use `a\n4. # guide*\n',
+         '[docs]: /guide\n 2. # guide*\n   ===\n3. Use `a\n4. # guide*\n'),
+        ('an underline after a paragraph that a list marker outside its item ends changed',
+         '[docs]: /guide\n2. b` here\n3. # Read *the\n   more words\n4. notes* here.\n---\n',
+         '[docs]: /guide\n2. b` here\n3. # Read *the\n   more words\n4. notes* here.\n--\n'),
+        ('the indentation of an underline below a heading item changed',
+         '[docs]: /guide\n2. Read <span title="a\n3. # Read *the\n   ===\n4. notes* here.\n===\n',
+         '[docs]: /guide\n2. Read <span title="a\n3. # Read *the\n===\n   4. notes* here.\n===\n'),
+        ('a paragraph moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2. # guide*\n3. Read *the guide*.\n4. plain words\n5. # guide*\n   c` end\n',
+         '[docs]: /guide\n2. # guide*\n3. Read *the guide*.\n4. plain words\n5. # guide*\n c` end\n'),
+        ('a code span word changed where markdown-it reads past nested quotes',
+         '- > > [docs]: /guide\nRead ``echo `alpha\n      ---\n    2. text`\n',
+         '- > > [docs]: /guide\nRead ``echo `zeta\n      ---\n    2. text`\n'),
+        ('whitespace inside a code span after an underline below a heading item changed',
+         '1. [docs]: /guide\n   2. # Read *the\n   ===\n   3. Read *the guide*.\n   4. b` here\n   5. Read *the guide\n   c` end\n',
+         '1. [docs]: /guide\n   2. # Read *the\n   ===\n   3. Read *the guide*.\n   4. b` here\n   5. Read *the guide\n    c` end\n'),
+        ('a stray backtick removed after an unclosed bracket',
+         'Read [alpha `a` and `b x\n',
+         'Read [alpha `a` and b x\n'),
+        ('a bracket added before code spans',
+         '> > Read <!-- alpha here\n> >  beta">x</a>\n> more beta` then `c` words\n',
+         '> > Read <!-- alpha here\n> >  beta"[x</a>\n> more beta` then `c` words\n'),
+        ('whitespace inside a code span of a paragraph markdown-it reads after list items',
+         '[docs]: /guide\n2. Read *the guide*.\nc` end\n3. # guide*\nc` end\n4. # guide*\n5. Read *the guide*.\nc` end\n',
+         '[docs]: /guide\n2. Read *the guide*.\nc` end\n3. # guide*\nc` end\n4. # guide*\n 5. Read *the guide*.\nc` end\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose reflowed before a code span with a lazy line',
+         '> Read these notes and use\n> the command `echo\n hello` to proceed.\n',
+         '> Read these notes\n> and use\n> the command `echo\n hello` to proceed.\n'),
+        ('prose reflowed after a closed code span holding a tag start',
+         '> Use `<span` to start,\n then follow the guide.\n',
+         '> Use `<span` to start, then follow the guide.\n'),
+        ('emphasis moved with its words over a numbered line markdown-it keeps in the item',
+         '[docs]: /guide\n2. For *the guide*, see section\n   3. before starting.\n',
+         '[docs]: /guide\n2. See section\n   3. of *the guide* before starting.\n'),
+        ('prose before an underline after a definition reworded',
+         '> [docs]: /guide\nRead the guide.\n---\n',
+         '> [docs]: /guide\nSee the guide.\n---\n'),
+        ('prose around a definition cmark-gfm takes at an underline reworded',
+         'See [the reference][r].\n\n- > [a]: /guide\n  [r]: file:///guide "Old title"\n  > ===\n',
+         'Read [the reference][r].\n\n- > [a]: /guide\n  [r]: file:///guide "Old title"\n  > ===\n'),
+        ('prose of a heading markdown-it reads over a heading item reworded',
+         '> [docs]: /guide\nRead the guide\n2. # Notes\n===\n    Run old code.\n',
+         '> [docs]: /guide\nSee the guide\n2. # Notes\n===\n    Run old code.\n'),
+        ('prose next to a stray backtick reworded',
+         'Use `a` and `b x here.\n',
+         'See `a` and `b x here.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
