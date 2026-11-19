@@ -29,6 +29,7 @@ This module performs no I/O and uses only the Python standard library.
 import html
 import html.entities
 import html.parser
+import hashlib
 import re
 import unicodedata
 
@@ -203,13 +204,13 @@ WORD_TOKEN_RE = re.compile(
     r"""
       (?P<path>(?<![\w./~-])(?:(?:~[\w.-]*|\.{1,2})?/[\w@+.-]+(?:/[\w@+.-]*)*
                                 |[\w@+.-]+(?:/[\w@+.-]*)+))
-    | (?P<call>[A-Za-z_][\w.]*\(\))
-    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\))?)
+    | (?P<call>[A-Za-z_][\w.]*\(\)(?:\.\w+(?:\(\))?)*)
+    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\)(?:\.\w+(?:\(\))?)*)?)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
     | (?P<qty>(?<![\w.])\d+(?:\.\d+)?
-        [ \t]*(?:\n[ \t]*)?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
+        [ \t\u00a0\u2007\u2009\u200a\u202f]*(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
                |months?|years?|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz
                |s|h|d|B|k|K|M|G|x|%)
         (?![\w%]))
@@ -227,7 +228,8 @@ WORD_TOKEN_RE = re.compile(
 # otherwise retry every alternative at each position of the run, which takes
 # time quadratic in its length.
 LONG_RUN_RE = re.compile(
-    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)|\}|(?<=\d)[ \t]*(?:\n[ \t]*)?"
+    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)|\}|(?<=\d)[ \t\u00a0\u2007\u2009\u200a\u202f]*"
+    r"(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?"
     r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
     r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)(?![\w%]))?",
     re.A)
@@ -432,7 +434,7 @@ def _scan_links(text, resolve=None, original=None):
                 if not label and not re.search(r"[\[\]]", text[i + 1:close]):
                     label = original[i + 1:close]
                 inner, inner_unmodeled = _scan_links(text[i + 1:close], resolve, original[i + 1:close])
-                if (_label_ok(label) and resolve(label) == "yes"
+                if (resolve(label, _label_ok(label)) == "yes"
                         and not any(k == "link" for _, _, _, _, k, _ in inner)):
                     for (a, b, c, d, kind, target) in inner:
                         links.append((a + i + 1, b + i + 1, c + i + 1, d + i + 1, kind, target))
@@ -522,14 +524,18 @@ def _scan_refs(masked, original, resolve, offset=0):
         text_label = None if re.search(r"[\[\]]", masked[i + 1:close]) else original[i + 1:close]
         end = close + 1
         label = text_label
+        cm_valid = True
         second = _ref_label_close(masked, end) if end < n and masked[end] == "[" else None
         if second is not None:
             # "[text][label]" (full) or "[text][]" (collapsed). A label of
-            # only whitespace is not a label, and the text is no link.
+            # only whitespace is not a label for cmark-gfm, and the text is
+            # no link there; markdown-it may still read the label (it has no
+            # length limit, and other whitespace is whitespace to it).
             inner = original[end + 1:second]
-            label = inner if _label_ok(inner) else (text_label if not inner else None)
+            if inner:
+                label, cm_valid = inner, _label_ok(inner)
             end = second + 1
-        status = resolve(label) if label is not None and _label_ok(label) else "no"
+        status = resolve(label, cm_valid and _label_ok(label)) if label is not None else "no"
         if status == "no":
             i += 1
             continue
@@ -621,13 +627,20 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     found = []
     unhide = []
 
-    def resolve(label):
+    def resolve(label, cm_valid=True):
+        """"yes", "maybe" or "no": whether a reference label resolves. Where
+        cmark-gfm and markdown-it resolve it differently, it may."""
         if refs is None:
             return "maybe"
-        norm = normalize_label(label)
-        if norm in refs[0]:
-            return "yes"
-        return "maybe" if norm in refs[1] else "no"
+        cm = "no"
+        if cm_valid:
+            norm = normalize_label(label)
+            cm = "yes" if norm in refs[0] else ("maybe" if norm in refs[1] else "no")
+        if len(refs) < 4:
+            return cm
+        key = mdit_label_key(label)
+        md = "yes" if key and key in refs[2] else ("maybe" if key and key in refs[3] else "no")
+        return cm if cm == md else "maybe"
 
     def current():
         return "".join(chars)
@@ -674,11 +687,25 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         # every combination is checked.
         spans = [(ls, le, kind, "yes", None) for _, ls, le, _, kind, _ in links]
         spans += _scan_refs(current(), text, resolve)
+        # The statuses of the links inside each link, found in one pass over
+        # the spans sorted by start (bracket spans nest or stay apart), so
+        # many links in one paragraph take linear time.
+        order = sorted(range(len(spans)), key=lambda k: (spans[k][0], -spans[k][1]))
+        inside = {}
+        for pos, k in enumerate(order):
+            ls, le = spans[k][0], spans[k][1]
+            found_inner = []
+            nxt = pos + 1
+            while nxt < len(order) and spans[order[nxt]][0] <= le:
+                sp = spans[order[nxt]]
+                if sp[2] == "link" and sp[1] <= le and (sp[0], sp[1]) != (ls, le):
+                    found_inner.append(sp[3])
+                nxt += 1
+            inside[k] = found_inner
         nested = 0
-        for ls, le, kind, status, key in spans:
+        for k, (ls, le, kind, status, key) in enumerate(spans):
             if kind == "link":
-                inner = [s[3] for s in spans
-                         if s[2] == "link" and ls <= s[0] and s[1] <= le and (s[0], s[1]) != (ls, le)]
+                inner = inside[k]
                 if "yes" in inner:
                     continue
                 if inner:
@@ -703,7 +730,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         # The reference label is protected. When it does not resolve, the
         # brackets are text and its emphasis markers pair with others; when
         # it may resolve, it is also a possible boundary.
-        status = resolve(m.group(3))
+        status = resolve(m.group(3), _label_ok(m.group(3)))
         if status != "yes":
             unhide.extend((k, snapshot[k]) for k in range(m.end(2), m.end()) if snapshot[k] in "*_~")
             if status == "maybe" and maybe is not None:
@@ -998,11 +1025,17 @@ def emphasis_structure(original, masked, labels=(), gfm=True):
         children[idx] = []
         open_spans.append(idx)
 
-    def describe(idx):
-        inner = sorted(describe(c) for c in children[idx])
-        return spans[idx][2] + "(" + ",".join(inner) + ")"
-
-    forest = sorted(describe(c) for c in children[None])
+    # Describe each span after its children (they come later in the sorted
+    # order), without recursion: markdown-it nests one strikethrough per
+    # "~~" of a long run. A long description is replaced by its digest, so
+    # deep nesting stays linear in size.
+    desc = {}
+    for idx in range(len(spans) - 1, -1, -1):
+        text = spans[idx][2] + "(" + ",".join(sorted(desc.pop(c) for c in children[idx])) + ")"
+        if len(text) > 200:
+            text = spans[idx][2] + "#" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+        desc[idx] = text
+    forest = sorted(desc[c] for c in children[None])
     return forest, sorted(literal.items())
 
 
@@ -2480,7 +2513,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         # blank line added or removed before the header changes structure.
         above_table = j in table_headers
         for first, last, label, parsed in defs:
-            ref = (normalize_label(label), parsed and not above_table) if label is not None else None
+            ref = ((normalize_label(label), parsed and not above_table, mdit_label_key(label))
+                   if label is not None else None)
             marks = {"above_table": True} if above_table else {}
             blocks.append(Block("refdef", attrs(**marks), "\n".join(lines[i + first:i + last]), [],
                                 i + first + 1, ref))
@@ -2533,19 +2567,41 @@ def normalize_label(label):
     return " ".join(re.split(r"[ \t\n\r]+", label.strip(LABEL_SPACE))).casefold()
 
 
+def mdit_label_key(label):
+    """A link label as markdown-it matches it: every kind of whitespace
+    trimmed and collapsed, then lowered and uppercased. Empty when
+    markdown-it takes it as no label."""
+    return re.sub(r"\s+", " ", label.strip()).lower().upper()
+
+
 def reference_labels(blocks):
-    """The link reference labels a document defines, as (definite, possible):
-    labels of definitions the parser read, and labels that may be defined
-    (in a polish:off region, a footnote, or a definition the parser could
-    not read in full)."""
+    """The link reference labels a document defines, as (definite, possible)
+    for cmark-gfm followed by (definite, possible) for markdown-it: labels
+    of definitions the parser read, and labels that may be defined (in a
+    polish:off region, a footnote, a definition the parser could not read
+    in full, or a definition-like line at the start of a paragraph that
+    markdown-it may read as a definition, such as one with a label over
+    1000 bytes)."""
     definite, possible = set(), set()
+    md_definite, md_possible = set(), set()
     for block in blocks:
         if block.kind == "refdef" and block.ref:
             (definite if block.ref[1] else possible).add(block.ref[0])
+            if block.ref[2]:
+                (md_definite if block.ref[1] else md_possible).add(block.ref[2])
         elif block.kind in ("protected", "footnote_def"):
             for m in LOOSE_REFDEF_RE.finditer(block.raw):
                 possible.add(normalize_label(m.group(1)))
-    return definite, possible - definite
+                md_possible.add(mdit_label_key(m.group(1)))
+        elif block.kind == "paragraph":
+            # Definitions are read only from the start of a paragraph.
+            for line in block.raw.split("\n"):
+                m = LOOSE_REFDEF_RE.match(line)
+                if not m:
+                    break
+                md_possible.add(mdit_label_key(m.group(1)))
+    md_possible.discard("")
+    return definite, possible - definite, md_definite, md_possible - md_definite
 
 
 def prose_block_count(text):

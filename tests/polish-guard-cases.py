@@ -1848,4 +1848,55 @@ for name, src, cand in [
          'Open __init__ first.\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of 8ab2ac4: references resolve the markdown-it way too, deep
+# strikethrough nesting is described without recursion, member names after
+# a call are part of it, and a unit may follow a no-break or thin space.
+for name, src, cand in [
+        ('emphasis lost where markdown-it does not resolve a no-break space label',
+         'Read [*a][\u00a0] b* now.\n\n[\u00a0]: /u\n',
+         'Read [*a][\u00a0] *b now.\n\n[\u00a0]: /u\n'),
+        ('emphasis lost where markdown-it does not resolve a vertical tab label',
+         'Read [*a][\x0b] b* now.\n\n[\x0b]: /u\n',
+         'Read [*a][\x0b] *b now.\n\n[\x0b]: /u\n'),
+        ('emphasis lost where only markdown-it matches a label with a no-break space',
+         'Read [*a][a b] b* now.\n\n[a\u00a0b]: /u\n',
+         'Read [*a][a b] *b now.\n\n[a\u00a0b]: /u\n'),
+        ('emphasis lost where only markdown-it takes a label over 1000 bytes',
+         'Read [*a][' + 'a' * 1001 + '] b* now.\n\n[' + 'a' * 1001 + ']: /u\n',
+         'Read [*a][' + 'a' * 1001 + '] *b now.\n\n[' + 'a' * 1001 + ']: /u\n'),
+        ('the member name after a scoped call changed',
+         'Call config::module.run().field now.\n',
+         'Call config::module.run().other now.\n'),
+        ('the member name after a call changed',
+         'Call obj.load().parse().value now.\n',
+         'Call obj.load().parse().other now.\n'),
+        ('a unit after a no-break space changed',
+         'Wait 30\u00a0ms now.\n',
+         'Wait 30\u00a0ns now.\n'),
+        ('a unit after a narrow no-break space changed',
+         'Wait 30\u202fms now.\n',
+         'Wait 30\u202fns now.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose around 4096 tildes on each side of a word reworded',
+         'Read ' + '~' * 4096 + 'word' + '~' * 4096 + ' now.\n',
+         'See ' + '~' * 4096 + 'word' + '~' * 4096 + ' now.\n'),
+        ('prose around deeply nested strikethrough reworded',
+         'Read ' + '~~a ' * 3000 + 'b' + ' a~~' * 3000 + ' now.\n',
+         'See ' + '~~a ' * 3000 + 'b' + ' a~~' * 3000 + ' now.\n'),
+        ('the space before a unit turned into a no-break space',
+         'Wait 30 ms now.\n',
+         'Wait 30\u00a0ms now.\n'),
+        ('prose after a call ending a sentence reworded',
+         'Call run(). Then stop.\n',
+         'Call run(). Then halt.\n')]:
+    accepts("R3 " + name, src, cand)
+started = time.time()
+accepts("R3 a paragraph of 16000 reference links unchanged",
+        "[x][a b] and [y][c] " * 8000 + "\n\n[a b]: /u\n[c]: /v\n",
+        "[x][a b] and [y][c] " * 8000 + "\n\n[a b]: /u\n[c]: /v\n")
+report("R3 a paragraph of 16000 reference links checked within three seconds",
+       time.time() - started < 3.0, "%.2fs" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
