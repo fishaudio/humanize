@@ -2043,4 +2043,46 @@ for name, src, cand in [
          'See [*the guide][r] carefully* today.\n\n[r]: /guide "Guide"\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of 1ffae14: markdown-it reads definitions one by one from the
+# start of a paragraph and stops at the first it does not take, it rejects
+# script and data destinations, the underline below definitions is read
+# relative to its container, frozen long-label paragraphs and headings
+# define every label markdown-it reads there, and calls may follow calls.
+LONG2 = 'a' * 600 + '\n' + 'b' * 500
+for name, src, cand in [
+        ('an inline link after a definition markdown-it does not take changed',
+         'Read [guide][r](alpha) now.\n\n[a]: /guide "C:\\"\n[r]: /reference\n',
+         'Read [guide][r](delta) now.\n\n[a]: /guide "C:\\"\n[r]: /reference\n'),
+        ('an inline link next to a data definition changed',
+         'Read [sample][r](alpha) now.\n\n[r]: data:text/plain,hello\n',
+         'Read [sample][r](delta) now.\n\n[r]: data:text/plain,hello\n'),
+        ('an inline link next to a script definition changed',
+         'Read [sample][r](alpha) now.\n\n[r]: javascript:alert(1)\n',
+         'Read [sample][r](delta) now.\n\n[r]: javascript:alert(1)\n'),
+        ('a thematic break below a definition in a nested list shortened',
+         '- Outer.\n  - [r]: /guide\n    ---\n    Read prose.\n',
+         '- Outer.\n  - [r]: /guide\n    --\n    Read prose.\n'),
+        ('emphasis moved into a reference defined after a long label',
+         'Read [*the guide][r] carefully* now.\n\n[' + LONG2 + ']: /unused\n[r]: /guide\n',
+         'Read [*the guide*][r] carefully now.\n\n[' + LONG2 + ']: /unused\n[r]: /guide\n'),
+        ('emphasis moved into a reference defined above an underline after a long label',
+         'Read [*the guide][r] carefully* now.\n\n[' + LONG2 + ']: /unused\n[r]: /guide\n---\n',
+         'Read [*the guide*][r] carefully now.\n\n[' + LONG2 + ']: /unused\n[r]: /guide\n---\n'),
+        ('the second call of a call removed',
+         'Call factory()() to create the object.\n',
+         'Call factory() to create the object.\n'),
+        ('the member after two calls changed',
+         'Read factory()().value now.\n',
+         'Read factory()().other now.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose before a parenthetical with an indented continuation definition reworded',
+         'Read [guide][r](see examples) now.\n\n- [a]: /intro\n    [r]: /guide\n',
+         'See [guide][r](see examples) now.\n\n- [a]: /intro\n    [r]: /guide\n'),
+        ('prose next to a reference with a data image definition reworded',
+         'Read [*the logo][r] here* now.\n\n[r]: data:image/png;base64,AAAA\n',
+         'See [*the logo][r] here* today.\n\n[r]: data:image/png;base64,AAAA\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)

@@ -206,8 +206,8 @@ WORD_TOKEN_RE = re.compile(
     r"""
       (?P<path>(?<![\w./~-])(?:(?:~[\w.-]*|\.{1,2})?/[\w@+.-]+(?:/[\w@+.-]*)*
                                 |[\w@+.-]+(?:/[\w@+.-]*)+))
-    | (?P<call>[A-Za-z_][\w.]*\(\)(?:(?:\.|::)\w+(?:\(\))?)*)
-    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\)(?:(?:\.|::)\w+(?:\(\))?)*)?)
+    | (?P<call>[A-Za-z_][\w.]*\(\)(?:\(\)|(?:\.|::)\w+)*)
+    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\)(?:\(\)|(?:\.|::)\w+)*)?)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
@@ -230,7 +230,7 @@ WORD_TOKEN_RE = re.compile(
 # otherwise retry every alternative at each position of the run, which takes
 # time quadratic in its length.
 LONG_RUN_RE = re.compile(
-    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)(?:(?:\.|::)\w+(?:\(\))?)*|\}|(?<=\d)[ \t\u00a0\u2007\u2009\u200a\u202f]*"
+    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)(?:\(\)|(?:\.|::)\w+)*|\}|(?<=\d)[ \t\u00a0\u2007\u2009\u200a\u202f]*"
     r"(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?"
     r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
     r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)(?![\w%]))?",
@@ -1358,19 +1358,33 @@ def _scan_destination(text, pos, balanced=False):
     return i if i > pos else None
 
 
-def _mdit_definition_ok(text):
-    """Whether markdown-it reads the definition at the start of ``text``
-    (one that cmark-gfm reads): its destination must close every parenthesis
-    it opens, and a title must end at its closing quote (a backslash right
-    before it escapes it), with only spaces after it on its line; without a
+_MDIT_BAD_PROTO_RE = re.compile(r"(?:vbscript|javascript|file|data):")
+_MDIT_GOOD_DATA_RE = re.compile(r"data:image/(?:gif|png|jpeg|webp);")
+
+
+def _mdit_definition_end(text, pos):
+    """End of the definition whose destination starts at ``pos`` (after the
+    line it ends on), as markdown-it reads it, or None when it does not:
+    the destination closes every parenthesis it opens and is not a
+    "javascript:", "vbscript:", "file:" or "data:" link (images in data
+    links excepted), and a title ends at its closing quote (a backslash right
+    before it escapes it) with only spaces after it on its line; without a
     title, only spaces may follow the destination on its line."""
-    head = _REFDEF_HEAD_RE.match(text)
-    if not head:
-        return False
-    end = _scan_destination(text, head.end(), balanced=True)
+    end = _scan_destination(text, pos, balanced=True)
     if end is None:
-        return False
+        return None
+    dest = text[pos:end]
+    if dest.startswith("<") and dest.endswith(">"):
+        dest = dest[1:-1]
+    dest = dest.strip().lower()
+    if _MDIT_BAD_PROTO_RE.match(dest) and not _MDIT_GOOD_DATA_RE.match(dest):
+        return None
     n = len(text)
+
+    def line_end(k):
+        nl = text.find("\n", k)
+        return n if nl < 0 else nl + 1
+
     j = end
     while j < n and text[j] in " \t":
         j += 1
@@ -1389,9 +1403,36 @@ def _mdit_definition_ok(text):
                 k = n
                 break
             k += 1
-        if k < n and not text[k + 1:].split("\n", 1)[0].strip(" \t"):
-            return True
-    return not text[end:].split("\n", 1)[0].strip(" \t")
+        if k < n and not text[k + 1:line_end(k + 1)].strip(" \t\n"):
+            return line_end(k + 1)
+    if not text[end:line_end(end)].strip(" \t\n"):
+        return line_end(end)
+    return None
+
+
+def _mdit_definitions(lines):
+    """The labels (as markdown-it matches them) of the definitions markdown-it
+    reads at the start of a paragraph with these lines, in order, up to the
+    first line that is not one (the rest of the paragraph is text)."""
+    text = "\n".join(line.lstrip(" \t") for line in lines)
+    keys = []
+    pos = 0
+    while pos < len(text):
+        head = _REFDEF_HEAD_RE.match(text, pos)
+        if not head or not mdit_label_key(head.group(1)):
+            break
+        end = _mdit_definition_end(text, head.end())
+        if end is None:
+            break
+        keys.append(mdit_label_key(head.group(1)))
+        pos = end
+    return keys
+
+
+def _mdit_definition_ok(text):
+    """Whether markdown-it reads the definition at the start of ``text``."""
+    head = _REFDEF_HEAD_RE.match(text.lstrip(" \t"))
+    return bool(head) and _mdit_definition_end(text.lstrip(" \t"), head.end()) is not None
 
 
 def _match_definition(text):
@@ -2635,10 +2676,14 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         # definition only possibly defines its label, and is marked, so a
         # blank line added or removed before the header changes structure.
         above_table = j in table_headers
+        md_broken = False
         for first, last, label, parsed in defs:
-            # markdown-it takes the definition too unless its destination
-            # leaves a parenthesis open (cmark-gfm allows that).
-            md_ok = _mdit_definition_ok("\n".join(content[first:last]))
+            # markdown-it takes the definition too when it reads it by its
+            # own rules; after one it does not take, the rest of the
+            # paragraph is text to it.
+            md_ok = not md_broken and _mdit_definition_ok(
+                "\n".join(line.lstrip(" \t") for line in content[first:last]))
+            md_broken = md_broken or not md_ok
             ref = ((normalize_label(label), parsed and not above_table,
                     mdit_label_key(label) if md_ok else "")
                    if label is not None else None)
@@ -2673,7 +2718,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # markdown-it reads "---" there as a thematic break (and, below a
             # definition it does not take, either underline as a heading), so
             # the underline is part of the structure.
-            under = re.match(r"[ ]{0,3}(=+|-+)[ \t]*$", content[rest]) if defs else None
+            under = (re.match(r"[ ]{0,3}(=+|-+)[ \t]*$", _past_container(content[rest], base))
+                     if defs else None)
             marks = {}
             if under:
                 # "=" is text or an h1 underline; "-" is an empty list item,
@@ -2684,10 +2730,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # A definition-like line whose label cmark-gfm does not take (over
             # 1000 bytes) is text there but a definition to markdown-it: the
             # paragraph is kept byte for byte.
-            head = _REFDEF_HEAD_RE.match("\n".join(content[rest:]))
             md_label = None
-            if head and not _label_ok(head.group(1)) and mdit_label_key(head.group(1)):
-                md_label = mdit_label_key(head.group(1))
+            md_keys = [] if md_broken else _mdit_definitions(content[rest:])
+            if md_keys:
+                md_label = tuple(md_keys)
                 raw = "\n".join(lines[i + rest:j])
                 marks["markdown_it_definition"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
             if setext_level:
@@ -2744,14 +2790,16 @@ def reference_labels(blocks):
                 possible.add(normalize_label(m.group(1)))
                 md_possible.add(mdit_label_key(m.group(1)))
         elif block.kind == "paragraph":
-            if getattr(block, "md_label", None):
-                md_possible.add(block.md_label)
             # Definitions are read only from the start of a paragraph.
             for line in block.raw.split("\n"):
                 m = LOOSE_REFDEF_RE.match(line)
                 if not m:
                     break
                 md_possible.add(mdit_label_key(m.group(1)))
+        # A paragraph or heading that starts with definitions only markdown-it
+        # takes (kept byte for byte) defines their labels there.
+        if block.md_label:
+            md_possible.update(block.md_label)
     md_possible.discard("")
     return definite, possible - definite, md_definite, md_possible - md_definite
 
