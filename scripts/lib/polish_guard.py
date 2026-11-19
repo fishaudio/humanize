@@ -221,10 +221,16 @@ WORD_TOKEN_RE = re.compile(
 )
 
 # A run of ASCII letters, digits and path punctuation long enough to be a
-# hash, encoded data or a long identifier rather than a prose word. It is one
-# protected word: the word patterns would otherwise retry every alternative
-# at each position of the run, which takes time quadratic in its length.
-LONG_RUN_RE = re.compile(r"[\w@+.:/~-]{%d,}" % 48, re.A)
+# hash, encoded data or a long identifier rather than prose, with the token
+# syntax next to it (a "$" or "${" before it, "()" or "}" after it, or a unit
+# after a number). It is one protected word: the word patterns would
+# otherwise retry every alternative at each position of the run, which takes
+# time quadratic in its length.
+LONG_RUN_RE = re.compile(
+    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)|\}|(?<=\d)[ ]?"
+    r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
+    r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)(?![\w%]))?",
+    re.A)
 
 # Slash pairs that are ordinary prose rather than paths.
 # Word pairs with a slash that are ordinary prose, not paths.
@@ -724,7 +730,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         _mask(chars, m.start(), m.start() + len(url))
 
     for m in LONG_RUN_RE.finditer(current()):
-        value = m.group(0).rstrip(".:,;-")
+        value = m.group(0).rstrip(".:,;")
         found.append((m.start(), "word", value))
         _mask(chars, m.start(), m.start() + len(value))
 
@@ -1089,16 +1095,22 @@ REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line. ``_match_definition``
 # reads it as cmark-gfm does; the destination needs a scanner of its own.
-_REFDEF_HEAD_RE = re.compile(r"[ ]{0,3}\[(?:\\[\s\S]|[^\[\]\\])+\]:[ \t]*\n?[ \t]*")
+# The label holds at most 999 characters, not all of them whitespace.
+_REFDEF_HEAD_RE = re.compile(r"[ ]{0,3}\[(?!\s*\])(?:\\[\s\S]|[^\[\]\\]){1,999}\]:[ \t]*\n?[ \t]*")
 _POINTY_DEST_RE = re.compile(r"<(?:\\.|[^<>\n\\])*>")
+# A title: a backslash escapes the next character, and one more backslash
+# may come right before the closing delimiter (a backslash, as in
+# cmark-gfm). Each form matches one way only, so a title that never closes
+# fails in linear time.
+_TITLE = (r"(?:\"(?:\\[\s\S]|[^\"\\])*\\?\"|'(?:\\[\s\S]|[^'\\])*\\?'"
+          r"|\((?:\\[\s\S]|[^()\\])*\\?\))")
 # An optional title, separated from the destination by spaces or a line end,
-# then the end of the line (a backslash before the closing delimiter is a
-# backslash, as in cmark-gfm). Without a title that ends its line, the
+# then the end of the line. Without a title that ends its line, the
 # destination must end the line itself.
-_REFDEF_TAIL_RE = re.compile(
-    r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)"
-    r"(?:\"(?:\\[\s\S]|\\|[^\"\\])*\"|'(?:\\[\s\S]|\\|[^'\\])*'|\((?:\\[\s\S]|\\|[^()\\])*\)))?"
-    r"[ \t]*(?:\n|$)")
+_REFDEF_TAIL_RE = re.compile(r"(?:(?:[ \t]*\n[ \t]*|[ \t]+)" + _TITLE + r")?[ \t]*(?:\n|$)")
+# A title that starts and ends on one line.
+_LINE_TITLE_RE = re.compile(_TITLE.replace(r"\s\S", r"^\n").replace(r"[^\"\\]", r"[^\"\\\n]")
+                            .replace(r"[^'\\]", r"[^'\\\n]").replace(r"[^()\\]", r"[^()\\\n]"))
 _ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 _ASCII_SPACE = frozenset(" \t\n\x0b\x0c\r")
 
@@ -1480,6 +1492,8 @@ def _not_a_definition(line):
     m = REFDEF_LABEL_RE.match(line)
     if not m:
         return False
+    if not m.group(1).strip() or len(m.group(1)) > 999:
+        return True
     pos = m.end()
     while pos < len(line) and line[pos] in " \t":
         pos += 1
@@ -1492,7 +1506,12 @@ def _not_a_definition(line):
     after = rest.lstrip(" \t")
     if not after:
         return False
-    return after == rest or after[0] not in "\"'("
+    if after == rest or after[0] not in "\"'(":
+        return True
+    # A title that closes on the line must end it (a title that continues
+    # on the next line is read with the whole paragraph).
+    title = _LINE_TITLE_RE.match(after)
+    return bool(title) and bool(after[title.end():].strip(" \t"))
 
 
 def _read_definitions(content, parsed_only=False):

@@ -1691,4 +1691,42 @@ for name, doc in (("a 20000-character word", "Read " + "a" * 20000 + ")word now.
     report("R3 " + name + " checked within two seconds", time.time() - started < 2.0,
            "%.2fs" % (time.time() - started))
 
+# Re-review of 556b052: a long run carries the token syntax next to it and keeps
+# its hyphens, hyphenated prose under 80 characters stays editable, a title
+# fails in linear time, and a label of only whitespace is no label.
+for name, src, cand in [
+        ('the parentheses after a long function name removed',
+         'Call load_application_configuration_from_environment_variables() before starting.\n',
+         'Call load_application_configuration_from_environment_variables before starting.\n'),
+        ('the parentheses after a function name of 80 characters removed',
+         'Call load_application_configuration_from_environment_variables_and_settings_files_now() before starting.\n',
+         'Call load_application_configuration_from_environment_variables_and_settings_files_now before starting.\n'),
+        ('the dollar sign before a long variable removed',
+         'Set $A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_B first.\n',
+         'Set A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_A_B first.\n'),
+        ('the unit after a long number changed',
+         'Wait 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111 ms here.\n',
+         'Wait 111111111111111111111111111111111111111111111111111111111111111111111111111111111111111111 s here.\n'),
+        ('the trailing hyphen of a long flag removed',
+         'Pass --a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a- now.\n',
+         'Pass --a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a now.\n'),
+        ('code after a heading whose definition-like line has a whitespace label edited',
+         '[ ]: a(word\n===\n    Alpha body.\n',
+         '[ ]: a(word\n===\n    Delta body.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('long hyphenated prose reworded',
+         'Follow an-easy-to-follow-step-by-step-troubleshooting-guide today.\n',
+         'Follow a-simple-step-by-step-troubleshooting-guide today.\n'),
+        ('prose after a definition-like line with text after its title reworded',
+         '[ref]: a(word "title" extra\nRead prose.\n',
+         '[ref]: a(word "title" extra\nSee prose.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("a title of 5000 backslashes that never closes", '[ref]: /u "' + "\\" * 5000 + "x\n"),
+                  ("runs of 79 letters", ("a" * 79 + " ") * 500 + "\n")):
+    started = time.time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within three seconds", time.time() - started < 3.0,
+           "%.2fs" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
