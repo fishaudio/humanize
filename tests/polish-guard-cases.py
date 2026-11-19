@@ -2003,4 +2003,44 @@ accepts("R3 a paragraph of 8000 emphasized reference links unchanged",
 report("R3 a paragraph of 8000 emphasized reference links checked within three seconds",
        time.time() - started < 3.0, "%.2fs" % (time.time() - started))
 
+
+# Re-review of 6610945: markdown-it's title rule decides whether it takes a
+# definition, labels over 1000 bytes may span lines, the underline below
+# definitions keeps markdown-it's reading, the "![" of a reference image is
+# protected, and two false rejections.
+for name, src, cand in [
+        ('emphasis lost next to a reference whose title ends in a backslash',
+         'Read [*the guide][r] carefully* now.\n\n[r]: /guide "C:\\"\n',
+         'Read [*the guide][r] *carefully now.\n\n[r]: /guide "C:\\"\n'),
+        ('the destination below a long label over two lines changed',
+         '[' + 'a' * 600 + '\n' + 'b' * 500 + ']: alpha\n\n[guide][' + 'a' * 600 + '\n' + 'b' * 500 + ']\n',
+         '[' + 'a' * 600 + '\n' + 'b' * 500 + ']: delta\n\n[guide][' + 'a' * 600 + '\n' + 'b' * 500 + ']\n'),
+        ('a thematic break below a definition shortened to two dashes',
+         '[ref]: /u\n---\nRead prose.\n',
+         '[ref]: /u\n--\nRead prose.\n'),
+        ('a thematic break below a definition shortened to one dash',
+         '[ref]: /u\n---\nRead prose.\n',
+         '[ref]: /u\n-\nRead prose.\n'),
+        ('a reference image with brackets in its alt text turned into a link',
+         'See ![Architecture [draft]][diagram].\n\n[diagram]: /diagram.svg\n',
+         'See [Architecture [draft]][diagram].\n\n[diagram]: /diagram.svg\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose around image-shaped text in an HTML attribute reworded',
+         'Read <span data-template="![alt](image.png)">the guide</span> now.\n',
+         'See <span data-template="![alt](image.png)">the guide</span> now.\n'),
+        ('prose before a parenthetical after a reference reworded',
+         'Read [guide][r](call(a, b)) now.\n\n[r]: /guide\n',
+         'See [guide][r](call(a, b)) now.\n\n[r]: /guide\n'),
+        ('the alt text of a reference image with brackets reworded',
+         'See ![Architecture [draft]][diagram].\n\n[diagram]: /diagram.svg\n',
+         'See ![System [draft]][diagram].\n\n[diagram]: /diagram.svg\n'),
+        ('a thematic break below a definition lengthened',
+         '[ref]: /u\n---\nRead prose.\n',
+         '[ref]: /u\n----\nRead prose.\n'),
+        ('prose next to a reference with an ordinary title reworded',
+         'Read [*the guide][r] carefully* now.\n\n[r]: /guide "Guide"\n',
+         'See [*the guide][r] carefully* today.\n\n[r]: /guide "Guide"\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)

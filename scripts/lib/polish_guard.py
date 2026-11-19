@@ -743,6 +743,11 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
                     found_inner.append(sp[3])
                 nxt += 1
             inside[k] = found_inner
+        for ls, le, kind, status, key in spans:
+            if kind == "image" and status != "no":
+                # "![" of an image (also one whose alt text holds brackets,
+                # which the reference patterns above do not take).
+                found.append((ls - 2, "image_open", "!["))
         for k, (ls, le, kind, status, key) in enumerate(spans):
             if kind == "link" and inside[k]:
                 if "yes" in inside[k]:
@@ -786,9 +791,11 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         _mask(chars, m.start(), m.end())
 
     snapshot = current()
+    html_spans = [(t.start(), t.end()) for t in HTML_TAG_RE.finditer(snapshot)]
     for m in SHORTCUT_REF_RE.finditer(snapshot):
         found.append((m.start(), "reflink", m.group(0)))
-        if m.group(0).startswith("!") and snapshot.startswith("(", m.end()):
+        if (m.group(0).startswith("!") and snapshot.startswith("(", m.end())
+                and not any(a <= m.start() < b for a, b in html_spans)):
             # "![label](" that starts no inline image: cmark-gfm falls back
             # to a reference image, markdown-it to a "!" and a reference
             # link. The unit is kept byte for byte.
@@ -866,7 +873,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     # Link destinations, autolinks and URLs are read again from the original
     # text: code-span, math or escape syntax inside a destination is part of
     # the destination, so masking it above must not leave the rest editable.
-    links, unmodeled = _scan_links(text)
+    links, unmodeled = _scan_links(text, resolve, text)
     for start, _, _, _, _, target in links:
         found.append((start, "dest", target))
     if unmodeled:
@@ -1351,6 +1358,42 @@ def _scan_destination(text, pos, balanced=False):
     return i if i > pos else None
 
 
+def _mdit_definition_ok(text):
+    """Whether markdown-it reads the definition at the start of ``text``
+    (one that cmark-gfm reads): its destination must close every parenthesis
+    it opens, and a title must end at its closing quote (a backslash right
+    before it escapes it), with only spaces after it on its line; without a
+    title, only spaces may follow the destination on its line."""
+    head = _REFDEF_HEAD_RE.match(text)
+    if not head:
+        return False
+    end = _scan_destination(text, head.end(), balanced=True)
+    if end is None:
+        return False
+    n = len(text)
+    j = end
+    while j < n and text[j] in " \t":
+        j += 1
+    if j < n and text[j] == "\n":
+        j += 1
+        while j < n and text[j] in " \t":
+            j += 1
+    if j > end and j < n and text[j] in "\"'(":
+        close = ")" if text[j] == "(" else text[j]
+        k = j + 1
+        while k < n and text[k] != close:
+            if text[k] == "\\" and k + 1 < n:
+                k += 2
+                continue
+            if close == ")" and text[k] == "(":
+                k = n
+                break
+            k += 1
+        if k < n and not text[k + 1:].split("\n", 1)[0].strip(" \t"):
+            return True
+    return not text[end:].split("\n", 1)[0].strip(" \t")
+
+
 def _match_definition(text):
     """End of the definition at the start of ``text`` (after the newline
     that ends it), or None when it is not one."""
@@ -1393,7 +1436,7 @@ HTML_LINE_TAG_RE = re.compile(
 
 
 class Block(object):
-    __slots__ = ("kind", "attrs", "raw", "units", "line", "ref")
+    __slots__ = ("kind", "attrs", "raw", "units", "line", "ref", "md_label")
 
     def __init__(self, kind, attrs, raw, units, line, ref=None):
         self.kind = kind
@@ -1402,9 +1445,13 @@ class Block(object):
         self.units = units
         self.line = line
         # For a reference definition: (normalized label, whether the parser
-        # read the whole definition); for a footnote definition: how its
-        # content ends. Not part of the comparison.
+        # read the whole definition, the label as markdown-it matches it or
+        # "" when markdown-it does not take the definition); for a footnote
+        # definition: how its content ends. Not part of the comparison.
         self.ref = ref
+        # For a paragraph that starts with a definition only markdown-it
+        # takes: its label as markdown-it matches it. Not compared.
+        self.md_label = None
 
     def describe(self):
         return "block at line %d (%s)" % (self.line, self.kind)
@@ -2591,9 +2638,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         for first, last, label, parsed in defs:
             # markdown-it takes the definition too unless its destination
             # leaves a parenthesis open (cmark-gfm allows that).
-            head = _REFDEF_HEAD_RE.match("\n".join(content[first:last]))
-            md_ok = bool(head) and _scan_destination("\n".join(content[first:last]), head.end(),
-                                                     balanced=True) is not None
+            md_ok = _mdit_definition_ok("\n".join(content[first:last]))
             ref = ((normalize_label(label), parsed and not above_table,
                     mdit_label_key(label) if md_ok else "")
                    if label is not None else None)
@@ -2629,12 +2674,20 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # definition it does not take, either underline as a heading), so
             # the underline is part of the structure.
             under = re.match(r"[ ]{0,3}(=+|-+)[ \t]*$", content[rest]) if defs else None
-            marks = {"after_definition": under.group(1)[0]} if under else {}
+            marks = {}
+            if under:
+                # "=" is text or an h1 underline; "-" is an empty list item,
+                # "--" text, and "---" or longer a thematic break (each also
+                # an h2 underline below a definition markdown-it does not take).
+                run = under.group(1)
+                marks["after_definition"] = "=" if run[0] == "=" else "-" * min(len(run), 3)
             # A definition-like line whose label cmark-gfm does not take (over
             # 1000 bytes) is text there but a definition to markdown-it: the
             # paragraph is kept byte for byte.
-            head = _REFDEF_HEAD_RE.match(content[rest])
+            head = _REFDEF_HEAD_RE.match("\n".join(content[rest:]))
+            md_label = None
             if head and not _label_ok(head.group(1)) and mdit_label_key(head.group(1)):
+                md_label = mdit_label_key(head.group(1))
                 raw = "\n".join(lines[i + rest:j])
                 marks["markdown_it_definition"] = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
             if setext_level:
@@ -2643,6 +2696,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             else:
                 blocks.append(Block("paragraph", attrs(**marks), "\n".join(lines[i + rest:j]), units,
                                     i + rest + 1))
+            # The label markdown-it defines there, for reference_labels.
+            blocks[-1].md_label = md_label
         i = j
 
     # Raw blocks are compared byte for byte against the original lines; a
@@ -2689,6 +2744,8 @@ def reference_labels(blocks):
                 possible.add(normalize_label(m.group(1)))
                 md_possible.add(mdit_label_key(m.group(1)))
         elif block.kind == "paragraph":
+            if getattr(block, "md_label", None):
+                md_possible.add(block.md_label)
             # Definitions are read only from the start of a paragraph.
             for line in block.raw.split("\n"):
                 m = LOOSE_REFDEF_RE.match(line)
