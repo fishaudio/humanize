@@ -2699,4 +2699,123 @@ for name, src, cand in [
          '1. Read the guide.\n     # Next step\n   Read the notes.\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Found after be7201c by an edit fuzz of the paragraphs markdown-it reads:
+# where markdown-it reads a line of cmark-gfm's paragraph outside the
+# paragraph's quote or list item (after a definition, a line that does not
+# reach the item's content column or lacks the quote marker), the blocks it
+# starts there and the containers it closes are structure, and each
+# paragraph it reads there is a prose unit of its own.
+for name, src, cand in [
+        ('a line after a definition in a list item moved short of its content column',
+         '1. [docs]: /guide\n   Read the notes.\n',
+         '1. [docs]: /guide\n  Read the notes.\n'),
+        ('a quote marker added to the line after a quoted definition',
+         '> [docs]: /guide\nRead the notes.\n',
+         '> [docs]: /guide\n> Read the notes.\n'),
+        ('a quote marker removed where markdown-it reopens the quote',
+         '> 1. [docs]: /guide\nRead the notes.\n> See the guide.\n',
+         '> 1. [docs]: /guide\nRead the notes.\nSee the guide.\n'),
+        ('a line after a quoted definition in a list item moved out of the item',
+         '- > [docs]: /guide\n  Read the notes.\n',
+         '- > [docs]: /guide\n Read the notes.\n'),
+        ('a link markdown-it forms where it no longer splits the paragraph',
+         '> 1. [docs]: /guide\n   Read [the notes\n> and](/guide) more.\n> See the guide.\n',
+         '> 1. [docs]: /guide\n   Read [the notes\n  and](/guide) more.\n> See the guide.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose markdown-it reads outside the list item reworded',
+         '1. [docs]: /guide\n  Read the notes.\n',
+         '1. [docs]: /guide\n  See the notes.\n'),
+        ('prose before the quote markdown-it reopens reworded',
+         '> 1. [docs]: /guide\nRead the notes.\n> See the guide.\n',
+         '> 1. [docs]: /guide\nRead these notes.\n> See the guide.\n'),
+        ('prose markdown-it reads outside the list item rewrapped',
+         '1. [docs]: /guide\n  Read the notes\n  and the guide.\n',
+         '1. [docs]: /guide\n  Read the notes and the guide.\n'),
+        ('prose around a link markdown-it splits reworded',
+         '> 1. [docs]: /guide\n   Read [the notes\n> and](/guide) more.\n> See the guide.\n',
+         '> 1. [docs]: /guide\n   See [the notes\n> and](/guide) more.\n> See the guide.\n')]:
+    accepts("R3 " + name, src, cand)
+
+
+# Re-review of be7201c: the paragraph units keep trailing whitespace (it may
+# be inside a code span), belong to the block that holds their first line
+# and are compared also when that block is a definition; markdown-it's
+# reading of a paragraph it reads outside its quote or list item is
+# structure; a setext underline counts only from the content column of the
+# list item markdown-it still reads the paragraph in; which definition of
+# a label comes first is compared; indented code markdown-it reads as a
+# quote continuation is marked; and a list item outside the paragraph's
+# own item ends markdown-it's paragraph there.
+for name, src, cand in [
+        ('trailing whitespace inside a code span markdown-it reads across a list item removed',
+         '1. [docs]: /guide\nRun `echo hello \n2. echo done`\n',
+         '1. [docs]: /guide\nRun `echo hello\n2. echo done`\n'),
+        ('a code span markdown-it reads after a definition it does not take edited',
+         '1. [docs]: /guide\n[local]: file:///guide\nRun `echo hello\n2. echo done`\n',
+         '1. [docs]: /guide\n[local]: file:///guide\nRun `echo world\n2. echo done`\n'),
+        ('a code span markdown-it reads after a heading it reads in the paragraph edited',
+         '1. [docs]: /guide\nExample\n===\nRun `echo hello\n2. echo done`\n',
+         '1. [docs]: /guide\nExample\n===\nRun `echo world\n2. echo done`\n'),
+        ('a blank line that makes markdown-it take a later definition of the same label',
+         'Read [the guide][docs].\n\n> # Next step\n    > [docs]: /guide\n\n[docs]: /fallback\n',
+         'Read [the guide][docs].\n\n> # Next step\n\n    > [docs]: /guide\n\n[docs]: /fallback\n'),
+        ('a blank line that makes a quote markdown-it continues into code',
+         'Read the guide.\n\n> # Next step\n    > Read the notes.\n',
+         'Read the guide.\n\n> # Next step\n\n    > Read the notes.\n'),
+        ('a paragraph after a definition moved into the list item',
+         '- [docs]: /guide\nRead the guide.\n',
+         '- [docs]: /guide\n  Read the guide.\n'),
+        ('a code span markdown-it reads over an underline short of the outer list item edited',
+         '- 1. [docs]: /guide\n  Run `echo hello\n===\n  2. echo done`\n',
+         '- 1. [docs]: /guide\n  Run `echo world\n===\n  2. echo done`\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose in separate numbered items with literal asterisks reworded',
+         '1. Use *suffix when matching **files**.\n2. Use prefix* for the other pattern.\n',
+         '1. When matching **files**, use *suffix.\n2. Use prefix* for the other pattern.\n')]:
+    accepts("R3 " + name, src, cand)
+started = time.time()
+src = "".join("%d. Read the notes.\n" % (k + 1) for k in range(1600))
+accepts("R3 1600 numbered list items unchanged", src, src)
+report("R3 1600 numbered list items checked within two seconds",
+       time.time() - started < 2.0, "took %.2f s" % (time.time() - started))
+
+# (A tag whose quoted attribute value is still open at the line end starts
+# no HTML block: both renderers read a paragraph with raw inline HTML.)
+for name, src, cand in [
+        ('an attribute value continued from a tag line ending in ">" in a list item edited',
+         '-   <span title="Next ->\n  old page">next</span> here.\n',
+         '-   <span title="Next ->\n  new page">next</span> here.\n'),
+        ('an attribute value continued from a tag line ending in ">" edited',
+         'Intro.\n\n<span title="Next ->\nold page">next</span> here.\n',
+         'Intro.\n\n<span title="Next ->\nnew page">next</span> here.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after an attribute value continued from a tag line in a list item reworded',
+         '-   <span title="Next ->\n  old page">next</span> here.\n',
+         '-   <span title="Next ->\n  old page">next</span> now.\n'),
+        ('prose after an attribute value continued from a tag line reworded',
+         'Intro.\n\n<span title="Next ->\nold page">next</span> here.\n',
+         'Intro.\n\n<span title="Next ->\nold page">next</span> now.\n')]:
+    accepts("R3 " + name, src, cand)
+
+# (Over a list item only cmark-gfm opens, markdown-it measures the lines of
+# the paragraph it continues from the column it reads that paragraph at:
+# four spaces there start indented code after a heading it reads.)
+for name, src, cand in [
+        ('code markdown-it reads after a heading across a list item edited',
+         '- [docs]: /guide\nRead the guide\n3. More notes\n===\n    make build\n',
+         '- [docs]: /guide\nRead the guide\n3. More notes\n===\n    make test\n'),
+        ('code markdown-it reads after a heading across a list item in a quote edited',
+         '> - [docs]: /guide\n  Read the guide\n3. More notes\n===\n     make build\n',
+         '> - [docs]: /guide\n  Read the guide\n3. More notes\n===\n     make test\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose before a heading markdown-it reads across a list item reworded',
+         '- [docs]: /guide\nRead the guide\n3. More notes\n===\n    make build\n',
+         '- [docs]: /guide\nSee the guide\n3. More notes\n===\n    make build\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)

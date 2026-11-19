@@ -1511,22 +1511,30 @@ def _mdit_interrupts(line, level):
                 or _is_html_start(rest, interrupt=True))
 
 
-def _mdit_ends_paragraph(line, level, base):
+def _mdit_ends_paragraph(line, level, base, marker_indent=None):
     """Whether markdown-it surely ends at ``line`` a paragraph it has open at
     quote depth ``level`` in a container whose content column is ``base``
     (None when that is not known): a line that is blank once its quote
-    markers are removed, or a line inside the container that starts a block
-    there (such as a nested list item or a heading)."""
+    markers are removed, a line inside the container that starts a block
+    there (such as a nested list item or a heading), or a list item outside
+    the paragraph's list item (whose marker is indented ``marker_indent``
+    columns) less than four columns past that marker, which ends the item
+    whatever its number and even when it is empty."""
     depth, body = _quote_depth(line)
     if not body.strip():
         return True
     if base is None or depth != level:
         return False
-    body = _strip_quote(line, level)
-    return _indent_of(_expand_indent(body)) >= base and _mdit_interrupts(_past_container(body, base), 0)
+    body = _expand_indent(_strip_quote(line, level))
+    ind = _indent_of(body)
+    if ind >= base:
+        return _mdit_interrupts(_past_container(body, base), 0)
+    return (marker_indent is not None and ind - marker_indent < 4
+            and bool(re.match(r"(?:[-+*]|\d{1,9}[.)])(?:[ \t]|$)", body[ind:])))
 
 
-def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_lines=None, depths=None):
+def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_lines=None, depths=None,
+                  outer_cols=()):
     """How markdown-it reads the lines of one cmark-gfm paragraph (inside a
     container ``base`` columns deep): a list of line ranges (kind, first,
     last, extra), ``last`` excluded, covering the lines in order. Kinds:
@@ -1542,7 +1550,8 @@ def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_line
     holds the indexes of lazy lines outside the paragraph's quotes, and
     ``depths`` the number of quote markers on each line; ``col_lines`` are
     the lines with their quote markers removed and tabs expanded at their
-    true columns, for measuring indentation.
+    true columns, for measuring indentation; ``outer_cols`` the content
+    columns of the list items open at the paragraph's quote depth.
 
     markdown-it reads a definition only at the start of a block, and starts
     a new block after each one, so a line that only continues the paragraph
@@ -1635,7 +1644,10 @@ def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_line
         if where == "quote":
             return depths[q] == level and _indent_of(col_lines[q]) < 4
         if where == "list":
-            return q not in quote_lazy and _indent_of(col_lines[q]) < 4
+            # (From the content column of the list item markdown-it still
+            # reads the paragraph in: a line short of it is lazy text.)
+            ind = _indent_of(col_lines[q])
+            return q not in quote_lazy and own_col <= ind < own_col + 4
         return q not in quote_lazy and not list_lazy[q] and cols[q] < 4
 
     def plain(q, p):
@@ -1654,6 +1666,10 @@ def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_line
     # read a block outside them), and whether it opened a list item of its
     # own (whose content an indented line may continue).
     closed = False
+    # (The least indentation of a line markdown-it read outside the
+    # paragraph's list item: the list items it closed there stay closed,
+    # also for a later line indented to them.)
+    closed_ind = None
     md_list = False
     while p < n:
         if p >= cut:
@@ -1662,6 +1678,9 @@ def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_line
         body = bodies[p]
         outside = p in quote_lazy
         closed = closed or bool(p and (outside or list_lazy[p]))
+        if p and list_lazy[p] and not outside:
+            ind_p = _indent_of(col_lines[p])
+            closed_ind = ind_p if closed_ind is None else min(closed_ind, ind_p)
         # Indented code or HTML that starts inside the paragraph's
         # containers ends at a lazy line; outside the quote it ends where
         # a quote marker opens a new quote.
@@ -1753,6 +1772,8 @@ def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_line
             q = p + 1
             stop = min(inside_from(p) if outside else n, cut)
             where = "quote" if outside else ("list" if closed else None)
+            p_ind = _indent_of(col_lines[p]) if closed_ind is None else min(_indent_of(col_lines[p]), closed_ind)
+            own_col = max((c for c in outer_cols if c <= p_ind), default=0)
             while q < stop and not underline(q, where, depths[p]):
                 q += 1
             if q < stop:
@@ -1875,10 +1896,11 @@ HTML_TYPE1_RE = re.compile(r"<(?:script|pre|style|textarea)(?:\s|>|$)", re.I)
 HTML_TYPE1_END_RE = re.compile(r"</(?:script|pre|style|textarea)\s*>", re.I)
 # HTML block start condition 7: any other complete tag alone on its line
 # (cmark-gfm also counts a closing script, pre, style or textarea tag). It
-# cannot interrupt a paragraph.
+# cannot interrupt a paragraph. A tag whose quoted attribute value is still
+# open at the line end is not complete: both renderers read a paragraph
+# with raw inline HTML there.
 HTML_LINE_TAG_RE = re.compile(
-    r"^[ ]{0,3}(?:" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG
-    + r"|</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>)[ \t]*$")
+    r"^[ ]{0,3}(?:" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG + r")[ \t]*$")
 
 
 class Block(object):
@@ -2756,6 +2778,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # The line at which a paragraph markdown-it opened on a setext
     # underline continues (see below), or -1.
     md_open = -1
+    # The content column of the list item markdown-it reads the paragraph
+    # it continues there in (None when not known): it measures the lines'
+    # indentation from it, not from the item cmark-gfm opens.
+    md_open_base = None
     # (line, quote depth, content column, end marker) where an HTML block
     # markdown-it opened inside a paragraph continues past it, up to a blank
     # line or the end of the paragraph's containers (both 0 when markdown-it
@@ -2771,12 +2797,21 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # (first line, line) of a paragraph cmark-gfm ends at a line that
     # markdown-it reads as a lazy continuation of it.
     md_lazy_run = []
+    # Where markdown-it reads lines of a paragraph outside the paragraph's
+    # containers: the first line and the shape of its reading.
+    md_shapes = []
     # (line, quote depth, content column) of the outermost container that
     # markdown-it may have closed in a paragraph before the line (it read a
     # line of the paragraph outside it): a list item at that quote depth, or
     # the quote itself (column 0). markdown-it reads the rest of cmark-gfm's
     # container outside it too.
     md_closed_from = []
+
+    def item_marker(level, col):
+        # The indentation of the marker of the open list item at quote
+        # depth ``level`` whose content column is ``col``, or None.
+        stack = level_stacks[level] if level < len(level_stacks) else []
+        return next((ind for ind, c in reversed(stack) if c == col), None)
 
     def md_item_continues(j, md_level):
         """Whether markdown-it's paragraph at quote depth ``md_level``
@@ -3209,8 +3244,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         # takes one inside a list item it did not read further.
         # Whether markdown-it continues a paragraph of its own on these lines.
         md_cont = i == md_open
-        md_read = _mdit_reading(content, base, "paragraph" if md_cont else None, quote_lazy,
-                                col_lines, depths)
+        walk_base = md_open_base if md_cont and md_open_base is not None and md_open_base < base else base
+        md_read = _mdit_reading(content, walk_base, "paragraph" if md_cont else None, quote_lazy,
+                                col_lines, depths,
+                                tuple(c for _, c in level_stacks[quote]) if quote < len(level_stacks) else ())
         md_defs = {r[1]: r[3] for r in md_read if r[0] == "definition"}
         md_unknown = next((r[1] for r in md_read if r[0] == "unknown"), None)
         if md_unknown is not None and md_unknown in quote_lazy and j < n:
@@ -3246,6 +3283,31 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             blocks[-1].md_label = tuple(md_only)
         closers = [r[1] for r in md_read
                    if r[1] and (r[1] in quote_lazy or (depth and _indent_of(col_lines[r[1]]) < base))]
+        closer_set = set(closers)
+        if closers:
+            # Which blocks markdown-it starts in these lines, which of them
+            # it reads outside the paragraph's quote or list item, and where
+            # it closes them: whether a line after a definition reaches the
+            # list item's content column, or keeps its quote markers, decides
+            # where markdown-it reads the rest, although cmark-gfm continues
+            # the paragraph either way. (Without line offsets, so rewording
+            # and rewrapping inside a block keep it.)
+            def closes(k):
+                # The quote depth markdown-it reads line k at and the content
+                # column of the outermost list item there it does not reach.
+                nq = depths[k]
+                stack = level_stacks[nq] if nq < len(level_stacks) else []
+                ind = _indent_of(col_lines[k])
+                return (nq, next((col for _, col in stack if col > ind), None))
+            # Each paragraph markdown-it reads in these lines is a prose
+            # unit of its own, so inline markup that spans where markdown-it
+            # splits cmark-gfm's paragraph is compared as markdown-it groups
+            # it.
+            md_shapes.append((i, tuple((r[0], r[3] is True if r[0] == "paragraph" else None,
+                                        closes(r[1]) if r[1] in closer_set else None)
+                                       for r in md_read),
+                              ["\n".join(content[x].lstrip(" \t") for x in range(r[1], r[2]))
+                               for r in md_read if r[0] == "paragraph"]))
         if md_read[-1][0] == "html" and md_read[-1][2] == len(content):
             if closers:
                 # markdown-it opened it after it closed the paragraph's
@@ -3292,7 +3354,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 if last_read[0] == "paragraph":
                     md_lazy_run.append((i + last_read[1], j, lazy_level,
                                         _mdit_ends_paragraph(lines[j], lazy_level,
-                                                             base if lazy_level == quote else None)))
+                                                             base if lazy_level == quote else None,
+                                                             None if last_read[3] is True
+                                                             else item_marker(quote, base))))
         if (last_read[0] == "paragraph" and (last_read[3] or (md_cont and last_read[1] == 0))
                 and last_read[2] == len(content)
                 and not setext_level and j < n):
@@ -3302,6 +3366,14 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # marker that reopens a quote continue it.
             md_level = _quote_depth(lines[i + last_read[1]])[0] if last_read[1] in quote_lazy else quote
             if md_item_continues(j, md_level):
+                if not (md_cont and last_read[1] == 0):
+                    # (The list item markdown-it still reads that paragraph
+                    # in: the deepest one open at its quote depth that the
+                    # lines it read outside the paragraph's item reach.)
+                    reached = [_indent_of(col_lines[k]) for k in closers
+                               if k <= last_read[1] and depths[k] == md_level]
+                    md_open_base = (max((c for _, c in level_stacks[md_level] if c <= min(reached)), default=0)
+                                    if reached and md_level < len(level_stacks) else None)
                 md_open = j
                 md_lazy_run.append((i + last_read[1], j, md_level, False))
         if defs and rest == len(content) and depth > 0 and j < n and not _strip_quote(lines[j], quote).strip():
@@ -3396,11 +3468,14 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                         # kinds, such as indented code, and over a list item
                         # that cannot interrupt it, which cmark-gfm opens.)
                         md_open = j
+                        md_open_base = None
                         md_lazy_from.append((j, quote))
                         md_item_continues(j, md_depth)
                         md_lazy_run.append((i + md_read[-1][1], j, md_depth,
                                             _mdit_ends_paragraph(lines[j], md_depth,
-                                                                 base if md_depth == quote else None)))
+                                                                 base if md_depth == quote else None,
+                                                                 None if md_read[-1][3] is True
+                                                                 else item_marker(quote, base))))
             if over:
                 kept = "\x00".join(r[0] + "\x00" + (r[3] if r[0] == "listitem"
                                                       else "\n".join(kept_lines[max(r[1], rest):r[2]]))
@@ -3449,6 +3524,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             first = block.line - 1
             if (first and orig_lines[first - 1].strip() and _quote_depth(orig_lines[first - 1])[0]
                     and orig_lines[first].lstrip(" \t").startswith(">")):
+                # (So a blank line that ends that quote for markdown-it, and
+                # makes the lines code there too, changes the structure.)
+                block.attrs["md_quoted"] = True
                 labels = tuple(mdit_label_key(label) for label in _loose_labels(block.raw))
                 if labels:
                     block.md_label = tuple(block.md_label or ()) + labels
@@ -3535,6 +3613,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     for block in blocks:
         if block.kind not in ("quote", "list_item"):
             block_at.setdefault(block.line - 1, block)
+    for at, shape, texts in md_shapes:
+        if at in block_at:
+            block_at[at].attrs["md_shape"] = shape
+            block_at[at].md_units = (block_at[at].md_units or []) + texts
     # Containers markdown-it reads outside cmark-gfm's (see below), in the
     # order they are found.
     closed_queue = list(md_closed_from)
@@ -3737,6 +3819,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # the paragraph when it holds the start of an HTML tag, a code span or
     # a link.
     if md_lazy_run:
+        starts = sorted(block_at)
+        # (The lines an earlier unit already covers: a further list item
+        # markdown-it continues the same paragraph over adds no unit.)
+        covered = 0
         for first, at, level, ends in md_lazy_run:
             nxt = block_at.get(at)
             # (Read with the quote markers the parse moved: such a marker
@@ -3748,19 +3834,24 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # interrupts it) is a prose unit of the block where it starts,
             # so its inline markup, code, HTML and links are compared as
             # markdown-it groups them.
-            owner = next((block_at[k] for k in range(first, at)
-                          if k in block_at and block_at[k].kind in ("paragraph", "heading", "refdef")), None)
+            # (The block that holds its first line, which may start
+            # earlier, such as a paragraph whose first lines markdown-it
+            # reads as a heading; the unit is compared whatever its kind.)
+            pos = bisect.bisect_right(starts, first) - 1
+            owner = block_at[starts[pos]] if pos >= 0 else (block_at[starts[0]] if starts else None)
             # (Not where the line ends the paragraph for markdown-it too: a
-            # blank line once its quote markers are removed, or a block
-            # start inside the paragraph's container.)
-            if owner is not None and not ends:
+            # blank line once its quote markers are removed, a block start
+            # inside the paragraph's container, or a list item outside it.
+            # Trailing whitespace stays: it may be inside a code span.)
+            if owner is not None and not ends and at >= covered:
                 k = at
                 while (k < n and _quote_depth(written[k])[1].strip()
                        and (k == at or not _mdit_interrupts(written[k], level))):
                     k += 1
-                text = "\n".join([_strip_quote(lines[x], _quote_depth(lines[x])[0]).strip(" \t")
+                covered = k
+                text = "\n".join([_strip_quote(lines[x], _quote_depth(lines[x])[0]).lstrip(" \t")
                                    for x in range(first, at)]
-                                  + [_strip_quote(written[x], level).strip(" \t") for x in range(at, k)])
+                                  + [_strip_quote(written[x], level).lstrip(" \t") for x in range(at, k)])
                 owner.md_units = (owner.md_units or []) + [text]
             if nxt is None or nxt.kind != "html":
                 continue
@@ -3826,36 +3917,55 @@ def reference_labels(blocks):
     definite, possible = set(), set()
     md_definite, md_possible = set(), set()
     for block in blocks:
-        if block.kind == "refdef" and block.ref:
-            (definite if block.ref[1] else possible).add(block.ref[0])
-            if block.ref[2]:
-                (md_definite if block.ref[1] and block.ref[3] else md_possible).add(block.ref[2])
-        elif block.kind in ("protected", "footnote_def", "frontmatter"):
-            # (Front matter is Markdown to the renderers that do not read
-            # it as metadata.)
-            for label in _loose_labels(block.raw):
-                possible.add(normalize_label(label))
-                md_possible.add(mdit_label_key(label))
-        elif block.kind == "html":
-            # Raw text to cmark-gfm, but markdown-it may read some of its
-            # lines as Markdown (it starts fewer HTML blocks).
-            for label in _loose_labels(block.raw):
-                md_possible.add(mdit_label_key(label))
-        elif block.kind == "paragraph":
-            # Definitions are read only from the start of a paragraph.
-            for label in _loose_labels(block.raw, first_only=True):
-                md_possible.add(mdit_label_key(label))
-            for line in block.raw.split("\n"):
-                m = LOOSE_REFDEF_RE.match(line)
-                if not m:
-                    break
-                md_possible.add(mdit_label_key(m.group(1)))
-        # A paragraph or heading that starts with definitions only markdown-it
-        # takes (kept byte for byte) defines their labels there.
-        if block.md_label:
-            md_possible.update(block.md_label)
+        _add_block_labels(block, definite, possible, md_definite, md_possible)
     md_possible.discard("")
     return definite, possible - definite, md_definite, md_possible - md_definite
+
+
+def reference_label_sequence(blocks):
+    """The labels each block may define, in document order: which of two
+    definitions of one label comes first decides the link target, so this
+    order is compared as well as the label sets."""
+    out = []
+    for block in blocks:
+        sets = (set(), set(), set(), set())
+        _add_block_labels(block, *sets)
+        sets[3].discard("")
+        if any(sets):
+            out.append((block.kind,) + tuple(tuple(sorted(s)) for s in sets))
+    return out
+
+
+def _add_block_labels(block, definite, possible, md_definite, md_possible):
+    """Add the labels ``block`` defines or may define (see reference_labels)."""
+    if block.kind == "refdef" and block.ref:
+        (definite if block.ref[1] else possible).add(block.ref[0])
+        if block.ref[2]:
+            (md_definite if block.ref[1] and block.ref[3] else md_possible).add(block.ref[2])
+    elif block.kind in ("protected", "footnote_def", "frontmatter"):
+        # (Front matter is Markdown to the renderers that do not read
+        # it as metadata.)
+        for label in _loose_labels(block.raw):
+            possible.add(normalize_label(label))
+            md_possible.add(mdit_label_key(label))
+    elif block.kind == "html":
+        # Raw text to cmark-gfm, but markdown-it may read some of its
+        # lines as Markdown (it starts fewer HTML blocks).
+        for label in _loose_labels(block.raw):
+            md_possible.add(mdit_label_key(label))
+    elif block.kind == "paragraph":
+        # Definitions are read only from the start of a paragraph.
+        for label in _loose_labels(block.raw, first_only=True):
+            md_possible.add(mdit_label_key(label))
+        for line in block.raw.split("\n"):
+            m = LOOSE_REFDEF_RE.match(line)
+            if not m:
+                break
+            md_possible.add(mdit_label_key(m.group(1)))
+    # A paragraph or heading that starts with definitions only markdown-it
+    # takes (kept byte for byte) defines their labels there.
+    if block.md_label:
+        md_possible.update(block.md_label)
 
 
 def prose_block_count(text):
@@ -3961,7 +4071,8 @@ def _compare_blocks(src_blocks, cand_blocks, block_ratio):
     # markdown-it may define elsewhere (in lines it reads differently) must
     # stay the same.
     refs = reference_labels(src_blocks)
-    if reference_labels(cand_blocks) != refs:
+    if (reference_labels(cand_blocks) != refs
+            or reference_label_sequence(cand_blocks) != reference_label_sequence(src_blocks)):
         raise GuardReject("structure", "the reference labels the renderers may define changed")
     total_src = 0
     total_cand = 0
@@ -3971,14 +4082,16 @@ def _compare_blocks(src_blocks, cand_blocks, block_ratio):
             raise GuardReject("structure", "%s: candidate has %s" % (where, b.kind))
         if a.attrs != b.attrs:
             raise GuardReject("structure", "%s: attributes changed from %r to %r" % (where, a.attrs, b.attrs))
-        if a.kind in RAW_KINDS:
-            if a.raw != b.raw:
-                raise GuardReject("region_changed", "%s: protected region changed" % where)
-            continue
+        # (Also for a raw block, such as a definition, where markdown-it's
+        # paragraph starts: the unit runs past its bytes.)
         if len(a.md_units or ()) != len(b.md_units or ()):
             raise GuardReject("structure", "%s: the paragraphs markdown-it reads past it changed" % where)
         for su, cu in zip(a.md_units or (), b.md_units or ()):
             compare_prose(su, cu, where + " (as markdown-it reads it)", block_ratio, refs=refs)
+        if a.kind in RAW_KINDS:
+            if a.raw != b.raw:
+                raise GuardReject("region_changed", "%s: protected region changed" % where)
+            continue
         if len(a.units) != len(b.units):
             raise GuardReject("structure", "%s: cell count changed" % where)
         for k, (su, cu) in enumerate(zip(a.units, b.units)):
