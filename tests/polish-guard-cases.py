@@ -1760,12 +1760,83 @@ for name, src, cand in [
          'Use 30 of it.\n')]:
     rejects("R3 " + name, src, cand)
 for name, src, cand in [
-        ('prose at the end of emphasis around a long identifier reworded',
-         'Read _load_application_configuration_from_environment_variables_and_settings_files_now old wording_ here.\n',
-         'Read _load_application_configuration_from_environment_variables_and_settings_files_now old phrasing_ here.\n'),
         ('the space inside a spaced unit removed',
          'Wait 30 s now.\n',
          'Wait 30s now.\n')]:
+    accepts("R3 " + name, src, cand)
+
+
+# Re-review of b196e95: a lone underscore is not paired across words, labels
+# may hold a vertical tab or form feed, reference uses follow the same label
+# rules as definitions, single and double tildes are read both the cmark-gfm
+# way and the markdown-it way, dunder names keep their strong emphasis, and
+# scoped names with dots and units across spaces or a line break are whole.
+for name, src, cand in [
+        ('an identifier after a lone underscore changed',
+         'Use _private and _emphasis_ here.\n',
+         'Use _public and _emphasis_ here.\n'),
+        ('a path with an underscore changed',
+         'See /_private and _word_ here.\n',
+         'See /_public and _word_ here.\n'),
+        ('a destination below a label of a vertical tab changed',
+         '[\x0b]: alpha\n\n[link][\x0b]\n',
+         '[\x0b]: delta\n\n[link][\x0b]\n'),
+        ('a destination below a label of a form feed changed',
+         '[\x0c]: alpha\n\n[link][\x0c]\n',
+         '[\x0c]: delta\n\n[link][\x0c]\n'),
+        ('emphasis moved into a reference link with a label of 1000 bytes',
+         '[*a][' + 'a' * 1000 + '] b*\n\n[' + 'a' * 1000 + ']: /u\n',
+         '[*a*][' + 'a' * 1000 + '] b\n\n[' + 'a' * 1000 + ']: /u\n'),
+        ('emphasis added after a reference link with a no-break space label',
+         '[*a][\u00a0] b**\n\n[\u00a0]: /u\n',
+         '[*a][\u00a0] *b*\n\n[\u00a0]: /u\n'),
+        ('single-tilde strikethrough lost',
+         'Read ~word~ now.\n',
+         'Read ~ word ~ now.\n'),
+        ('single-tilde strikethrough turned into a double one',
+         'Read ~word~ now.\n',
+         'Read ~~word~~ now.\n'),
+        ('emphasis before a tilde after a long word lost',
+         'Read _' + 'a' * 80 + '_~ here.\n',
+         'Read _' + 'a' * 80 + '_~here.\n'),
+        ('emphasis that starts before a tilde lost (cmark-gfm reading)',
+         'Read x*~a* now.\n',
+         'Read x*~ a* now.\n'),
+        ('strikethrough inside a run of three tildes lost (markdown-it reading)',
+         'Read ~~~word~~~ now.\n',
+         'Read ~~~ word~~~ now.\n'),
+        ('strong emphasis of a dunder name lost',
+         'Read __init__ \u00e9 here.\n',
+         'Read __init__\u00e9 here.\n'),
+        ('the dot in a scoped member call removed',
+         'Call config::module.run() now.\n',
+         'Call config::module run() now.\n'),
+        ('strikethrough after a run of 101 tildes lost (cmark-gfm reading)',
+         'Read ' + '~' * 101 + 'word~ now.\n',
+         'Read ' + '~' * 101 + 'word ~ now.\n'),
+        ('a unit after two spaces changed',
+         'Wait 30  s now.\n',
+         'Wait 30  h now.\n'),
+        ('a unit after a line break changed',
+         'Wait 30\ns now.\n',
+         'Wait 30\nh now.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose in emphasis after a lone underscore reworded',
+         'Keep _private and _clear wording_ here.\n',
+         'Keep _private and _plain wording_ here.\n'),
+        ('the text of a reference link with a no-break space label reworded',
+         '[Read the manual][\u00a0]\n\n[\u00a0]: /u\n',
+         '[Consult the manual][\u00a0]\n\n[\u00a0]: /u\n'),
+        ('prose around single-tilde strikethrough reworded',
+         'Read ~word~ now.\n',
+         'See ~word~ today.\n'),
+        ('prose around strikethrough and emphasis reworded',
+         'Keep ~~old~~ *new* text.\n',
+         'Keep ~~old~~ *new* words.\n'),
+        ('prose around a dunder name reworded',
+         'Read __init__ first.\n',
+         'Open __init__ first.\n')]:
     accepts("R3 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)

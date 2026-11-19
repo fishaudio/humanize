@@ -204,12 +204,12 @@ WORD_TOKEN_RE = re.compile(
       (?P<path>(?<![\w./~-])(?:(?:~[\w.-]*|\.{1,2})?/[\w@+.-]+(?:/[\w@+.-]*)*
                                 |[\w@+.-]+(?:/[\w@+.-]*)+))
     | (?P<call>[A-Za-z_][\w.]*\(\))
-    | (?P<scope>[A-Za-z_]\w*(?:::\w+)+(?:\(\))?)
+    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\))?)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
     | (?P<qty>(?<![\w.])\d+(?:\.\d+)?
-        [ ]?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
+        [ \t]*(?:\n[ \t]*)?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
                |months?|years?|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz
                |s|h|d|B|k|K|M|G|x|%)
         (?![\w%]))
@@ -227,7 +227,7 @@ WORD_TOKEN_RE = re.compile(
 # otherwise retry every alternative at each position of the run, which takes
 # time quadratic in its length.
 LONG_RUN_RE = re.compile(
-    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)|\}|(?<=\d)[ ]?"
+    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)|\}|(?<=\d)[ \t]*(?:\n[ \t]*)?"
     r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
     r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)(?![\w%]))?",
     re.A)
@@ -241,9 +241,7 @@ PROSE_SLASH_PAIRS = frozenset([
 # Dotted abbreviations made of one-letter segments that are ordinary prose.
 PROSE_ABBREVIATIONS = frozenset(["e.g", "i.e", "a.k.a", "n.b", "p.s", "a.m", "p.m", "u.s", "u.k"])
 # Emphasis delimited by underscores, such as "_word_" or "__two words__".
-# Underscores between letters inside it cannot close it (CommonMark), so
-# the text may hold them: "_a snake_case name_" is emphasis.
-UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_]).+?(?<=[^\s_])\1(?!\w)")
+UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_])(?:(?!\1).)+?(?<=[^\s_])\1(?!\w)")
 MARKUP_TOKEN_KINDS = ("tag", "rawtag", "link", "image", "reflink", "autolink", "footnote", "escape")
 
 
@@ -434,7 +432,7 @@ def _scan_links(text, resolve=None, original=None):
                 if not label and not re.search(r"[\[\]]", text[i + 1:close]):
                     label = original[i + 1:close]
                 inner, inner_unmodeled = _scan_links(text[i + 1:close], resolve, original[i + 1:close])
-                if (label.strip() and resolve(label) == "yes"
+                if (_label_ok(label) and resolve(label) == "yes"
                         and not any(k == "link" for _, _, _, _, k, _ in inner)):
                     for (a, b, c, d, kind, target) in inner:
                         links.append((a + i + 1, b + i + 1, c + i + 1, d + i + 1, kind, target))
@@ -467,12 +465,13 @@ def _scan_links(text, resolve=None, original=None):
     return links, unmodeled
 
 
-REF_LABEL_LIMIT = 999
+REF_LABEL_LIMIT = 1000
 
 
 def _ref_label_close(text, open_bracket):
-    """Index of the "]" ending the link label (no unescaped brackets, at most
-    999 characters) that opens at ``open_bracket``, or None."""
+    """Index of the "]" ending the link label (no unescaped brackets) that
+    opens at ``open_bracket``, or None. The caller checks the label's length
+    in bytes and its whitespace with ``_label_ok`` on the original text."""
     i = open_bracket + 1
     while i < len(text) and i - open_bracket <= REF_LABEL_LIMIT + 1:
         ch = text[i]
@@ -528,9 +527,9 @@ def _scan_refs(masked, original, resolve, offset=0):
             # "[text][label]" (full) or "[text][]" (collapsed). A label of
             # only whitespace is not a label, and the text is no link.
             inner = original[end + 1:second]
-            label = inner if inner.strip() else (text_label if not inner else None)
+            label = inner if _label_ok(inner) else (text_label if not inner else None)
             end = second + 1
-        status = resolve(label) if label is not None and label.strip() else "no"
+        status = resolve(label) if label is not None and _label_ok(label) else "no"
         if status == "no":
             i += 1
             continue
@@ -597,7 +596,7 @@ def _scan_inline(text):
     return out
 
 
-def extract_tokens(text, labels=None, refs=None, maybe=None):
+def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     """Return (tokens, masked) for a prose fragment.
 
     ``tokens`` is an ordered list of (kind, value) pairs. ``masked`` is the
@@ -610,6 +609,12 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
     reference labels, or None when the fragment stands alone (a segment);
     the labels of references that may or may not resolve go to ``maybe``,
     each as (start, end, key): labels with the same key resolve together.
+
+    Tildes inside a protected word (a path such as ``~/file`` or a long run)
+    stay in ``masked``, as the renderers do not know these words and may
+    pair them as strikethrough. ``url_marks`` collects the positions and
+    characters of the emphasis markers inside bare URLs, which renderers
+    without autolinks read as markers and GitHub reads as part of a link.
     """
     chars = list(text)
     found = []
@@ -687,7 +692,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
     snapshot = current()
     for m in REF_LINK_RE.finditer(snapshot):
         kind = "reflink"
-        if not m.group(3).strip():
+        if not m.group(3).strip(LABEL_SPACE):
             # Collapsed reference "[label][]": the text is the label.
             found.append((m.start(), kind, m.group(0)))
             unhide.extend((k, snapshot[k]) for k in range(m.start(), m.end()) if snapshot[k] in "*_~")
@@ -729,6 +734,9 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
     for m in URL_RE.finditer(current()):
         url = _strip_url(m.group(0))
         found.append((m.start(), "url", url))
+        if url_marks is not None:
+            url_marks.extend((k, chars[k]) for k in range(m.start(), m.start() + len(url))
+                             if chars[k] in "*_~")
         _mask(chars, m.start(), m.start() + len(url))
 
     # Hide underscore emphasis delimiters from the identifier patterns so
@@ -738,6 +746,9 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
     for m in UNDERSCORE_EMPHASIS_RE.finditer(current()):
         delim = m.group(1)
         if delim == "__" and re.fullmatch(r"__\w+__", m.group(0), re.A):
+            # The name stays one identifier, but its underscores still pair
+            # as strong emphasis (cmark-gfm renders "__init__" bold).
+            unhide.extend((k, "_") for k in (m.start(), m.start() + 1, m.end() - 2, m.end() - 1))
             continue
         width = len(delim)
         for k in list(range(m.start(), m.start() + width)) + list(range(m.end() - width, m.end())):
@@ -748,6 +759,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
     for m in LONG_RUN_RE.finditer(current()):
         value = m.group(0).rstrip(".:,;")
         found.append((m.start(), "word", value))
+        unhide.extend((k, "~") for k in range(m.start(), m.start() + len(value)) if chars[k] == "~")
         _mask(chars, m.start(), m.start() + len(value))
 
     for m in WORD_TOKEN_RE.finditer(current()):
@@ -755,18 +767,19 @@ def extract_tokens(text, labels=None, refs=None, maybe=None):
         value = m.group(0)
         if kind == "path" and value.lower() in PROSE_SLASH_PAIRS:
             continue
-        if kind in ("digit", "dotted", "path"):
+        if kind in ("digit", "dotted", "path", "scope"):
             value = value.rstrip(".:,;")
         if kind == "dotted" and value.lower() in PROSE_ABBREVIATIONS:
             continue
         if kind == "qty":
-            value = value.replace(" ", "")
+            value = re.sub(r"\s+", "", value)
             found.append((m.start(), "word", value))
             _mask(chars, m.start(), m.end())
             continue
         if not value:
             continue
         found.append((m.start(), "word", value))
+        unhide.extend((k, "~") for k in range(m.start(), m.start() + len(value)) if chars[k] == "~")
         _mask(chars, m.start(), m.start() + len(value))
 
     for k, ch in hidden:
@@ -808,18 +821,44 @@ def _flank_class(ch):
     return "other"
 
 
-def _delimiter_runs(original, masked):
+def _delimiter_runs(original, masked, gfm=True):
     """Emphasis delimiter runs in ``masked`` (so markers inside code, math or
     URLs are text), each with whether it can open or close emphasis by the
-    CommonMark flanking rules, read against the characters of ``original``."""
+    CommonMark flanking rules, read against the characters of ``original``.
+
+    ``gfm`` selects the cmark-gfm reading: ``~`` and ``~~`` are strikethrough
+    runs, and tildes are skipped when looking at the characters around a
+    star or underscore run. Otherwise it is the markdown-it reading: a run
+    of two or more tildes holds one strikethrough delimiter per ``~~`` (an
+    odd first tilde is text), and a tilde is punctuation like any other."""
     ref = original if len(original) == len(masked) else masked
     runs = []
     for m in EMPHASIS_RUN_RE.finditer(masked):
         ch, size = m.group(0)[0], len(m.group(0))
-        if ch == "~" and size != 2:
-            continue
-        before = _flank_class(ref[m.start() - 1] if m.start() > 0 else None)
-        after = _flank_class(ref[m.end()] if m.end() < len(ref) else None)
+        start = m.start()
+        if ch == "~" and gfm and size > 100:
+            # cmark-gfm reads at most 100 tildes at a time, so the last
+            # piece of a longer run may be a strikethrough run of its own.
+            size = size % 100
+            start = m.end() - size
+        count = size
+        if ch == "~":
+            if gfm and not 1 <= size <= 2:
+                continue
+            if not gfm:
+                if size < 2:
+                    continue
+                count = size // 2
+        bi, ai = start - 1, m.end()
+        if ch != "~" and gfm:
+            # cmark-gfm looks past tildes for the characters around a star
+            # or underscore run (the strikethrough characters are skipped).
+            while bi >= 0 and ref[bi] == "~":
+                bi -= 1
+            while ai < len(ref) and ref[ai] == "~":
+                ai += 1
+        before = _flank_class(ref[bi] if bi >= 0 else None)
+        after = _flank_class(ref[ai] if ai < len(ref) else None)
         left = after != "space" and (after != "punct" or before != "other")
         right = before != "space" and (before != "punct" or after != "other")
         if ch == "_":
@@ -830,22 +869,33 @@ def _delimiter_runs(original, masked):
             can_close = right and (not left or after == "punct")
         else:
             can_open, can_close = left, right
-        runs.append({"ch": ch, "pos": m.start(), "orig": size, "count": size,
+        runs.append({"ch": ch, "pos": start, "orig": count, "count": count,
                      "open": can_open, "close": can_close})
     return runs
 
 
-def _pair_delimiters(stack, spans, literal):
+def _pair_delimiters(stack, spans, literal, gfm=True):
     """Pair the delimiter runs in ``stack`` (in text order) with the CommonMark
-    "process emphasis" rules, including the rule of three; ``~~`` pairs as
-    strikethrough. Adds (start, end, kind) to ``spans`` and counts the
-    delimiters that stay literal in ``literal``."""
+    "process emphasis" rules, including the rule of three. Adds (start, end,
+    kind) to ``spans`` and counts the delimiters that stay literal in
+    ``literal``.
+
+    In the cmark-gfm reading (``gfm``) a tilde run finds its opener as an
+    emphasis run does, but strikes through only when both runs have the same
+    length; otherwise both runs and every delimiter between them stay text.
+    cmark-gfm also keeps one search floor per character and closer length
+    (modulo 3): a closer that finds no opener stops later closers of that
+    class from looking further back, which can change the result. In the
+    markdown-it reading each ``~~`` pairs with the nearest ``~~`` opener,
+    without the rule of three, and the floor also depends on whether the
+    closer can open, so it only saves time."""
 
     def drop(run):
         if run["count"]:
-            key = run["ch"] if run["ch"] != "~" else "~~"
-            literal[key] = literal.get(key, 0) + (run["count"] if run["ch"] != "~" else 1)
+            key = run["ch"] if (run["ch"] != "~" or gfm) else "~~"
+            literal[key] = literal.get(key, 0) + run["count"]
 
+    floor = {}
     ci = 0
     while ci < len(stack):
         closer = stack[ci]
@@ -853,11 +903,20 @@ def _pair_delimiters(stack, spans, literal):
             ci += 1
             continue
         found = None
+        if gfm:
+            key = (closer["ch"], closer["orig"] % 3)
+        else:
+            # markdown-it's floor also keys on whether the closer can open,
+            # which makes it only a shortcut (the result is the same).
+            key = (closer["ch"], closer["open"], closer["orig"] % 3 if closer["ch"] != "~" else 0)
+        lowest = floor.get(key, -1)
         for oi in range(ci - 1, -1, -1):
             opener = stack[oi]
+            if opener["pos"] < lowest:
+                break
             if opener["ch"] != closer["ch"] or not opener["open"]:
                 continue
-            if closer["ch"] == "~":
+            if closer["ch"] == "~" and not gfm:
                 found = oi
                 break
             if ((opener["close"] or closer["open"])
@@ -866,7 +925,14 @@ def _pair_delimiters(stack, spans, literal):
                 continue
             found = oi
             break
+        if found is not None and gfm and closer["ch"] == "~" and stack[found]["orig"] != closer["orig"]:
+            for run in stack[found:ci + 1]:
+                drop(run)
+            del stack[found:ci + 1]
+            ci = found
+            continue
         if found is None:
+            floor[key] = closer["pos"]
             if not closer["open"]:
                 drop(closer)
                 del stack[ci]
@@ -875,7 +941,7 @@ def _pair_delimiters(stack, spans, literal):
             continue
         opener = stack[found]
         if closer["ch"] == "~":
-            use, kind = 2, "del"
+            use, kind = (closer["orig"] if gfm else 1), "del"
         elif opener["count"] >= 2 and closer["count"] >= 2:
             use, kind = 2, "strong" + closer["ch"]
         else:
@@ -898,7 +964,7 @@ def _pair_delimiters(stack, spans, literal):
         drop(run)
 
 
-def emphasis_structure(original, masked, labels=()):
+def emphasis_structure(original, masked, labels=(), gfm=True):
     """The emphasis a prose unit renders, independent of the words inside.
 
     Delimiter runs are paired with the CommonMark rules. Runs inside a link
@@ -909,15 +975,15 @@ def emphasis_structure(original, masked, labels=()):
     delimiters that stay literal. Moving a marker away from its word,
     regrouping markers, or swapping ``*`` and ``_`` changes the result.
     """
-    runs = _delimiter_runs(original, masked)
+    runs = _delimiter_runs(original, masked, gfm)
     spans = []
     literal = {}
     used = set()
     for label_start, label_end in sorted(labels, key=lambda lb: lb[1] - lb[0]):
         inside = [r for r in runs if id(r) not in used and label_start <= r["pos"] < label_end]
         used.update(id(r) for r in inside)
-        _pair_delimiters(inside, spans, literal)
-    _pair_delimiters([r for r in runs if id(r) not in used], spans, literal)
+        _pair_delimiters(inside, spans, literal, gfm)
+    _pair_delimiters([r for r in runs if id(r) not in used], spans, literal, gfm)
 
     # Spans nest properly; build the forest and describe it without order.
     spans.sort(key=lambda sp: (sp[0], -sp[1]))
@@ -1029,9 +1095,14 @@ def _check_emphasis(src, src_masked, src_labels, src_maybe,
     for bits in range(1 << len(keys)):
         on = [key for idx, key in enumerate(keys) if bits >> idx & 1]
         chosen = [k for k in relevant if src_maybe[k][2] in on]
-        if (emphasis_structure(src, src_masked, src_labels + [src_maybe[k][:2] for k in chosen])
-                != emphasis_structure(cand, cand_masked, cand_labels + [cand_maybe[k][:2] for k in chosen])):
-            raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
+        src_bounds = src_labels + [src_maybe[k][:2] for k in chosen]
+        cand_bounds = cand_labels + [cand_maybe[k][:2] for k in chosen]
+        # Both readings must stay the same: cmark-gfm and markdown-it differ
+        # on tildes (and cmark-gfm has its own search floor).
+        for gfm in (True, False):
+            if (emphasis_structure(src, src_masked, src_bounds, gfm)
+                    != emphasis_structure(cand, cand_masked, cand_bounds, gfm)):
+                raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
 
 
 def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars=False, refs=None):
@@ -1044,8 +1115,9 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
             if cand.count(ch) > src.count(ch):
                 raise GuardReject("markup_in_text", "%s: candidate adds %r" % (where, ch))
     src_labels, cand_labels, src_maybe, cand_maybe = [], [], [], []
-    src_tokens, src_masked = extract_tokens(src, src_labels, refs, src_maybe)
-    cand_tokens, cand_masked = extract_tokens(cand, cand_labels, refs, cand_maybe)
+    src_marks, cand_marks = [], []
+    src_tokens, src_masked = extract_tokens(src, src_labels, refs, src_maybe, src_marks)
+    cand_tokens, cand_masked = extract_tokens(cand, cand_labels, refs, cand_maybe, cand_marks)
     if src_tokens != cand_tokens:
         idx, x, y = _first_token_difference(src_tokens, cand_tokens)
         kinds = set()
@@ -1064,6 +1136,16 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
     _check_emphasis(src, src_masked, src_labels, src_maybe,
                     cand, cand_masked, cand_labels, cand_maybe, where)
+    if src_marks or cand_marks:
+        # Markers inside bare URLs: checked again as markers, the way the
+        # renderers without autolinks read them.
+        def with_marks(masked, marks):
+            chars = list(masked)
+            for k, ch in marks:
+                chars[k] = ch
+            return "".join(chars)
+        _check_emphasis(src, with_marks(src_masked, src_marks), src_labels, src_maybe,
+                        cand, with_marks(cand_masked, cand_marks), cand_labels, cand_maybe, where)
     if hard_break_count(src) != hard_break_count(cand):
         raise GuardReject("inline_markup", "%s: hard line breaks changed" % where)
     check_scripts(src_masked, cand_masked, where)
@@ -1098,10 +1180,10 @@ REFDEF_START_RE = re.compile(r"^[ ]{0,3}\[(?!\^)")
 # line) and an optional title, which may start on the next line and continue
 # over several lines. It must end at the end of a line. ``_match_definition``
 # reads it as cmark-gfm does; the destination needs a scanner of its own.
-# The label (at most 1000 UTF-8 bytes, see ``_label_ok``) is not only ASCII
-# whitespace; other whitespace counts as text in cmark-gfm.
+# The label (at most 1000 UTF-8 bytes, see ``_label_ok``) is not only spaces,
+# tabs and line ends; other whitespace counts as text in cmark-gfm.
 _REFDEF_HEAD_RE = re.compile(
-    r"[ ]{0,3}\[(?![ \t\n\x0b\x0c\r]*\])((?:\\[\s\S]|[^\[\]\\])+)\]:[ \t]*\n?[ \t]*")
+    r"[ ]{0,3}\[(?![ \t\n\r]*\])((?:\\[\s\S]|[^\[\]\\])+)\]:[ \t]*\n?[ \t]*")
 _POINTY_DEST_RE = re.compile(r"<(?:\\.|[^<>\n\\])*>")
 # A title: a backslash escapes the next character, and one more backslash
 # may come right before the closing delimiter (a backslash, as in
@@ -1120,10 +1202,14 @@ _ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 _ASCII_SPACE = frozenset(" \t\n\x0b\x0c\r")
 
 
+LABEL_SPACE = " \t\n\r"
+
+
 def _label_ok(label):
     """Whether cmark-gfm takes ``label`` (between the brackets) as a link
-    label: at most 1000 bytes of UTF-8, not only ASCII whitespace."""
-    return bool(label.strip(" \t\n\x0b\x0c\r")) and len(label.encode("utf-8", "surrogatepass")) <= 1000
+    label: at most 1000 bytes of UTF-8, not only spaces, tabs and line
+    ends (a vertical tab, form feed or no-break space is text)."""
+    return bool(label.strip(LABEL_SPACE)) and len(label.encode("utf-8", "surrogatepass")) <= 1000
 
 
 def _scan_destination(text, pos):
@@ -2440,9 +2526,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
 
 
 def normalize_label(label):
-    """A link label as cmark-gfm matches it: case-folded, with runs of ASCII
-    whitespace collapsed and the ends trimmed (other whitespace is text)."""
-    return " ".join(re.split(r"[ \t\n\x0b\x0c\r]+", label.strip(" \t\n\x0b\x0c\r"))).casefold()
+    """A link label as cmark-gfm matches it: case-folded, with runs of
+    spaces, tabs and line ends collapsed and the ends trimmed (other
+    whitespace is text)."""
+    return " ".join(re.split(r"[ \t\n\r]+", label.strip(LABEL_SPACE))).casefold()
 
 
 def reference_labels(blocks):
