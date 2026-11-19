@@ -2301,4 +2301,64 @@ for name, src, cand in [
          'Read [x][n](delta) now.\n\n[c]: /c\n---\n--\n> [n]: /n\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of d624bcc and a wider label differential fuzz: the rest of a
+# container that markdown-it closed inside a paragraph is kept byte for
+# byte, also past it while a block markdown-it reads there runs on; a
+# paragraph markdown-it opens at cmark-gfm's setext underline continues
+# lazily over the blocks after the heading; markdown-it ends nested quotes
+# at an indented lazy block start and continues a quote at an indented
+# quote marker; quoted multi-line labels in frozen blocks are collected
+# without their markers; a kept title keeps cmark-gfm's lazy whitespace;
+# and a heading in a list item keeps only its markers as structure.
+for name, src, cand in [
+        ('text markdown-it reads as code after it closed a list item edited',
+         '- [a]: /guide\n[b]: /other\n\n    echo hello\n',
+         '- [a]: /guide\n[b]: /other\n\n    echo world\n'),
+        ('an inline link next to a definition after a heading and indented code changed',
+         'Read [x][e](alpha) now.\n\n[j]: /j\n*\n--\n    code\n[e]: /w\n',
+         'Read [x][e](delta) now.\n\n[j]: /j\n*\n--\n    code\n[e]: /w\n'),
+        ('code after a list item markdown-it closed, in a further block, edited',
+         '- [a]: /guide\n[b]: /reference\n    - echo hello\n',
+         '- [a]: /guide\n[b]: /reference\n    - echo world\n'),
+        ('text inside an HTML block markdown-it opens after it closed a list item edited',
+         '- > [a]: /guide\nRead the guide.\n  <div>\nKeep this exact.\n</div>\n',
+         '- > [a]: /guide\nRead the guide.\n  <div>\nRetain this text.\n</div>\n'),
+        ('an indented heading-like lazy line after nested quotes edited',
+         '> > Note.\n    # echo hello\n',
+         '> > Note.\n    # echo world\n'),
+        ('an indented list-like lazy line after nested quotes edited',
+         '> > Note.\n    - echo hello\n',
+         '> > Note.\n    - echo world\n'),
+        ('an inline link next to a definition behind an indented quote marker changed',
+         'Read [x][n](alpha) now.\n\n> quoted\n    > > [n]: /n\n',
+         'Read [x][n](delta) now.\n\n> quoted\n    > > [n]: /n\n'),
+        ('a reference to a quoted multi-line label in a protected region changed',
+         'Read [guide][long label](alpha) now.\n\n<!-- polish:off -->\n> [long\n> label]: /guide\n<!-- polish:on -->\n',
+         'Read [guide][other label](alpha) now.\n\n<!-- polish:off -->\n> [long\n> label]: /guide\n<!-- polish:on -->\n'),
+        ('the whitespace of a lazy line inside a kept title changed',
+         'Read [r].\n\n> [r]: /guide\n"Read\n  the guide" extra.\n',
+         'Read [r].\n\n> [r]: /guide\n"Read\n the guide" extra.\n'),
+        ('the level of a heading in a list item after a definition changed',
+         '[a]: /guide\n2. # Install the package.\n',
+         '[a]: /guide\n2. ## Install the package.\n'),
+        ('a definition after indented code that continues a quote for markdown-it kept as a link',
+         'Read [x][b](alpha) now.\n\n> -     code\n    > quoted\n[b]: /y\n',
+         'Read [x][b](delta) now.\n\n> -     code\n    > quoted\n[b]: /y\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a list item markdown-it closed reworded',
+         '- [a]: /guide\n[b]: /other\n\nRead the guide.\n',
+         '- [a]: /guide\n[b]: /other\n\nSee the guide.\n'),
+        ('a heading in a list item after a definition reworded',
+         '[a]: /guide\n2. # Read the guide.\n',
+         '[a]: /guide\n2. # See the guide.\n'),
+        ('an indented plain lazy line after nested quotes reworded',
+         '> > Note.\n    more text here\n',
+         '> > Note.\n    more words here\n'),
+        ('a lazy line in a nested quote reworded',
+         '> > Note one.\n> continued here.\n',
+         '> > Note two.\n> continued here.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
