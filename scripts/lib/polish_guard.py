@@ -1513,34 +1513,38 @@ def _mdit_interrupts(line, level):
 
 def _open_inline_at_end(text):
     """Whether ``text`` (a paragraph) leaves an inline element open at its
-    end that more lines could close: an HTML comment, tag or other raw HTML
-    construct without its end, a backtick string with no later one of the
-    same length, an unmatched opening bracket, or a link destination that
-    is not closed."""
-    last = None
-    for m in re.finditer(r"<(?:!--|[A-Za-z/!?])", text):
-        last = m
-    if last is not None:
-        tail = text[last.end():]
-        if last.group(0) == "<!--":
-            if "-->" not in tail:
-                return True
-        elif ">" not in tail:
+    end that more lines could close: a backtick string with no later one of
+    the same length, or, outside code spans, an HTML comment, tag or other
+    raw HTML construct without its end, an unmatched opening bracket, or a
+    link destination that is not closed."""
+    runs = [(m.start(), m.end()) for m in re.finditer(r"`+", text)]
+    plain = []
+    pos = 0
+    k = 0
+    while k < len(runs):
+        start, end = runs[k]
+        size = end - start
+        close = next((x for x in range(k + 1, len(runs)) if runs[x][1] - runs[x][0] == size), None)
+        if close is None:
             return True
-    runs = [len(m.group(0)) for m in re.finditer(r"`+", text)]
-    pending = {}
-    for size in runs:
-        if pending.get(size):
-            pending[size] -= 1
-        else:
-            pending[size] = pending.get(size, 0) + 1
-    if any(pending.values()):
+        plain.append(text[pos:start])
+        pos = runs[close][1]
+        k = close + 1
+    plain.append(text[pos:])
+    rest = re.sub(r"\\.", "", " ".join(plain))
+    k = 0
+    while True:
+        m = re.compile(r"<(?:!--|[A-Za-z/!?])").search(rest, k)
+        if m is None:
+            break
+        close = rest.find("-->" if m.group(0) == "<!--" else ">", m.end())
+        if close < 0:
+            return True
+        k = close + 1
+    if rest.count("[") > rest.count("]"):
         return True
-    plain = re.sub(r"\\.", "", text)
-    if plain.count("[") > plain.count("]"):
-        return True
-    dest = plain.rfind("](")
-    return dest >= 0 and ")" not in plain[dest + 2:]
+    dest = rest.rfind("](")
+    return dest >= 0 and ")" not in rest[dest + 2:]
 
 
 def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_lines=None, depths=None):
@@ -3237,12 +3241,19 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         for kind, first, last, *_rest in md_read:
             if kind == "unknown":
                 md_only += [mdit_label_key(label) for label in _loose_labels("\n".join(content[first:last]))]
+        # cmark-gfm drops a paragraph of only definitions in a list item
+        # when a blank line closes it, before it decides whether the list is
+        # loose; closed otherwise, the paragraph still counts there.
+        defs_end = (("blank" if j < n and not _strip_quote(lines[j], quote).strip() else "other")
+                    if defs and rest == len(content) and depth > 0 else None)
         for first, last, label, parsed in defs:
             maybe = md_unknown is not None and first >= md_unknown
             md_key = md_defs.get(first, mdit_label_key(label) if maybe else "")
             ref = ((normalize_label(label), parsed and not above_table, md_key, not maybe)
                    if label is not None else None)
             marks = {"above_table": True} if above_table else {}
+            if defs_end is not None:
+                marks["closed_by"] = defs_end
             if first in kept_titles:
                 # A title cmark-gfm keeps from the paragraph text after it.
                 marks["kept_title"] = hashlib.sha256(
@@ -3308,6 +3319,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             md_level = _quote_depth(lines[i + last_read[1]])[0] if last_read[1] in quote_lazy else quote
             if md_item_continues(j, md_level):
                 md_open = j
+                md_lazy_run.append((i, j, md_level))
         if defs and rest == len(content) and depth > 0 and j < n and not _strip_quote(lines[j], quote).strip():
             # cmark-gfm drops a paragraph of definitions when the blank line
             # after it closes it. A list item that held nothing else is then
@@ -3402,6 +3414,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                         md_open = j
                         md_lazy_from.append((j, quote))
                         md_item_continues(j, md_depth)
+                        md_lazy_run.append((i, j, md_depth))
             if over:
                 kept = "\x00".join(r[0] + "\x00" + (r[3] if r[0] == "listitem"
                                                       else "\n".join(kept_lines[max(r[1], rest):r[2]]))
@@ -3660,7 +3673,14 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 for k in range(first, last):
                     in_def[k] = True
 
+    # The last region read for each (quote depth, content column): a start
+    # inside it ends at the same line and was frozen with it.
+    regions = {}
+
     def close_region(start, quote, base):
+        seen = regions.get((quote, base))
+        if seen is not None and seen[0] <= start < seen[1]:
+            return
         # The rest of cmark-gfm's container (blank lines included, and the
         # lazy lines that continue a paragraph in it), which markdown-it
         # reads outside it: its definitions only possibly count. From the
@@ -3678,6 +3698,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 if not cont_line[end]:
                     break
             end += 1
+        regions[(quote, base)] = (start, end)
         risky = None
         for k in range(start, end):
             lazy_line[k] = True
@@ -3698,10 +3719,14 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         freeze_run(risky, end)
 
     done = set()
+    queued = [0]
 
     def drain():
-        while closed_queue:
-            item = closed_queue.pop()
+        # (In the order found, so a region read once covers the later starts
+        # inside it.)
+        while queued[0] < len(closed_queue):
+            item = closed_queue[queued[0]]
+            queued[0] += 1
             if item not in done:
                 done.add(item)
                 close_region(*item)
@@ -3721,6 +3746,18 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 block_at.setdefault(block.line - 1, block)
         for first, at, level in md_lazy_run:
             nxt = block_at.get(at)
+            # An inline element the paragraph leaves open may close in the
+            # lines markdown-it continues it on: the paragraph and those
+            # lines are kept byte for byte.
+            if any(block_at.get(k) is not None and block_at[k].kind in ("paragraph", "heading")
+                   and _open_inline_at_end(block_at[k].raw) for k in range(first, at)):
+                k = at
+                while k < n and written[k].strip() and (k == at or not _mdit_interrupts(written[k], level)):
+                    raw_line[k] = True
+                    k += 1
+                for k in range(first, at):
+                    if block_at.get(k) is not None and block_at[k].kind in ("paragraph", "heading"):
+                        raw_line[k] = True
             # (Read with the quote markers the parse moved: such a marker
             # opens a quote in both renderers.)
             if nxt is None or nxt.kind != "html" or _mdit_interrupts(view[at], level):
@@ -3735,10 +3772,6 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                     freeze_run(k, last)
                     drain()
                     break
-            for k in range(first, at):
-                para = block_at.get(k)
-                if para is not None and para.kind == "paragraph" and _open_inline_at_end(para.raw):
-                    raw_line[k] = True
     for start, end in md_run_from + md_unknown_from:
         freeze_run(start, end)
         drain()

@@ -2604,4 +2604,42 @@ accepts("R3 4000 quoted HTML blocks after definitions unchanged", src, src)
 report("R3 4000 quoted HTML blocks after definitions checked within two and a half seconds",
        time.time() - started < 2.5, "%.2fs" % (time.time() - started))
 
+
+# Re-review of c54a348: the open-inline check scans the whole paragraph
+# with code spans masked; a paragraph that leaves an inline element open
+# is kept with the lines markdown-it continues it on, wherever it does; a
+# paragraph of only definitions in a list item records whether a blank
+# line closes it (cmark-gfm drops it before deciding looseness); closed
+# container regions are read once per container.
+for name, src, cand in [
+        ('a comment markdown-it reads across lazy HTML lines behind a later tag edited',
+         '> Note: <!-- Keep the old logo for now.\n    <img src="logo.png">\n  <img src="fallback.png">\n-->\n',
+         '> Note: <!-- Retain the old logo for now.\n    <img src="logo.png">\n  <img src="fallback.png">\n-->\n'),
+        ('a code span markdown-it reads across a lazy underline and a list item edited',
+         '1. [docs]: /guide\nRead `echo hello\n    ---\n2. echo done`\n',
+         '1. [docs]: /guide\nRead `echo world\n    ---\n2. echo done`\n'),
+        ('the end of a code span markdown-it reads across a list item edited',
+         '1. [docs]: /guide\nRead `echo hello\n2. echo done`\n',
+         '1. [docs]: /guide\nRead `echo hello\n2. echo over`\n')]:
+    rejects("R3 " + name, src, cand)
+rejects("R3 a blank line added after a definition that ends a list item",
+        '- Read [the notes][docs].\n\n  [docs]: /guide\n# Next step\n',
+        '- Read [the notes][docs].\n\n  [docs]: /guide\n\n# Next step\n', "structure")
+for name, src, cand in [
+        ('prose with a bracket in a code span before lazy HTML lines reworded',
+         '> Use `[` to start a character class.\n    <img src="logo.png">\n  <img src="fallback.png">\n',
+         '> Start a character class with `[`.\n    <img src="logo.png">\n  <img src="fallback.png">\n'),
+        ('prose with a backtick in a double-backtick code span before lazy HTML lines reworded',
+         '> Read ``a ` b`` in this example.\n    <img src="logo.png">\n  <img src="fallback.png">\n',
+         '> See ``a ` b`` in this example.\n    <img src="logo.png">\n  <img src="fallback.png">\n'),
+        ('a quote before a lazy HTML line reworded',
+         '> Read the notes here.\n<img src="logo.png">\n',
+         '> See the notes here.\n<img src="logo.png">\n')]:
+    accepts("R3 " + name, src, cand)
+started = time.time()
+src = "- [root]: /root\n[root]: /root\n\n" + "  [docs]: /guide\n[notes]: /notes\n\n" * 1000
+accepts("R3 1000 lazy definition paragraphs in one list item unchanged", src, src)
+report("R3 1000 lazy definition paragraphs in one list item checked within two seconds",
+       time.time() - started < 2.0, "%.2fs" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
