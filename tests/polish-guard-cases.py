@@ -2428,4 +2428,48 @@ for name, src, cand in [
          'Read [x][d](delta) now.\n\n1. [c]: /c\n[i]: /i\n"t" more\n\t===\n[d]: /z\n')]:
     rejects("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
 
+
+# Re-review of c2460e3: an HTML block markdown-it opens after it closed a
+# container runs to a blank line (raw HTML to its end marker) whatever the
+# containers of the lines; a list item cmark-gfm opens inside it stays open
+# after it, where markdown-it reads the top level; an underline indented
+# four columns is lazy text to a paragraph markdown-it reads outside the
+# list item, whatever it looks like; a list item with fewer quote markers
+# than markdown-it's open paragraph opens in markdown-it too; and the freeze
+# after a closed container stops once no block markdown-it reads can run on.
+for name, src, cand in [
+        ('a heading markdown-it reads inside an HTML block after a closed item edited',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n# Keep this exact.\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n# Retain this text.\n'),
+        ('a quote markdown-it reads inside an HTML block after a closed item edited',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n> Keep this exact.\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n> Retain this text.\n'),
+        ('a list item markdown-it reads inside an HTML block after a closed item edited',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n- Keep this exact.\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n- Retain this text.\n'),
+        ('text inside an HTML comment after a closed item and a blank line edited',
+         '- [docs]: /guide\n[notes]: /notes\n  <!-- start\n\nKeep this exact.\n-->\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <!-- start\n\nRetain this text.\n-->\n'),
+        ('code after a list item markdown-it reads inside an HTML block edited',
+         '[docs]: /guide\n2. # Installation\n  <img src="logo.png">\n  - Setup notes.\n\n      echo hello\n',
+         '[docs]: /guide\n2. # Installation\n  <img src="logo.png">\n  - Setup notes.\n\n      echo world\n'),
+        ('an inline link next to a definition after an indented dash underline changed',
+         'Read [guide][ref](online).\n\n- [docs]: /guide\nRead the setup notes.\n    ---\n[ref]: /reference\n',
+         'Read [guide][ref](latest).\n\n- [docs]: /guide\nRead the setup notes.\n    ---\n[ref]: /reference\n'),
+        ('an inline link next to a definition after an indented single dash changed',
+         'Read [guide][ref](online).\n\n- [docs]: /guide\nRead the setup notes.\n    -\n[ref]: /reference\n',
+         'Read [guide][ref](latest).\n\n- [docs]: /guide\nRead the setup notes.\n    -\n[ref]: /reference\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a list item after a quote markdown-it closed, with an indented paragraph, reworded',
+         '> - [docs]: /guide\n> Read the guide.\n2. Read notes.\n\n    Read the extra notes.\n',
+         '> - [docs]: /guide\n> Read the guide.\n2. Read notes.\n\n    See the extra notes.\n'),
+        ('prose after a closed quoted fence after a closed item reworded',
+         '- [docs]: /guide\nRead the guide.\n  > FFF\n  > echo first\n  > FFF\nRead the notes.\n',
+         '- [docs]: /guide\nRead the guide.\n  > FFF\n  > echo first\n  > FFF\nSee the notes.\n'),
+        ('prose after an HTML block and a blank line after a closed item reworded',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n\nRead the notes.\n',
+         '- [docs]: /guide\n[notes]: /notes\n  <img src="logo.png">\n\nSee the notes.\n')]:
+    accepts("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
+
 sys.exit(1 if FAILED else 0)
