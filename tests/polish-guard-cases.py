@@ -3208,4 +3208,89 @@ for name, src, cand in [
          '[docs]: /guide\n2.\n   > Some notes\n   Read the notes.\n')]:
     accepts("R3 " + name, src, cand)
 
+# (Re-review of fbf4735: a quote line short of a list item only markdown-it
+# opens ends the item unless it continues a paragraph lazily, and a lazy
+# line there ends the paragraph at a block start at any indentation; a
+# quote continues lazily only when it holds a paragraph; the lines a fence
+# or HTML block holds are kept line by line, inside another block too and
+# on a blank line; the label resolver reads labels past quote markers;
+# exits inside lines read already are not walked again; and an HTML block
+# closed on its first line ends there.)
+for name, src, cand in [
+        ('a paragraph after a lazy underline moved out of its outer list item',
+         '- > [docs]: /guide\n  Read the guide\n  2. # Notes\n  ===\n    Read these notes.\n',
+         '- > [docs]: /guide\n  Read the guide\n  2. # Notes\n  ===\nRead these notes.\n'),
+        ('a quote moved into a nested list item only markdown-it opens',
+         '- [docs]: /guide\n  2. Read these notes.\n    > First note.\n     > Second note.\n',
+         '- [docs]: /guide\n  2. Read these notes.\n     > First note.\n     > Second note.\n'),
+        ('a paragraph after a quoted HTML comment moved out of a list item only markdown-it opens',
+         '[docs]: /guide\n2.\n   > <!-- note -->\n   Read these notes.\n',
+         '[docs]: /guide\n2.\n   > <!-- note -->\n  Read these notes.\n'),
+        ('fence content inside a quoted paragraph cmark-gfm reads changed',
+         '[docs]: /guide\n2.\n   > A quoted note.\n    ```text\n    echo old\n',
+         '[docs]: /guide\n2.\n   > A quoted note.\n    ```text\n    echo new\n'),
+        ('whitespace added to a blank line in a fence that only markdown-it opens after an HTML block',
+         '- [docs]: /guide\n  2. Read\n   Read the notes.\n    > quoted\n   <span>\n      echo old\n  ~~~\n\nSee [ref] and old words.\n',
+         '- [docs]: /guide\n  2. Read\nRead the notes.\n    > quoted\n   <span>\n      echo old\n  ~~~\n   \nSee [ref] and old words.\n'),
+        ('a quote-only line added to an exit fence with no block of its own',
+         '> [docs]: /guide\n> 3. # Notes\n>    ```text\n> # Heading\n>    ```\n\n<div>\nNote.\n</div>\n',
+         '> [docs]: /guide\n> 3. # Notes\n>    ```text\n> # Heading\n>    ```\n> \n<div>\nNote.\n</div>\n'),
+        ('code whitespace after a reference whose quoted label continues on a quote line changed',
+         '> See [the key][backtick ` key] and `echo\n>  old` now.\n\n> [backtick\n> ` key]: /syntax\n',
+         '> See [the key][backtick ` key] and `echo\n old` now.\n\n> [backtick\n> ` key]: /syntax\n'),
+        ('a quote marker removed from a line after a lazy underline in a quote',
+         '> > [docs]: /guide\n> Read the guide\n> 2. # Notes\n> ===\n>   Continue with care.\n>   old "title"\n>\n> - [docs]: /guide\n>   3. # Notes\n>     [ref]: old\n>       [ref]: old\n>\n> See [ref] and old words.\n>\n> ```\n> old\n> ```\n',
+         '> > [docs]: /guide\n> Read the guide\n> 2. # Notes\n> ===\n<   Continue with care.\n>   old "title"\n>\n> - [docs]: /guide\n>   3. # Notes\n>     [ref]: old\n>       [ref]: old\n>\n> See [ref] and old words.\n>\n> ```\n> old\n> ```\n'),
+        ('a paragraph after a lazy underline in a nested list moved out of its item',
+         '- - See [Docs](<x`>) for details.\n\n  - > [docs]: /guide\n  Read the guide\n  2. # Notes\n   ===\n    Continue with care.\n  > [ref]: old\n\n  See [ref].\n',
+         '- - See [Docs](<x`>) for details.\n    \n  - > [docs]: /guide\n  Read the guide\n  2. # Notes\n   ===\nContinue with care.\n  > [ref]: old\n\n  See [ref].\n'),
+        ('a quote marker removed from a fence after a doubled underline in a quoted list item',
+         '> > [docs]: /guide\n> > 2.  Text\n> >    ===\n> >   ===\n> >     Read the notes.\n> >     ```\n> > echo old\n',
+         '> > [docs]: /guide\n> > 2.  Text\n> >    ===\n> >   ===\n> >     Read the notes.\n>     ```\n> > echo old\n'),
+        ('a definition after a lazy underline moved out of its outer list item',
+         '- > [docs]: /guide\n  Read the guide\n  2. # Notes\n   ===\n  [ref]:\n  [ref]: old\n\n  See [ref].\n',
+         '- > [docs]: /guide\n  Read the guide\n  2. # Notes\n   ===\n [ref]:\n  [ref]: old\n\n  See [ref].\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a paragraph after a lazy underline reworded in its outer list item',
+         '- > [docs]: /guide\n  Read the guide\n  2. # Notes\n  ===\n    Read these notes.\n',
+         '- > [docs]: /guide\n  Read the guide\n  2. # Notes\n  ===\n    Consult these notes.\n'),
+        ('prose after an HTML comment closed on its line in a list item only markdown-it opens',
+         '[docs]: /guide\n2. Read the guide.\n   <!-- note -->\n   Read these notes.\n',
+         '[docs]: /guide\n2. Read the guide.\n   <!-- note -->\n   Consult these notes.\n'),
+        ('prose after a pre block closed on its line in a list item only markdown-it opens',
+         '[docs]: /guide\n2. Read the guide.\n   <pre>keep</pre>\n   Read these notes.\n',
+         '[docs]: /guide\n2. Read the guide.\n   <pre>keep</pre>\n   Consult these notes.\n'),
+        ('prose after a script block closed on its line in a list item only markdown-it opens',
+         '[docs]: /guide\n2. Read the guide.\n   <script>keep</script>\n   Read these notes.\n',
+         '[docs]: /guide\n2. Read the guide.\n   <script>keep</script>\n   Consult these notes.\n'),
+        ('prose in a quoted paragraph before a fence in a list item only markdown-it opens reworded',
+         '[docs]: /guide\n2.\n   > A quoted note.\n    ```text\n    echo old\n',
+         '[docs]: /guide\n2.\n   > A short quoted note.\n    ```text\n    echo old\n'),
+        ('a quote marker indented one more column inside an outer list item, after a lazy line',
+         '1. > - [docs]: /guide\n   >   2. Read\n   >    Keep old notes.\n   >       Read the notes.\n',
+         '1. > - [docs]: /guide\n   >   2. Read\n   >    Keep old notes.\n    >       Read the notes.\n'),
+        ('a quote marker indented one more column inside an outer list item, before a definition',
+         '1. > - [docs]: /guide\n   >   2.  Text\n   >       <span>\n   >      [ref]: old\n',
+         '1. > - [docs]: /guide\n   >   2.  Text\n   >       <span>\n    >      [ref]: old\n'),
+        ('a quote marker indented one column on a fence line kept in a list item only markdown-it opens',
+         '> [docs]: /guide\n> 2.\n>   <span>\n>     ```\n> # Heading\n>     ```text\n>     > quoted\n\nSee [ref] and old words.\n',
+         '> [docs]: /guide\n> 2.\n>   <span>\n >     ```\n> # Heading\n>     ```text\n>     > quoted\n\nSee [ref] and old words.\n'),
+        ('a quote marker indented one column on an HTML line kept in a list item only markdown-it opens',
+         '> [docs]: /guide\n> 2.\n>  <span>\n>   [ref]: old\n>  Read the notes.\n',
+         '> [docs]: /guide\n> 2.\n >  <span>\n>   [ref]: old\n>  Read the notes.\n'),
+        ('whitespace added to a blank line after text markdown-it continues lazily over a fence-like line',
+         '- [docs]: /guide\n  2.  Text\n   - item\n    # Heading\n  Keep old notes.\n  [ref]: old\n      ```\n\nSee [ref] and old words.\n',
+         '- [docs]: /guide\n  2.  Text\n   - item\n    # Heading\n  Keep old notes.\n  [ref]: old\n      ```\n \nSee [ref] and old words.\n'),
+        ('whitespace added to a blank line after indented code markdown-it reads after a closed fence',
+         '- [docs]: /guide\n  2.\n    ```\n  ```\n      <span>\n\n> Read the notes.\n',
+         '- [docs]: /guide\n  2.\n    ```\n  ```\n      <span>\n \n> Read the notes.\n')]:
+    accepts("R3 " + name, src, cand)
+
+EXITS = "[docs]: /guide\n2.\n   ```\n   notes\n```\n\n" * 800
+started = time.time()
+accepts("R3 800 repeated item exit fences unchanged", EXITS, EXITS)
+report("R3 800 repeated item exit fences checked within two seconds", time.time() - started < 2.0,
+       "%.2fs" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
