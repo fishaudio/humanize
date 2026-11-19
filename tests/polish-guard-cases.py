@@ -2818,4 +2818,51 @@ for name, src, cand in [
          '- [docs]: /guide\nSee the guide\n3. More notes\n===\n    make build\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of e14f2de: cmark-gfm keeps the whitespace at the start of a
+# lazy line inside a span that opened before it; the paragraph of a list
+# item only markdown-it opens continues lazily too; how many blocks a
+# markdown-it paragraph spans, and what follows a paragraph markdown-it
+# reads outside its containers, are structure; a range markdown-it may read
+# in any way keeps its quote depths; a list item outside the item
+# markdown-it reads the paragraph in ends that paragraph; and the paragraph
+# units keep the whitespace markdown-it may keep in a code span.
+for name, src, cand in [
+        ('a quote marker added to a lazy line inside a multi-line attribute',
+         '> <span title="Next ->\n old page">next</span> here.\n',
+         '> <span title="Next ->\n>  old page">next</span> here.\n'),
+        ('emphasis in a list item only markdown-it opens broken across a lazy HTML line',
+         '> [docs]: /guide\n> 2. Read *the guide\n<br>\nnotes* here.\n',
+         '> [docs]: /guide\n> 2. Read * the guide\n<br>\nnotes* here.\n'),
+        ('a blank line that moves prose out of the paragraph markdown-it continues',
+         '> - Read the guide.\n> <br>\nRead the notes.\n',
+         '> - Read the guide.\n> <br>\n\nRead the notes.\n'),
+        ('a quote line markdown-it reads as a quote after a closed container removed',
+         '> [docs]: /guide\nRead the guide.\n>\n',
+         '> [docs]: /guide\nRead the guide.\n\n'),
+        ('quote markers removed in lines markdown-it may read in any way',
+         'Read [the docs][docs].\n\n> > [guide]: /guide\n> Read these notes.\n    2. Read the guide.\n> > [docs]: /guide "Useful title"\n\n[docs]: /fallback\n',
+         'Read [the docs][docs].\n\n> > [guide]: /guide\n> Read these notes.\n    2. Read the guide.\n[docs]: /guide "Useful title"\n\n[docs]: /fallback\n'),
+        ('whitespace inside a code span markdown-it reads over lazy lines changed',
+         '> > [docs]: /guide\n  Read ``echo `alpha here\n     beta~~\n  2. \\`alpha `beta\n',
+         '> > [docs]: /guide\n  Read ``echo `alpha here\n    beta~~\n  2. \\`alpha `beta\n'),
+        ('an underline indented four columns after markdown-it closed the list item',
+         '- [docs]: /guide\nIntro\n===\n  Read the guide\n    ---\n',
+         '- [docs]: /guide\nIntro\n===\n  Read the guide\n   ---\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose in a nested list after a definition and a lazy underline reworded',
+         '- 1. [docs]: /guide\n  Use *suffix when matching **files**.\n===\n2. Use prefix* for the other pattern.\n',
+         '- 1. [docs]: /guide\n  When matching **files**, use *suffix.\n===\n2. Use prefix* for the other pattern.\n'),
+        ('prose in a list item only markdown-it opens reworded',
+         '> [docs]: /guide\n> 2. Read *the guide\n<br>\nnotes* here.\n',
+         '> [docs]: /guide\n> 2. See *the guide\n<br>\nnotes* here.\n'),
+        ('prose after a multi-line attribute reworded',
+         '> <span title="Next ->\n old page">next</span> here.\n',
+         '> <span title="Next ->\n old page">next</span> now.\n'),
+        ('the indentation of a prose line markdown-it continues changed',
+         '1. [docs]: /guide\nRead the notes\n    and more here.\n2. Next item\n',
+         '1. [docs]: /guide\nRead the notes\n  and more here.\n2. Next item\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
