@@ -2642,4 +2642,61 @@ accepts("R3 1000 lazy definition paragraphs in one list item unchanged", src, sr
 report("R3 1000 lazy definition paragraphs in one list item checked within two seconds",
        time.time() - started < 2.0, "%.2fs" % (time.time() - started))
 
+
+# Re-review of 3633f10: where markdown-it continues a paragraph past
+# cmark-gfm's, the paragraph it reads is compared as a prose unit of its
+# own (code spans, raw HTML, emphasis and links as markdown-it groups
+# them), which replaces the open-inline heuristic; a blank line after a
+# container markdown-it closed is structure; and the reference labels the
+# renderers may define must stay the same.
+for name, src, cand in [
+        ('a code span after an escaped backtick markdown-it reads across a list item edited',
+         '1. [docs]: /guide\nType \\` here, then run `echo hello\n2. echo done`\n',
+         '1. [docs]: /guide\nType \\` here, then run `echo world\n2. echo done`\n'),
+        ('a processing instruction markdown-it reads across a list item edited',
+         "1. [docs]: /guide\nPreview: <?php if ($count > 0) echo 'old';\n2. ?>\n",
+         "1. [docs]: /guide\nPreview: <?php if ($count > 0) echo 'new';\n2. ?>\n"),
+        ('a quoted attribute markdown-it reads across a list item edited',
+         '1. [docs]: /guide\nPreview: <span title="More > old\n2. details">note</span>\n',
+         '1. [docs]: /guide\nPreview: <span title="More > new\n2. details">note</span>\n'),
+        ('emphasis markdown-it reads across a list item broken',
+         '1. [docs]: /guide\nRead *the guide\n2. notes* here.\n',
+         '1. [docs]: /guide\nRead * the guide\n2. notes* here.\n'),
+        ('a blank line added after a quote markdown-it continues past a closed item',
+         '- [docs]: /guide\nContinue the setup.\n  > Read the guide.\n> Read the notes.\n',
+         '- [docs]: /guide\nContinue the setup.\n  > Read the guide.\n\n> Read the notes.\n'),
+        ('a blank line added before a definition markdown-it reads in a quote over indentation',
+         'Read [the guide][docs].\n\n> # Next step\n    > [docs]: /guide\n',
+         'Read [the guide][docs].\n\n> # Next step\n\n    > [docs]: /guide\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose with an escaped backtick before a list item markdown-it continues reworded',
+         '1. [docs]: /guide\nType \\` to start the example.\n2. Continue with the setup.\n',
+         '1. [docs]: /guide\nEnter \\` to start the example.\n2. Continue with the setup.\n'),
+        ('prose with a bracket in a closed comment before a list item markdown-it continues reworded',
+         '1. [docs]: /guide\nRead <!-- Keep [ as written. -->the notes here.\n2. Continue with the setup.\n',
+         '1. [docs]: /guide\nSee <!-- Keep [ as written. -->the notes here.\n2. Continue with the setup.\n'),
+        ('prose with a bracket in a closed attribute before a list item markdown-it continues reworded',
+         '1. [docs]: /guide\nRead <span title="[">the notes</span> here.\n2. Continue with the setup.\n',
+         '1. [docs]: /guide\nSee <span title="[">the notes</span> here.\n2. Continue with the setup.\n'),
+        ('prose with a backtick in a closed comment before a list item markdown-it continues reworded',
+         '1. [docs]: /guide\nRead <!-- Keep ` as written. -->the notes here.\n2. Continue with the setup.\n',
+         '1. [docs]: /guide\nSee <!-- Keep ` as written. -->the notes here.\n2. Continue with the setup.\n'),
+        ('emphasis markdown-it reads across a list item reworded with its words',
+         '1. [docs]: /guide\nRead *the guide\n2. notes* here.\n',
+         '1. [docs]: /guide\nSee *the guide\n2. notes* here.\n'),
+        # (A line that ends the paragraph for markdown-it too, a quoted
+        # blank line or a block inside the paragraph's list item, starts no
+        # paragraph of markdown-it's own.)
+        ('a blank line moved into the quote after its paragraph',
+         '> Read the guide.\n\nSee the notes.\n',
+         '> Read the guide.\n>\nSee the notes.\n'),
+        ('a nested list item indented further inside its item',
+         '- Read the guide.\n  - Read the notes.\n  ```\n  make\n  ```\n',
+         '- Read the guide.\n    - Read the notes.\n  ```\n  make\n  ```\n'),
+        ('a heading indented further inside its list item',
+         '1. Read the guide.\n   # Next step\n   Read the notes.\n',
+         '1. Read the guide.\n     # Next step\n   Read the notes.\n')]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
