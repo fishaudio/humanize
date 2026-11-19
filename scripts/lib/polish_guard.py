@@ -176,11 +176,13 @@ AUTOLINK_RE = re.compile(
 # Inline links and images are found by _scan_links, which balances brackets
 # and parentheses to any depth up to this limit.
 LINK_NESTING_LIMIT = 32
-REF_LINK_RE = re.compile(r"(!?)\[((?:\\.|[^\[\]\\])+)\]\[((?:\\.|[^\[\]\\])*)\]")
+REF_LINK_RE = re.compile(r"(!?)\[((?:\\.|[^\[\]\\])*)\]\[((?:\\.|[^\[\]\\])*)\]")
 FOOTNOTE_REF_RE = re.compile(r"\[\^[^\]\s]+\]")
 # Any other bracketed text may be a shortcut reference link whose label is
-# its text, so it is protected as a whole.
-SHORTCUT_REF_RE = re.compile(r"!?\[(?:\\.|[^\[\]\\])+\](?![(\[])")
+# its text, so it is protected as a whole (also before a "(" that starts no
+# inline link, or before a "[" that opens no label: inline links and full
+# references are masked before this pattern runs).
+SHORTCUT_REF_RE = re.compile(r"!?\[(?:\\.|[^\[\]\\])+\](?!\[(?:\\.|[^\[\]\\])*\])")
 # HTML tags by the CommonMark grammar: a ">" inside a quoted attribute value
 # does not end the tag. A tag that does not fit the grammar falls back to the
 # looser form, which ends at the first ">".
@@ -204,8 +206,8 @@ WORD_TOKEN_RE = re.compile(
     r"""
       (?P<path>(?<![\w./~-])(?:(?:~[\w.-]*|\.{1,2})?/[\w@+.-]+(?:/[\w@+.-]*)*
                                 |[\w@+.-]+(?:/[\w@+.-]*)+))
-    | (?P<call>[A-Za-z_][\w.]*\(\)(?:\.\w+(?:\(\))?)*)
-    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\)(?:\.\w+(?:\(\))?)*)?)
+    | (?P<call>[A-Za-z_][\w.]*\(\)(?:(?:\.|::)\w+(?:\(\))?)*)
+    | (?P<scope>[A-Za-z_][\w.]*(?:::[\w.]+)+(?:\(\)(?:(?:\.|::)\w+(?:\(\))?)*)?)
     | (?P<flag>(?<![\w-])--[A-Za-z0-9][\w-]*)
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
@@ -228,7 +230,7 @@ WORD_TOKEN_RE = re.compile(
 # otherwise retry every alternative at each position of the run, which takes
 # time quadratic in its length.
 LONG_RUN_RE = re.compile(
-    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)|\}|(?<=\d)[ \t\u00a0\u2007\u2009\u200a\u202f]*"
+    r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\(\)(?:(?:\.|::)\w+(?:\(\))?)*|\}|(?<=\d)[ \t\u00a0\u2007\u2009\u200a\u202f]*"
     r"(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?"
     r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
     r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)(?![\w%]))?",
@@ -370,7 +372,10 @@ def _link_tail(text, open_paren):
                 break
             i += 1
         if depth:
-            return None, False
+            # cmark-gfm takes a destination that leaves parentheses open
+            # when whitespace ends it ("[w](a(b )" links to "a(b");
+            # markdown-it does not: the unit is kept byte for byte.
+            return (None, True) if i < n else (None, False)
     dest_end = i
     j = _skip_space(text, i)
     if j < n and j > dest_end and text[j] in "\"'(":
@@ -434,7 +439,14 @@ def _scan_links(text, resolve=None, original=None):
                 if not label and not re.search(r"[\[\]]", text[i + 1:close]):
                     label = original[i + 1:close]
                 inner, inner_unmodeled = _scan_links(text[i + 1:close], resolve, original[i + 1:close])
-                if (resolve(label, _label_ok(label)) == "yes"
+                status = resolve(label, _label_ok(label))
+                if status not in ("yes", "no") and second + 1 < n and text[second + 1] == "(":
+                    # "[text][label](dest)": a reference to one renderer or
+                    # reading, text and an inline link to the other. The
+                    # whole unit is kept byte for byte.
+                    unmodeled = True
+                    break
+                if (status == "yes"
                         and not any(k == "link" for _, _, _, _, k, _ in inner)):
                     for (a, b, c, d, kind, target) in inner:
                         links.append((a + i + 1, b + i + 1, c + i + 1, d + i + 1, kind, target))
@@ -472,10 +484,11 @@ REF_LABEL_LIMIT = 1000
 
 def _ref_label_close(text, open_bracket):
     """Index of the "]" ending the link label (no unescaped brackets) that
-    opens at ``open_bracket``, or None. The caller checks the label's length
-    in bytes and its whitespace with ``_label_ok`` on the original text."""
+    opens at ``open_bracket``, or None. The label may be of any length, as
+    markdown-it has no limit; the caller checks cmark-gfm's limit in bytes
+    and its whitespace with ``_label_ok`` on the original text."""
     i = open_bracket + 1
-    while i < len(text) and i - open_bracket <= REF_LABEL_LIMIT + 1:
+    while i < len(text):
         ch = text[i]
         if ch == "\\" and i + 1 < len(text):
             i += 2
@@ -526,6 +539,16 @@ def _scan_refs(masked, original, resolve, offset=0):
         label = text_label
         cm_valid = True
         second = _ref_label_close(masked, end) if end < n and masked[end] == "[" else None
+        md_full = False
+        if second is None and end < n and masked[end] == "[":
+            # The next brackets hold brackets: no label for cmark-gfm, so
+            # "[text]" is a shortcut there, while markdown-it balances them
+            # into a label that no definition can have, so "[text]" is no
+            # link there. (Brackets that do not close within the window
+            # count as such a label too.)
+            window = masked[end:end + 4000]
+            close_at = _label_end(window, 0)
+            md_full = close_at >= 0 or len(window) == 4000
         if second is not None:
             # "[text][label]" (full) or "[text][]" (collapsed). A label of
             # only whitespace is not a label for cmark-gfm, and the text is
@@ -536,6 +559,8 @@ def _scan_refs(masked, original, resolve, offset=0):
                 label, cm_valid = inner, _label_ok(inner)
             end = second + 1
         status = resolve(label, cm_valid and _label_ok(label)) if label is not None else "no"
+        if md_full:
+            status = {"yes": "cm", "cm": "cm", "md": "no", "maybe": "maybe", "no": "no"}[status]
         if status == "no":
             i += 1
             continue
@@ -543,6 +568,16 @@ def _scan_refs(masked, original, resolve, offset=0):
         out.append((offset + i + 1, offset + close, kind, status, normalize_label(label)))
         out.extend(_scan_refs(masked[i + 1:close], original[i + 1:close], resolve,
                               offset + i + 1))
+        if second is not None and text_label is None and end - close > 3:
+            # When the link text holds a link, the text is no link, and its
+            # label "[label]" is a shortcut reference of its own; otherwise
+            # the label is not parsed. Either way its markers pair only with
+            # each other.
+            short = original[close + 2:second]
+            short_status = resolve(short, _label_ok(short))
+            if short_status != "no":
+                out.append((offset + close + 2, offset + second, "link", short_status,
+                            normalize_label(short)))
         i = end
     return out
 
@@ -628,8 +663,8 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     unhide = []
 
     def resolve(label, cm_valid=True):
-        """"yes", "maybe" or "no": whether a reference label resolves. Where
-        cmark-gfm and markdown-it resolve it differently, it may."""
+        """"yes", "maybe" or "no": whether a reference label resolves, or
+        "cm" or "md" when only cmark-gfm or only markdown-it resolves it."""
         if refs is None:
             return "maybe"
         cm = "no"
@@ -640,7 +675,13 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
             return cm
         key = mdit_label_key(label)
         md = "yes" if key and key in refs[2] else ("maybe" if key and key in refs[3] else "no")
-        return cm if cm == md else "maybe"
+        if cm == md:
+            return cm
+        if "maybe" in (cm, md):
+            return "maybe"
+        # Only one renderer resolves it: "cm" for cmark-gfm, "md" for
+        # markdown-it. Each reading then takes its own renderer's links.
+        return "cm" if cm == "yes" else "md"
 
     def current():
         return "".join(chars)
@@ -669,7 +710,9 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         found.append((m.start(), "autolink", m.group(0)))
         _mask(chars, m.start(), m.end())
 
-    links, _ = _scan_links(current(), resolve, text)
+    links, ambiguous = _scan_links(current(), resolve, text)
+    if ambiguous:
+        found.append((0, "frozen", text))
     for start, label_start, label_end, end, kind, target in links:
         found.append((start, kind, target))
         # Keep the link text editable; mask the syntax and the target.
@@ -679,12 +722,10 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     if labels is not None:
         # Link and image labels are boundaries for emphasis: inline links,
         # and reference links whose label the document defines (with the
-        # same bracket scanner). CommonMark does not nest links, so a "link"
-        # that holds another link is text, and its brackets are no boundary
-        # (its destination is still protected here). A reference that may
-        # or may not resolve gives a possible boundary; one whose boundary
-        # also depends on references inside it gets a key of its own, so
-        # every combination is checked.
+        # same bracket scanner). A reference that may or may not resolve
+        # gives a possible boundary. Links do not nest, so link text that
+        # holds a link is no boundary; a unit whose link text holds a link
+        # that may or may not resolve is kept byte for byte.
         spans = [(ls, le, kind, "yes", None) for _, ls, le, _, kind, _ in links]
         spans += _scan_refs(current(), text, resolve)
         # The statuses of the links inside each link, found in one pass over
@@ -702,20 +743,21 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
                     found_inner.append(sp[3])
                 nxt += 1
             inside[k] = found_inner
-        nested = 0
         for k, (ls, le, kind, status, key) in enumerate(spans):
-            if kind == "link":
-                inner = inside[k]
-                if "yes" in inner:
+            if kind == "link" and inside[k]:
+                if "yes" in inside[k]:
+                    # Links do not nest: link text that holds a link is text.
                     continue
-                if inner:
-                    status = "maybe"
-                    key = ("nested", nested)
-                    nested += 1
+                # Link text that holds a reference that may or may not be a
+                # link: what the outer brackets and the label after them
+                # become then depends on it and on the renderer. The unit is
+                # kept byte for byte.
+                found.append((0, "frozen", text))
+                break
             if status == "yes":
                 labels.append((ls, le))
             elif maybe is not None:
-                maybe.append((ls, le, key))
+                maybe.append((ls, le, key, status if status in ("cm", "md") else None))
 
     snapshot = current()
     for m in REF_LINK_RE.finditer(snapshot):
@@ -733,8 +775,9 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
         status = resolve(m.group(3), _label_ok(m.group(3)))
         if status != "yes":
             unhide.extend((k, snapshot[k]) for k in range(m.end(2), m.end()) if snapshot[k] in "*_~")
-            if status == "maybe" and maybe is not None:
-                maybe.append((m.start(3), m.end(3), normalize_label(m.group(3))))
+            if status != "no" and maybe is not None:
+                maybe.append((m.start(3), m.end(3), normalize_label(m.group(3)),
+                              status if status in ("cm", "md") else None))
         _mask(chars, m.start(), m.start(2))
         _mask(chars, m.end(2), m.end())
 
@@ -745,6 +788,11 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None):
     snapshot = current()
     for m in SHORTCUT_REF_RE.finditer(snapshot):
         found.append((m.start(), "reflink", m.group(0)))
+        if m.group(0).startswith("!") and snapshot.startswith("(", m.end()):
+            # "![label](" that starts no inline image: cmark-gfm falls back
+            # to a reference image, markdown-it to a "!" and a reference
+            # link. The unit is kept byte for byte.
+            found.append((0, "frozen", text))
         # The bracketed text is protected as a whole, as it may be a link
         # label; its emphasis markers still pair with those around it when
         # it is not a link.
@@ -849,7 +897,7 @@ def _flank_class(ch):
     return "other"
 
 
-def _delimiter_runs(original, masked, gfm=True):
+def _delimiter_runs(original, masked, gfm=True, text_ends=frozenset()):
     """Emphasis delimiter runs in ``masked`` (so markers inside code, math or
     URLs are text), each with whether it can open or close emphasis by the
     CommonMark flanking rules, read against the characters of ``original``.
@@ -858,7 +906,9 @@ def _delimiter_runs(original, masked, gfm=True):
     runs, and tildes are skipped when looking at the characters around a
     star or underscore run. Otherwise it is the markdown-it reading: a run
     of two or more tildes holds one strikethrough delimiter per ``~~`` (an
-    odd first tilde is text), and a tilde is punctuation like any other."""
+    odd first tilde is text), and a tilde is punctuation like any other;
+    link text is parsed on its own there, so a run that ends where link text
+    ends (``text_ends``) has nothing after it."""
     ref = original if len(original) == len(masked) else masked
     runs = []
     for m in EMPHASIS_RUN_RE.finditer(masked):
@@ -886,7 +936,7 @@ def _delimiter_runs(original, masked, gfm=True):
             while ai < len(ref) and ref[ai] == "~":
                 ai += 1
         before = _flank_class(ref[bi] if bi >= 0 else None)
-        after = _flank_class(ref[ai] if ai < len(ref) else None)
+        after = _flank_class(ref[ai] if ai < len(ref) and (gfm or ai not in text_ends) else None)
         left = after != "space" and (after != "punct" or before != "other")
         right = before != "space" and (before != "punct" or after != "other")
         if ch == "_":
@@ -1003,15 +1053,32 @@ def emphasis_structure(original, masked, labels=(), gfm=True):
     delimiters that stay literal. Moving a marker away from its word,
     regrouping markers, or swapping ``*`` and ``_`` changes the result.
     """
-    runs = _delimiter_runs(original, masked, gfm)
+    runs = _delimiter_runs(original, masked, gfm, frozenset(end for _, end in labels))
     spans = []
     literal = {}
-    used = set()
-    for label_start, label_end in sorted(labels, key=lambda lb: lb[1] - lb[0]):
-        inside = [r for r in runs if id(r) not in used and label_start <= r["pos"] < label_end]
-        used.update(id(r) for r in inside)
-        _pair_delimiters(inside, spans, literal, gfm)
-    _pair_delimiters([r for r in runs if id(r) not in used], spans, literal, gfm)
+    # Each run belongs to the smallest label that holds it (labels nest), found
+    # in one sweep over the runs and the labels sorted by start; the labels
+    # are then paired innermost first.
+    bounds = sorted(set(labels), key=lambda lb: (lb[0], -lb[1]))
+    groups = {lb: [] for lb in bounds}
+    outside = []
+    open_labels = []
+    li = 0
+    for run in runs:
+        while li < len(bounds) and bounds[li][0] <= run["pos"]:
+            open_labels.append(bounds[li])
+            li += 1
+        while open_labels and open_labels[-1][1] <= run["pos"]:
+            open_labels.pop()
+        holder = None
+        for lb in reversed(open_labels):
+            if lb[0] <= run["pos"] < lb[1]:
+                holder = lb
+                break
+        (groups[holder] if holder is not None else outside).append(run)
+    for lb in sorted(bounds, key=lambda lb: lb[1] - lb[0]):
+        _pair_delimiters(groups[lb], spans, literal, gfm)
+    _pair_delimiters(outside, spans, literal, gfm)
 
     # Spans nest properly; build the forest and describe it without order.
     spans.sort(key=lambda sp: (sp[0], -sp[1]))
@@ -1109,7 +1176,7 @@ def _check_emphasis(src, src_masked, src_labels, src_maybe,
     matters only when emphasis markers sit inside it. Labels that share a
     reference label resolve together, so the combinations are taken over
     the distinct reference labels."""
-    if [m[2] for m in src_maybe] != [m[2] for m in cand_maybe]:
+    if [m[2:] for m in src_maybe] != [m[2:] for m in cand_maybe]:
         raise GuardReject("inline_markup", "%s: bracketed text changed" % where)
 
     def has_markers(masked, span):
@@ -1117,23 +1184,29 @@ def _check_emphasis(src, src_masked, src_labels, src_maybe,
 
     relevant = [k for k in range(len(src_maybe))
                 if has_markers(src_masked, src_maybe[k]) or has_markers(cand_masked, cand_maybe[k])]
+    # Labels that only one renderer resolves are boundaries in that
+    # renderer's reading only; the others may or may not resolve, and every
+    # combination of them is checked.
     keys = []
     for k in relevant:
-        if src_maybe[k][2] not in keys:
+        if src_maybe[k][3] is None and src_maybe[k][2] not in keys:
             keys.append(src_maybe[k][2])
     if len(keys) > AMBIGUOUS_LABEL_LIMIT:
+        if src == cand:
+            return
         raise GuardReject(
             "inline_markup",
             "%s: emphasis markers inside bracketed texts with more than %d different labels that may "
             "be links" % (where, AMBIGUOUS_LABEL_LIMIT))
     for bits in range(1 << len(keys)):
         on = [key for idx, key in enumerate(keys) if bits >> idx & 1]
-        chosen = [k for k in relevant if src_maybe[k][2] in on]
-        src_bounds = src_labels + [src_maybe[k][:2] for k in chosen]
-        cand_bounds = cand_labels + [cand_maybe[k][:2] for k in chosen]
+        chosen = [k for k in relevant if src_maybe[k][3] is None and src_maybe[k][2] in on]
         # Both readings must stay the same: cmark-gfm and markdown-it differ
-        # on tildes (and cmark-gfm has its own search floor).
+        # on tildes, on reference labels, and at the end of link text.
         for gfm in (True, False):
+            own = [k for k in relevant if src_maybe[k][3] == ("cm" if gfm else "md")]
+            src_bounds = src_labels + [src_maybe[k][:2] for k in chosen + own]
+            cand_bounds = cand_labels + [cand_maybe[k][:2] for k in chosen + own]
             if (emphasis_structure(src, src_masked, src_bounds, gfm)
                     != emphasis_structure(cand, cand_masked, cand_bounds, gfm)):
                 raise GuardReject("inline_markup", "%s: emphasis markers changed" % where)
@@ -1246,12 +1319,13 @@ def _label_ok(label):
     return bool(label.strip(LABEL_SPACE)) and len(label.encode("utf-8", "surrogatepass")) <= 1000
 
 
-def _scan_destination(text, pos):
+def _scan_destination(text, pos, balanced=False):
     """End of the link destination that starts at ``pos``, or None, as
     cmark-gfm scans one: inside angle brackets, or a bare run that ends at
     ASCII whitespace or at a closing parenthesis with none open. A backslash
     escapes ASCII punctuation; at most 32 parentheses may be open, and
-    parentheses still open where the run ends are allowed."""
+    parentheses still open where the run ends are allowed (``balanced``
+    rejects them, as markdown-it does)."""
     if text.startswith("<", pos):
         m = _POINTY_DEST_RE.match(text, pos)
         return m.end() if m else None
@@ -1272,6 +1346,8 @@ def _scan_destination(text, pos):
         elif ch in _ASCII_SPACE:
             break
         i += 1
+    if balanced and depth:
+        return None
     return i if i > pos else None
 
 
@@ -2513,7 +2589,13 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
         # blank line added or removed before the header changes structure.
         above_table = j in table_headers
         for first, last, label, parsed in defs:
-            ref = ((normalize_label(label), parsed and not above_table, mdit_label_key(label))
+            # markdown-it takes the definition too unless its destination
+            # leaves a parenthesis open (cmark-gfm allows that).
+            head = _REFDEF_HEAD_RE.match("\n".join(content[first:last]))
+            md_ok = bool(head) and _scan_destination("\n".join(content[first:last]), head.end(),
+                                                     balanced=True) is not None
+            ref = ((normalize_label(label), parsed and not above_table,
+                    mdit_label_key(label) if md_ok else "")
                    if label is not None else None)
             marks = {"above_table": True} if above_table else {}
             blocks.append(Block("refdef", attrs(**marks), "\n".join(lines[i + first:i + last]), [],

@@ -1933,4 +1933,74 @@ for name, src, cand in [
          '[' + 'a' * 1001 + ']: /u\n\nSee prose.\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of d6af219: references that only one renderer resolves are
+# boundaries in that renderer's reading only, a reference before an inline
+# link tail that depends on the renderer freezes its unit, definitions with
+# an unbalanced destination are cmark-gfm's only, labels have no length
+# limit for markdown-it, call chains continue after "::", shortcut
+# references may precede "(" or an unclosed "[", a full reference may have
+# empty text, link text ends a delimiter run for markdown-it, and a
+# destination that leaves a parenthesis open freezes its unit.
+for name, src, cand in [
+        ('the label before an inline link tail changed where the readings differ',
+         'Read [text][\u00a0](/v) now.\n\n[\u00a0]: /u\n',
+         'Read [text][\u2009](/v) now.\n\n[\u00a0]: /u\n'),
+        ('emphasis lost next to a reference whose definition only cmark-gfm takes',
+         'Read [*a][r] b* now.\n\n[r]: foo(bar\n',
+         'Read [*a][r] *b now.\n\n[r]: foo(bar\n'),
+        ('emphasis gained next to a reference with a label over 1000 bytes',
+         'Read a*[,**][' + 'a' * 1001 + ']** now.\n\n[' + 'a' * 1001 + ']: /u\n',
+         'Read a *[,**][' + 'a' * 1001 + ']** now.\n\n[' + 'a' * 1001 + ']: /u\n'),
+        ('a scoped name after a call changed',
+         'Call run().field::value now.\n',
+         'Call run().field::other now.\n'),
+        ('the member after a long call changed',
+         'Call ' + 'a' * 80 + '().field now.\n',
+         'Call ' + 'a' * 80 + '().other now.\n'),
+        ('a shortcut reference before a failed inline link changed',
+         'Read [word](oops now.\n\n[word]: /u\n',
+         'Read [term](oops now.\n\n[word]: /u\n'),
+        ('a shortcut reference before an unclosed bracket removed',
+         'Read [r][! now.\n\n[r]: /u\n',
+         'Read [][! now.\n\n[r]: /u\n'),
+        ('emphasis lost around a label that becomes a shortcut link',
+         'Read *[[r] x][a*]** now.\n\n[a*]: /u\n[r]: /v\n',
+         'Read *[[r] x][a*]**now.\n\n[a*]: /u\n[r]: /v\n'),
+        ('emphasis lost around a reference link with empty text',
+         'Read *[][a*]** now.\n\n[a*]: /u\n',
+         'Read *[][a*]**now.\n\n[a*]: /u\n'),
+        ('emphasis gained at the end of link text (markdown-it reading)',
+         'Read [__!_][r] now.\n\n[r]: /u\n',
+         'Read [ __!_][r] now.\n\n[r]: /u\n'),
+        ('a destination that leaves a parenthesis open changed',
+         'Read [word](a(b ) now.\n',
+         'Read [word](a(c ) now.\n'),
+        ('a reference image before a failed inline tail turned into a link',
+         'Read word![r]a(b now.\n\n[r]: /u\n',
+         'Read word![r](b now.\n\n[r]: /u\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose around five references that only markdown-it resolves reworded',
+         'Read ' + ' and '.join('[*word*][' + x + ' b]' for x in 'abcde') + ' now.\n\n'
+         + ''.join('[' + x + '\u00a0b]: /u\n' for x in 'abcde'),
+         'See ' + ' and '.join('[*word*][' + x + ' b]' for x in 'abcde') + ' now.\n\n'
+         + ''.join('[' + x + '\u00a0b]: /u\n' for x in 'abcde')),
+        ('prose after a shortcut reference before a failed inline link reworded',
+         'Read [word](oops now.\n\n[word]: /u\n',
+         'See [word](oops today.\n\n[word]: /u\n'),
+        ('prose around a reference whose text holds brackets reworded',
+         'Read [a [b] c][r] now.\n\n[r]: /u\n',
+         'See [a [b] c][r] today.\n\n[r]: /u\n'),
+        ('prose around a reference link with empty text reworded',
+         'Read [][r] now.\n\n[r]: /u\n',
+         'See [][r] today.\n\n[r]: /u\n')]:
+    accepts("R3 " + name, src, cand)
+started = time.time()
+accepts("R3 a paragraph of 8000 emphasized reference links unchanged",
+        "Read " + " ".join("[*w*][r]" for _ in range(8000)) + " now.\n\n[r]: /u\n",
+        "Read " + " ".join("[*w*][r]" for _ in range(8000)) + " now.\n\n[r]: /u\n")
+report("R3 a paragraph of 8000 emphasized reference links checked within three seconds",
+       time.time() - started < 3.0, "%.2fs" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
