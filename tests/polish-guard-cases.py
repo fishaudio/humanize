@@ -2543,4 +2543,65 @@ for name, src, cand in [
          '1. Run this:\n    # Not a heading\n')]:
     accepts("R3 " + name, src, cand)
 
+
+# Re-review of 5986fac: a fence that opened in text an HTML block may hold
+# opens again at its closing line once that block ended at a blank line; a
+# list item cmark-gfm opens after a setext underline markdown-it reads as
+# lazy text is read outside it; quote depths in the post-pass follow the
+# quote markers the parse moved into list items; an HTML block markdown-it
+# reads in frozen lines swallows the list items cmark-gfm opens there; a
+# quoted fence cmark-gfm ended with its quote runs on in markdown-it over a
+# quote marker indented four columns; quadratic rescans of the blocks are
+# gone; the freeze past a container stops at a line that interrupts a
+# paragraph, a paragraph that only continues a definition paragraph across
+# a new list item is not lazy, and the closed list item is the one the
+# lazy line does not reach. Own addition: where cmark-gfm starts an HTML
+# block on a lazy line and markdown-it continues its paragraph over it,
+# what markdown-it reads there and runs on is kept byte for byte.
+for name, src, cand in [
+        ('a heading markdown-it reads as code after a fence that opens again after a blank line edited',
+         '> - [docs]: /guide\n> [notes]: /notes\n>   <img src="logo.png">\n>   FFF\n>\n>   FFF\n> # Keep this exact.\n',
+         '> - [docs]: /guide\n> [notes]: /notes\n>   <img src="logo.png">\n>   FFF\n>\n>   FFF\n> # Retain this text.\n'),
+        ('code after a list item opened below a lazy underline edited',
+         '1. [docs]: /guide\nRead the guide.\n    ---\n2. Read notes.\n\n    echo hello\n',
+         '1. [docs]: /guide\nRead the guide.\n    ---\n2. Read notes.\n\n    echo world\n'),
+        ('a title markdown-it reads after a quoted HTML block in a nested item changed',
+         'Read [the guide][ref].\n\n- Notes.\n  - > [docs]: /guide\n    > <img src="logo.png">\n    > - Setup notes.\n    [ref]: /reference "Guide"\n',
+         'Read [the guide][ref].\n\n- Notes.\n  - > [docs]: /guide\n    > <img src="logo.png">\n    > - Setup notes.\n    [ref]: /reference "Notes"\n'),
+        ('an inline link next to a definition after a quoted comment with a blank line in a nested item changed',
+         'Read [guide][ref](online).\n\n- Outer notes.\n  - > - Notes.\n    >   <!-- start\n    >\n    >   -->\n    [ref]: /reference\n',
+         'Read [guide][ref](latest).\n\n- Outer notes.\n  - > - Notes.\n    >   <!-- start\n    >\n    >   -->\n    [ref]: /reference\n'),
+        ('code after a list item an HTML block inside a comment swallows edited',
+         '- Notes.\n  <!-- start\n\n  <img src="logo.png">\n  -->\n  - Read notes.\n\n      echo hello\n',
+         '- Notes.\n  <!-- start\n\n  <img src="logo.png">\n  -->\n  - Read notes.\n\n      echo world\n'),
+        ('a heading markdown-it reads in a quoted fence over an indented quote marker edited',
+         '> FFFtext\n    > Quoted code\n> # Setup notes\n> FFF\n',
+         '> FFFtext\n    > Quoted code\n> # Usage notes\n> FFF\n'),
+        ('a quoted list item markdown-it reads inside a comment after a lazy closing tag edited',
+         '>   - Read the item\n  </pre>\n   <!-- note\n\n> >\n> - Keep this item\n  here\n',
+         '>   - Read the item\n  </pre>\n   <!-- note\n\n> >\n> - Retain this item\n  here\n'),
+        ('a comment markdown-it reads inline across a lazy HTML line edited',
+         '  > Read this\n      FFF\n    <pre>\n    <!-- keep this\n<img src="x">\n-->\n<!-- end\n',
+         '  > Read this\n      FFF\n    <pre>\n    <!-- drop this\n<img src="x">\n-->\n<!-- end\n'),
+        ('a quote markdown-it reads as code after a fence in a lazy HTML block edited',
+         '> Read this\n    <img src="x">\n  <img src="x">\n   FFF\n<!-- note\n\n  -->\n      > Keep this\n',
+         '> Read this\n    <img src="x">\n  <img src="x">\n   FFF\n<!-- note\n\n  -->\n      > Drop this\n')]:
+    rejects("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
+for name, src, cand in [
+        ('a heading after a list item comment with a blank line reworded',
+         '- Notes.\n  <!-- start\n\n  -->\n# Read the notes.\n',
+         '- Notes.\n  <!-- start\n\n  -->\n# See the notes.\n'),
+        ('an indented paragraph in a list item both renderers open after definitions reworded',
+         '- [docs]: /guide\n[notes]: /notes\n2. Read notes.\nMore details.\n\n    Explain the setup.\n',
+         '- [docs]: /guide\n[notes]: /notes\n2. Read notes.\nMore details.\n\n    Describe the setup.\n'),
+        ('a heading after an HTML block that ends with its list item reworded',
+         '- Outer list.\n  - [docs]: /guide\n  [notes]: /notes\n    ---\n  <img src="logo.png">\n  FFF\n  FFF\n# Read the notes.\n',
+         '- Outer list.\n  - [docs]: /guide\n  [notes]: /notes\n    ---\n  <img src="logo.png">\n  FFF\n  FFF\n# See the notes.\n')]:
+    accepts("R3 " + name, src.replace("FFF", "```"), cand.replace("FFF", "```"))
+started = time.time()
+src = ">[a]: x\n><b>\n>- x\n\n" * 4000
+accepts("R3 4000 quoted HTML blocks after definitions unchanged", src, src)
+report("R3 4000 quoted HTML blocks after definitions checked within two and a half seconds",
+       time.time() - started < 2.5, "%.2fs" % (time.time() - started))
+
 sys.exit(1 if FAILED else 0)
