@@ -4395,4 +4395,66 @@ for name, doc in (("800 tables in numbered list items", "".join("%d. | Name | Va
     report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
            "%.2fs" % (time.process_time() - started))
 
+for name, src, cand in [
+        ('emphasis markdown-it reads from link text with a refused file link across table cells moved',
+         '| Files | Notes |\n| --- | --- |\n| [*.md files](file:///tmp/guide) | The value* is approximate. |\n',
+         '| Files | Notes |\n| --- | --- |\n| [*.md files](file:///tmp/guide) | The value *is approximate. |\n'),
+        ('emphasis markdown-it reads from link text holding a link across table cells moved',
+         '| Guide | Notes |\n| --- | --- |\n| [Read *[setup](/setup) instructions](/guide) | The value* is approximate. |\n',
+         '| Guide | Notes |\n| --- | --- |\n| [Read *[setup](/setup) instructions](/guide) | The value *is approximate. |\n'),
+        ('emphasis markdown-it reads past a resolved reference into an unresolved one across cells moved',
+         '| Fields | Notes |\n| --- | --- |\n| *Required [Fields*][r] | [Optional*] |\n\n[r]: /guide\n',
+         '| Fields | Notes |\n| --- | --- |\n| Required* [Fields*][r] | [Optional*] |\n\n[r]: /guide\n'),
+        ('a table cell inside code markdown-it opens in TeX math reworded',
+         '| Expression | Notes |\n| --- | --- |\n| \\(x `sample\\) | The old value` is approximate. |\n',
+         '| Expression | Notes |\n| --- | --- |\n| \\(x `sample\\) | The new value` is approximate. |\n'),
+        ('a protected sentence after a closer in code opened in TeX math that runs into a footnote',
+         'See[^1].\n\nStart <!-- polish:off -->keep.\n\nRun \\(x `example\\) <!-- polish:on -->\n[^1]: done` here.\n\nRead old prose.\n',
+         'See[^1].\n\nStart <!-- polish:off -->keep.\n\nRun \\(x `example\\) <!-- polish:on -->\n[^1]: done` here.\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in image text with a link inside TeX math',
+         'Start <!-- polish:off -->keep.\n\n![Diagram \\( [sample](/guide "Use ] here") \\) <!-- polish:on -->](diagram.svg)\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n![Diagram \\( [sample](/guide "Use ] here") \\) <!-- polish:on -->](diagram.svg)\n\nRead new prose.\n'),
+        ('a protected sentence after a closer in code markdown-it reads from a footnote into the next one',
+         'Start <!-- polish:off -->keep.\n\n[^11]: Note `old <!-- polish:on --> y\n[^12]: The command is `echo old\n\nProse after old.\n',
+         'Start <!-- polish:off -->keep.\n\n[^11]: Note `old <!-- polish:on --> y\n[^12]: The command is `echo old\n\nProse after new.\n'),
+        ('a protected sentence after a closer in code markdown-it reads between quoted footnotes',
+         'Start <!-- polish:off -->keep.\n\n> [^11]: Note `old <!-- polish:on --> y\n[^12]: The command is `echo old\n\nProse after old.\n',
+         'Start <!-- polish:off -->keep.\n\n> [^11]: Note `old <!-- polish:on --> y\n[^12]: The command is `echo old\n\nProse after new.\n'),
+        ('a protected sentence after a closer in image text markdown-it reads into the next footnote',
+         'Start <!-- polish:off -->keep.\n\n[^11]: Note ![old <!-- polish:on --> y\n[^12]: The command](x.png) old\n\nProse after old.\n',
+         'Start <!-- polish:off -->keep.\n\n[^11]: Note ![old <!-- polish:on --> y\n[^12]: The command](x.png) old\n\nProse after new.\n'),
+        ('prose inside code that opens in TeX math reworded',
+         'Use \\(x `sample\\) and the old value` here.\n',
+         'Use \\(x `sample\\) and the new value` here.\n'),
+        ('prose inside code that opens in TeX math reworded on the next line',
+         'Use \\(x `sample\\) and the\nold value` here.\n',
+         'Use \\(x `sample\\) and the\nnew value` here.\n'),
+        ('a protected sentence after a closer in code that opens in TeX math',
+         'Start <!-- polish:off -->keep.\n\nUse \\(x `a\\) <!-- polish:on --> b` c.\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\nUse \\(x `a\\) <!-- polish:on --> b` c.\n\nRead new prose.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose next to TeX math reworded',
+         'Use \\(x + y\\) and the old value here.\n',
+         'Use \\(x + y\\) and the new value here.\n'),
+        ('prose next to TeX math and closed code reworded',
+         'Use \\(x\\) and `code` with the old value here.\n',
+         'Use \\(x\\) and `code` with the new value here.\n'),
+        ('prose after a closer between two footnotes with nothing running on reworded',
+         'See[^11] and [^12].\n\n[^11]: Note <!-- polish:off --> keep <!-- polish:on --> y\n[^12]: The command.\n\nProse after old.\n',
+         'See[^11] and [^12].\n\n[^11]: Note <!-- polish:off --> keep <!-- polish:on --> y\n[^12]: The command.\n\nProse after new.\n'),
+        ('a table cell next to an undefined bracket pair reworded',
+         '| Done | Task |\n| --- | --- |\n| [x] *a* | Read the old notes. |\n| [ ] b | More. |\n',
+         '| Done | Task |\n| --- | --- |\n| [x] *a* | Read the new notes. |\n| [ ] b | More. |\n'),
+        ('a table cell next to a reference with closed emphasis reworded',
+         '| Link | Notes |\n| --- | --- |\n| [*a*][r] | Read the old notes. |\n\n[r]: /u\n',
+         '| Link | Notes |\n| --- | --- |\n| [*a*][r] | Read the new notes. |\n\n[r]: /u\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("1500 paragraphs with references before footnotes", "See[^1].\n\n" + "".join("Para [x][r%d] *e* `c`.\n[^%d]: Note *f* %d.\n\n" % (k % 3, k, k) for k in range(1500)) + "[r0]: /a\n[r1]: /b\n[r2]: /c\n"),
+                  ("2000 table rows with TeX math, code and links", "| a | b |\n| --- | --- |\n" + "".join("| \\(x_%d\\) | `c` [a](/u) *e* |\n" % k for k in range(2000)))):
+    started = time.process_time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
+           "%.2fs" % (time.process_time() - started))
+
 sys.exit(1 if FAILED else 0)
