@@ -4457,4 +4457,82 @@ for name, doc in (("1500 paragraphs with references before footnotes", "See[^1].
     report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
            "%.2fs" % (time.process_time() - started))
 
+for name, src, cand in [
+        ('emphasis the renderers read from a star in TeX math moved',
+         'Use \\(x*y\\) and the value* is approximate.\n',
+         'Use \\(x*y\\) and the value *is approximate.\n'),
+        ('emphasis the renderers read from a star in dollar math moved',
+         'Use $2*x$ and the value* is approximate.\n',
+         'Use $2*x$ and the value *is approximate.\n'),
+        ('emphasis the renderers read from a star in display TeX math moved',
+         'Use \\[x*y\\] and the value* now.\n',
+         'Use \\[x*y\\] and the value * now.\n'),
+        ('emphasis markdown-it reads through a refused file link moved',
+         '*a old b* and [*.md](file:///x) then v* old.\n',
+         '*a old b * and [*.md](file:///x) then v* old.\n'),
+        ('emphasis markdown-it reads through a refused file link ended',
+         '*a old b* and [*.md](file:///x) then v* old.\n',
+         '*a old b* and [*.md](file:///x) then v * old.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose next to a star in TeX math reworded',
+         'Use \\(x*y\\) and the old value here.\n',
+         'Use \\(x*y\\) and the new value here.\n'),
+        ('emphasis after a star in TeX math reworded',
+         'Use \\(x*y\\) and *the old value* here.\n',
+         'Use \\(x*y\\) and *the new value* here.\n'),
+        ('underscore emphasis after subscripts in TeX math reworded',
+         'Use \\(a_1 + b_2\\) and _the old value_ here.\n',
+         'Use \\(a_1 + b_2\\) and _the new value_ here.\n'),
+        ('emphasis around a refused file link reworded',
+         'Read *the [old](file:///x) notes* here.\n',
+         'Read *the [new](file:///x) notes* here.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, src, cand in [
+        ('code the renderers read in the tail of link text holding a link reworded',
+         'Read [the [setup](/setup) guide](/guide "Use ` here") and old prose` now.\n',
+         'Read [the [setup](/setup) guide](/guide "Use ` here") and new prose` now.\n'),
+        ('code the renderers read in the tail of link text holding a reference reworded',
+         'Read [the [setup] guide](/guide "Use ` here") and old prose` now.\n\n[setup]: /s\n',
+         'Read [the [setup] guide](/guide "Use ` here") and new prose` now.\n\n[setup]: /s\n'),
+        ('a protected sentence after a closer in code in the tail of link text holding a link',
+         'Start <!-- polish:off -->keep.\n\nRead [the [setup](/setup) guide](/guide "Use ` here") <!-- polish:on --> x` now.\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\nRead [the [setup](/setup) guide](/guide "Use ` here") <!-- polish:on --> x` now.\n\nRead new prose.\n'),
+        ('a protected sentence after a closer in code after a resolved and an unresolved reference',
+         'Start <!-- polish:off -->keep.\n\n[guide][s](/manual "Use ` here") [guide][r](/manual "Use ` here") <!-- polish:on --> more` text.\n\nRead old prose.\n\n[r]: /guide\n',
+         'Start <!-- polish:off -->keep.\n\n[guide][s](/manual "Use ` here") [guide][r](/manual "Use ` here") <!-- polish:on --> more` text.\n\nRead new prose.\n\n[r]: /guide\n'),
+        ('a link title across table cells after escaped parentheses in TeX math reworded',
+         '| Formula | Notes |\n| --- | --- |\n| \\(x [guide](guide\\(draft\\).html "Setup | old notes")\\) |\n',
+         '| Formula | Notes |\n| --- | --- |\n| \\(x [guide](guide\\(draft\\).html "Setup | new notes")\\) |\n'),
+        ('a protected sentence after a marker in image text with a link to escaped parentheses in TeX math',
+         'Start <!-- polish:off -->keep.\n\n![Diagram \\(see [the guide](guide\\(draft\\).html "Use ] to close")\\) <!-- polish:on -->](diagram.svg)\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n![Diagram \\(see [the guide](guide\\(draft\\).html "Use ] to close")\\) <!-- polish:on -->](diagram.svg)\n\nRead new prose.\n'),
+        ('emphasis the renderers read from a star in TeX math removed',
+         'Use \\(x*y\\) and the value* today.\n',
+         'Use \\(x*y\\) and the *value today.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a table cell next to two defined references with emphasis inside reworded',
+         '| Link | Notes |\n| --- | --- |\n| [*Guide*][guide] | Read the old notes. |\n| [*API*][api] | More details. |\n\n[guide]: /guide\n[api]: /api\n',
+         '| Link | Notes |\n| --- | --- |\n| [*Guide*][guide] | Read the new notes. |\n| [*API*][api] | More details. |\n\n[guide]: /guide\n[api]: /api\n'),
+        ('prose after a closer in a footnote in a list item before the next item reworded',
+         'See[^11] and [^12].\n\nStart <!-- polish:off -->keep.\n\n1. [^11]: The ` character <!-- polish:on --> is literal.\n2. [^12]: Run `echo ok`.\n\nRead old prose.\n',
+         'See[^11] and [^12].\n\nStart <!-- polish:off -->keep.\n\n1. [^11]: The ` character <!-- polish:on --> is literal.\n2. [^12]: Run `echo ok`.\n\nRead new prose.\n'),
+        ('prose after a link title holding a backtick reworded',
+         'Read [the guide](/guide "Use ` here") and old prose` now.\n',
+         'Read [the guide](/guide "Use ` here") and new prose` now.\n'),
+        ('prose after link text holding a link reworded',
+         'Read [the [setup](/setup) guide](/guide) and the old prose.\n',
+         'Read [the [setup](/setup) guide](/guide) and the new prose.\n'),
+        ('prose after an image holding a link reworded',
+         'See ![a [b](/c) d](i.png "t ` x") and old` y.\n',
+         'See ![a [b](/c) d](i.png "t ` x") and new` y.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("3000 table rows with references", "| a | b |\n| --- | --- |\n" + "".join("| [x][r%d] *e* | [y][r%d] _f_ |\n" % (k % 3, (k + 1) % 3) for k in range(3000)) + "\n[r0]: /a\n[r1]: /b\n[r2]: /c\n"),
+                  ("2000 paragraphs with TeX math and links to escaped parentheses", "".join("Use \\(x [g](g\\(d\\).html \"t\")\\) and *e* `c`.\n\n" for k in range(2000)))):
+    started = time.process_time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
+           "%.2fs" % (time.process_time() - started))
+
 sys.exit(1 if FAILED else 0)
