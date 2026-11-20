@@ -707,6 +707,8 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
     or a reference that resolves) deactivates the brackets open before it
     that open no image, as in CommonMark: their closing brackets start no
     link, so what looks like a destination and title after them is text.
+    markdown-it reads an image as one token, so there a link deactivates
+    only the brackets open after the nearest open image (READ_MD).
 
     Two choices depend on more than the text, and ``reading`` (bits) makes
     them; the bit of each choice met goes to ``seen``:
@@ -720,7 +722,8 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
       ``resolve`` (see extract_tokens) decides when it can.
     - READ_MD: markdown-it refuses a link or autolink to a "javascript:",
       "vbscript:", "file:" or "data:" destination, which cmark-gfm takes:
-      its brackets and backticks are then text and code syntax.
+      its brackets and backticks are then text and code syntax. A link
+      inside an open image's text also makes this choice (see above).
 
     With READ_TEX in ``reading``, TeX math is text, as the renderers read
     it: "\\(" and "\\[" are escapes.
@@ -728,11 +731,29 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
     out = []
     n = len(text)
     opens = []
-    # (The openers below this stack index are inactive unless they open an
-    # image: a link deactivates the brackets open before it, so their
-    # closing brackets start no link.)
-    dead_below = 0
+    # (For each open bracket: [opens an image, inactive, walked]. A link
+    # deactivates the brackets open before it, so their closing brackets
+    # start no link: in cmark-gfm every one that opens no image, in
+    # markdown-it, which reads an image as one token, those down to the
+    # nearest image (READ_MD). Each walk stops where an earlier one did, so
+    # the work stays linear.)
+    state = []
+    images = [0]
     escaped = set()
+
+    def deactivate():
+        if images[0] and seen is not None:
+            seen.add(READ_MD)
+        for entry in reversed(state):
+            if reading & READ_MD:
+                if entry[0] or entry[1]:
+                    break
+                entry[1] = True
+            else:
+                if entry[2]:
+                    break
+                entry[2] = True
+                entry[1] = entry[1] or not entry[0]
     i = 0
     while i < n:
         ch = text[i]
@@ -794,16 +815,18 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
             i += 1
             continue
         if ch == "[":
+            image = i > 0 and text[i - 1] == "!" and i - 1 not in escaped
             opens.append(i)
+            state.append([image, False, False])
+            images[0] += image
         elif ch == "]" and opens:
             start = opens.pop()
-            image = start > 0 and text[start - 1] == "!" and start - 1 not in escaped
-            if not image and len(opens) < dead_below:
+            image, inactive, _ = state.pop()
+            images[0] -= image
+            if inactive:
                 # (An inactive opener: the bracket is text.)
-                dead_below = len(opens)
                 i += 1
                 continue
-            dead_below = min(dead_below, len(opens))
             second = _ref_label_close(text, i + 1) if i + 2 < n and text[i + 1] == "[" else None
             if second is not None:
                 # (It matters where parentheses follow, or where the label
@@ -820,7 +843,7 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
                         # A reference link: its label is not read, and the
                         # parentheses after it are text.
                         if not image:
-                            dead_below = len(opens)
+                            deactivate()
                         i = second + 1
                         continue
             if i + 1 < n and text[i + 1] == "(":
@@ -833,10 +856,10 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
                 if end is not None:
                     out.append(("linktail", i + 1, end, text[i + 1:end]))
                     if not image:
-                        dead_below = len(opens)
+                        deactivate()
                     i = end
                     continue
-            if not image and len(opens) > dead_below:
+            if not image and state:
                 # A reference link (full, collapsed or shortcut) deactivates
                 # the brackets open before it too.
                 label = (text[i + 2:second] if second is not None else "") or text[start + 1:i]
@@ -844,7 +867,7 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
                 if status not in ("yes", "no") and seen is not None:
                     seen.add(READ_REF)
                 if status == "yes" or (status != "no" and reading & READ_REF):
-                    dead_below = len(opens)
+                    deactivate()
                     if second is not None:
                         i = second + 1
                         continue
@@ -871,35 +894,56 @@ def _inline_readings(text, resolve=None, tex=False):
     return sorted(readings.items())
 
 
+def _expanded_readings(readings):
+    """Readings 0 to 3 of an _inline_readings result, as (reading,
+    constructs): a reading whose choice the text never meets is the reading
+    without that choice. So a text that meets a choice that changes
+    nothing, and one that does not meet it, read the same."""
+    table = dict(readings)
+    bits = 0
+    for r in table:
+        bits |= r
+    return [(r, table[r & bits]) for r in range(4)]
+
+
+def _reading_variants(readings):
+    """The expanded readings 1 to 3 (see _expanded_readings) that differ
+    from reading 0."""
+    expanded = _expanded_readings(readings)
+    return [(r, constructs) for r, constructs in expanded[1:] if constructs != expanded[0][1]]
+
+
 def _ref_readings(text, resolve=None, tex=False):
     """_inline_readings of ``text`` with every combination of the labels
     that may or may not resolve (``resolve``, see _doc_label_resolver; None:
     any may) resolving or not, not only all or none of them, up to
-    MAYBE_LABEL_GROUPS such labels; None past that (unknown)."""
+    MAYBE_LABEL_GROUPS such labels (also those that only some combination
+    reaches); None past that (unknown)."""
     keys = []
 
-    def probe(label, cm_valid=True):
-        status = resolve(label, cm_valid) if resolve is not None else "maybe"
-        if status not in ("yes", "no") and normalize_label(label) not in keys:
-            keys.append(normalize_label(label))
-        return status
-    readings = _inline_readings(text, probe, tex)
-    if len(keys) <= 1:
-        return readings
-    if len(keys) > MAYBE_LABEL_GROUPS:
-        return None
-    out = list(readings)
-    for pick in range(1, (1 << len(keys)) - 1):
-        chosen = {keys[b] for b in range(len(keys)) if pick >> b & 1}
-
-        def fixed(label, cm_valid=True, chosen=chosen):
+    def make(chosen):
+        def fixed(label, cm_valid=True):
             status = resolve(label, cm_valid) if resolve is not None else "maybe"
             if status in ("yes", "no"):
                 return status
-            return "yes" if normalize_label(label) in chosen else "no"
-        out.extend(_inline_readings(text, fixed, tex))
-    return out
-
+            key = normalize_label(label)
+            if key not in keys:
+                keys.append(key)
+            if chosen is None:
+                return status
+            return "yes" if key in chosen else "no"
+        return fixed
+    while True:
+        out = list(_inline_readings(text, make(None), tex))
+        known = list(keys)
+        if len(known) > MAYBE_LABEL_GROUPS:
+            return None
+        for pick in range(1, (1 << len(known)) - 1) if len(known) > 1 else ():
+            out.extend(_inline_readings(text, make({known[b] for b in range(len(known)) if pick >> b & 1}), tex))
+            if len(keys) > MAYBE_LABEL_GROUPS:
+                return None
+        if len(keys) == len(known):
+            return out
 
 def _scan_inline(text, resolve=None):
     """Find code spans, TeX math and backslash escapes (see
@@ -908,7 +952,7 @@ def _scan_inline(text, resolve=None):
     return [c for c in _inline_constructs(text, resolve=resolve) if c[0] in ("code", "math", "escape")]
 
 
-def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, math_spans=None):
+def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt_masks=None):
     """Return (tokens, masked) for a prose fragment.
 
     ``tokens`` is an ordered list of (kind, value) pairs. ``masked`` is the
@@ -928,8 +972,12 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
     may pair with another (one between letters never does). ``url_marks`` collects the positions and
     characters of the emphasis markers inside bare URLs, which renderers
     without autolinks read as markers and GitHub reads as part of a link.
-    ``math_spans`` collects the (start, end) of each inline math token,
-    which the renderers read as text (see _tex_masked).
+    ``alt_masks`` collects (reading, masked) for each reading of the text
+    (see _inline_readings, also with TeX math read as text) in which text
+    that ``masked`` hides is text to the renderers: emphasis markers inside
+    inline math, and inside what looks like an inline link's destination or
+    title where that reading has no link there (markdown-it refuses it, or
+    link text before it holds a link, or a reference resolves before it).
     """
     chars = list(text)
     found = []
@@ -961,8 +1009,14 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
 
     readings = _inline_readings(current(), resolve)
     tex = _renderer_readings(current(), resolve, readings)
-    others = readings[1:] + ([(READ_TEX | r, constructs) for r, constructs in tex]
-                             if tex is not readings else [])
+    # (Where the renderers may read text that the masks below hide: see
+    # alt_masks.)
+    exposable = []
+    # (Only the readings that differ, with the choices the text does not
+    # meet read as not taken: see _expanded_readings.)
+    others = _reading_variants(readings) + ([(READ_TEX | r, constructs) for r, constructs in
+                                             tex[:1] + _reading_variants(tex)]
+                                            if tex is not readings else [])
     for reading, constructs in others:
         # Where the text reads in two ways (a reference label that may or
         # may not be defined, a link that only cmark-gfm takes), the code,
@@ -985,8 +1039,8 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
         if kind not in ("code", "math", "escape"):
             continue
         found.append((start, kind, value))
-        if kind == "math" and math_spans is not None:
-            math_spans.append((start, end))
+        if kind == "math":
+            exposable.append((start, end))
         if kind == "escape":
             # Hide the escaped punctuation from the markup patterns but keep
             # the position occupied, so a link target or URL that contains an
@@ -1004,8 +1058,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
     for m in INLINE_MATH_RE.finditer(current()):
         found.append((m.start(), "math", m.group(0)))
         _mask(chars, m.start(), m.end())
-        if math_spans is not None:
-            math_spans.append((m.start(), m.end()))
+        exposable.append((m.start(), m.end()))
 
     for m in AUTOLINK_RE.finditer(current()):
         found.append((m.start(), "autolink", m.group(0)))
@@ -1019,6 +1072,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
         # Keep the link text editable; mask the syntax and the target.
         _mask(chars, start, label_start)
         _mask(chars, label_end, end)
+        exposable.append((label_end + 1, end))
 
     if labels is not None:
         # Link and image labels are boundaries for emphasis: inline links,
@@ -1040,11 +1094,19 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
         for pos, k in enumerate(order):
             ls, le = spans[k][0], spans[k][1]
             found_inner = []
+            # (The ends of the images inside, around the spans that follow:
+            # markdown-it reads an image as one token, so a link inside one
+            # leaves the link around it alone there.)
+            image_ends = []
             nxt = pos + 1
             while nxt < len(order) and spans[order[nxt]][0] <= le:
                 sp = spans[order[nxt]]
+                while image_ends and image_ends[-1] <= sp[0]:
+                    image_ends.pop()
                 if sp[2] == "link" and sp[1] <= le and (sp[0], sp[1]) != (ls, le):
-                    found_inner.append(sp[3])
+                    found_inner.append((sp[3], bool(image_ends)))
+                elif sp[2] == "image" and sp[3] != "no" and sp[1] <= le:
+                    image_ends.append(sp[1])
                 nxt += 1
             inside[k] = found_inner
         for ls, le, kind, status, key in spans:
@@ -1054,15 +1116,23 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
                 found.append((ls - 2, "image_open", "!["))
         for k, (ls, le, kind, status, key) in enumerate(spans):
             if kind == "link" and inside[k]:
-                if "yes" in inside[k]:
-                    # Links do not nest: link text that holds a link is text.
+                # Links do not nest: link text that holds a link is text, in
+                # cmark-gfm also where the link is inside an image, and each
+                # renderer reads its own links ("cm", "md").
+                inner = [(st, img) for st, img in inside[k] if st != "no"]
+                in_cm = status in ("yes", "cm") and not any(st in ("yes", "cm") for st, _ in inner)
+                in_md = status in ("yes", "md") and not any(st in ("yes", "md") and not img for st, img in inner)
+                if not in_cm and not in_md:
                     continue
-                # Link text that holds a reference that may or may not be a
-                # link: what the outer brackets and the label after them
-                # become then depends on it and on the renderer. The unit is
-                # kept byte for byte.
-                found.append((0, "frozen", text))
-                break
+                if ((in_cm and any(st not in ("yes", "cm", "md") for st, _ in inner))
+                        or (in_md and any(st not in ("yes", "cm", "md") and not img for st, img in inner))):
+                    # Link text that holds a reference that may or may not be
+                    # a link: what the outer brackets and the label after
+                    # them become then depends on it and on the renderer.
+                    # The unit is kept byte for byte.
+                    found.append((0, "frozen", text))
+                    break
+                status = "yes" if in_cm and in_md else ("cm" if in_cm else "md")
             if status == "yes":
                 labels.append((ls, le))
             elif maybe is not None:
@@ -1209,7 +1279,34 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, mat
 
     found.sort(key=lambda item: item[0])
     tokens = [(kind, value) for _, kind, value in found]
-    return tokens, "".join(chars)
+    masked = "".join(chars)
+    if alt_masks is not None and exposable:
+        # Every reading, those with TeX math read as text included (the same
+        # as the others where the text holds no math), so a reading one text
+        # does not reach compares as the reading it has there.
+        expanded = _expanded_readings(readings)
+        expanded = expanded + [(READ_TEX | r, cs) for r, cs in
+                               (_expanded_readings(tex) if tex is not readings else expanded)]
+        made = {}
+        for reading, constructs in expanded:
+            if id(constructs) in made:
+                if made[id(constructs)] is not None:
+                    alt_masks.append((reading, made[id(constructs)]))
+                continue
+            made[id(constructs)] = None
+            covered = [False] * len(text)
+            for _, start, end, _ in constructs:
+                covered[start:end] = [True] * (end - start)
+            alt = list(masked)
+            for start, end in exposable:
+                for x in range(start, min(end, len(text))):
+                    if text[x] in "*_~" and not covered[x]:
+                        alt[x] = text[x]
+            alt = "".join(alt)
+            if alt != masked:
+                made[id(constructs)] = alt
+                alt_masks.append((reading, alt))
+    return tokens, masked
 
 
 EMPHASIS_RUN_RE = re.compile(r"\*+|_+|~+")
@@ -1497,22 +1594,6 @@ def _first_token_difference(a, b):
 AMBIGUOUS_LABEL_LIMIT = 4
 
 
-def _tex_masked(text, masked, spans):
-    """``masked`` (see extract_tokens) with the emphasis markers inside the
-    math tokens at ``spans`` put back, as the renderers read them (TeX math
-    is text to them), apart from those in a code span, raw HTML, an
-    autolink, a link tail or an escape of that reading."""
-    chars = list(masked)
-    skip = [False] * len(text)
-    for kind, start, end, _ in _renderer_readings(text)[0][1]:
-        skip[start:end] = [True] * (end - start)
-    for start, end in spans:
-        for x in range(start, end):
-            if text[x] in "*_~" and not skip[x]:
-                chars[x] = text[x]
-    return "".join(chars)
-
-
 def _check_emphasis(src, src_masked, src_labels, src_maybe,
                     cand, cand_masked, cand_labels, cand_maybe, where):
     """Compare emphasis with every combination of the possible link labels
@@ -1567,9 +1648,9 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
                 raise GuardReject("markup_in_text", "%s: candidate adds %r" % (where, ch))
     src_labels, cand_labels, src_maybe, cand_maybe = [], [], [], []
     src_marks, cand_marks = [], []
-    src_math, cand_math = [], []
-    src_tokens, src_masked = extract_tokens(src, src_labels, refs, src_maybe, src_marks, src_math)
-    cand_tokens, cand_masked = extract_tokens(cand, cand_labels, refs, cand_maybe, cand_marks, cand_math)
+    src_alt, cand_alt = [], []
+    src_tokens, src_masked = extract_tokens(src, src_labels, refs, src_maybe, src_marks, src_alt)
+    cand_tokens, cand_masked = extract_tokens(cand, cand_labels, refs, cand_maybe, cand_marks, cand_alt)
     if src_tokens != cand_tokens:
         idx, x, y = _first_token_difference(src_tokens, cand_tokens)
         kinds = set()
@@ -1588,11 +1669,18 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
             "%s: protected token %d differs (source %r, candidate %r)" % (where, idx + 1, x, y))
     _check_emphasis(src, src_masked, src_labels, src_maybe,
                     cand, cand_masked, cand_labels, cand_maybe, where)
-    if src_math or cand_math:
-        # The renderers read TeX math as text: the emphasis markers inside
-        # it pair with those outside, which must pair the same way too.
-        _check_emphasis(src, _tex_masked(src, src_masked, src_math), src_labels, src_maybe,
-                        cand, _tex_masked(cand, cand_masked, cand_math), cand_labels, cand_maybe, where)
+    # Where a reading of the renderers takes emphasis markers that the masks
+    # hide (inside TeX math, or a destination and title that are text
+    # there), they must pair the same way in it too.
+    src_alt, cand_alt = dict(src_alt), dict(cand_alt)
+    checked = set()
+    for reading in sorted(set(src_alt) | set(cand_alt)):
+        pair = (src_alt.get(reading, src_masked), cand_alt.get(reading, cand_masked))
+        if pair in checked:
+            continue
+        checked.add(pair)
+        _check_emphasis(src, pair[0], src_labels, src_maybe,
+                        cand, pair[1], cand_labels, cand_maybe, where)
     # A backtick string outside code (one no other string of its length
     # closes) is markup too: adding or removing one can pair others
     # differently, and markdown-it, after an unclosed "[", reads every code
@@ -2006,7 +2094,9 @@ def _spanned_lines(lines, ks, resolve=None):
     for line in lines:
         starts.append(starts[-1] + len(line) + 1)
     found = []
-    for reading, constructs in _inline_readings(text, resolve):
+    # (Every reading, with a choice the text does not meet read as not
+    # taken: see _expanded_readings.)
+    for reading, constructs in _expanded_readings(_inline_readings(text, resolve)):
         spans = [(s, e) for kind, s, e, _ in constructs if kind in ("code", "html", "linktail")]
         heads = [s for s, _ in spans]
         out = []

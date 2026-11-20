@@ -4535,4 +4535,45 @@ for name, doc in (("3000 table rows with references", "| a | b |\n| --- | --- |\
     report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
            "%.2fs" % (time.process_time() - started))
 
+for name, src, cand in [
+        ('a protected sentence after an opener markdown-it reads past a link inside image text inside link text',
+         'Read [the ![a [setup](/setup) diagram](image.png) guide](/guide "Use ` here") <!-- polish:off --> keep ` now.\n\nRead old prose.\n',
+         'Read [the ![a [setup](/setup) diagram](image.png) guide](/guide "Use ` here") <!-- polish:off --> keep ` now.\n\nRead new prose.\n'),
+        ('a protected sentence after a closer in code that only a mix of resolved references reads',
+         'Start <!-- polish:off -->keep.\n\nRead [notes][t](/notes "Use ` here") and `sample [manual][s](/manual "Type `` here") then [guide][r](/guide "Use ` here") sample`` <!-- polish:on --> ` now.\n\nRead old prose.\n\n[r]: /guide\n[t]: /notes\n\n```markdown\n[s]: /manual\n```\n',
+         'Start <!-- polish:off -->keep.\n\nRead [notes][t](/notes "Use ` here") and `sample [manual][s](/manual "Type `` here") then [guide][r](/guide "Use ` here") sample`` <!-- polish:on --> ` now.\n\nRead new prose.\n\n[r]: /guide\n[t]: /notes\n\n```markdown\n[s]: /manual\n```\n'),
+        ('emphasis the renderers read from a star after a resolved reference in TeX math removed',
+         'Use \\(x [guide][r](x*y)\\) and the value* is approximate.\n\n[r]: /guide\n',
+         'Use \\(x [guide][r](x*y)\\) and the value *is approximate.\n\n[r]: /guide\n'),
+        ('emphasis markdown-it reads from a star in a refused destination in TeX math removed',
+         'Use \\(x [guide](file:///x*y)\\) and the value* is approximate.\n',
+         'Use \\(x [guide](file:///x*y)\\) and the value *is approximate.\n'),
+        ('emphasis markdown-it reads from a star in a refused destination removed',
+         'Use [guide](file:///x*y) and the value* is approximate.\n',
+         'Use [guide](file:///x*y) and the value *is approximate.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a refused link inside link text reworded',
+         'Read [the [local copy](file:///tmp/guide.md) notes](/guide) for the old details.\n',
+         'Read [the [local copy](file:///tmp/guide.md) notes](/guide) for the new details.\n'),
+        ('prose after a link inside image text inside link text reworded',
+         'Read [the ![a [setup](/setup) diagram](image.png) guide](/guide) for the old details.\n',
+         'Read [the ![a [setup](/setup) diagram](image.png) guide](/guide) for the new details.\n'),
+        ('prose after a star in a refused destination reworded',
+         'Use [guide](file:///x*y) and the old value here.\n',
+         'Use [guide](file:///x*y) and the new value here.\n'),
+        ('an open image before a link split into text',
+         'Press ![ and then [setup](/setup) to start the old run.\n',
+         'Press ! [ and then [setup](/setup) to start the new run.\n'),
+        ('an open image around a link across lines split into text',
+         'Read <![CDATA[ alpha here\nmore beta](/gamma) words.\n',
+         'Read <! [CDATA[ alpha here\nmore beta](/gamma) words.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("3000 open images before 3000 links", "![" * 3000 + " text " + "[a](/u) " * 3000 + "\n"),
+                  ("2000 paragraphs with a link in image text in link text", "".join("Read [the ![a [s](/s) d](i.png) g](/g \"t\") and *e* `c`.\n\n" for k in range(2000)))):
+    started = time.process_time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
+           "%.2fs" % (time.process_time() - started))
+
 sys.exit(1 if FAILED else 0)
