@@ -2857,7 +2857,7 @@ def _expand_structure(line):
     return "".join(out) + line[m.end():]
 
 
-def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
+def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_lines=None):
     """Split Markdown or plain text into an ordered list of blocks.
 
     By default the parser follows cmark-gfm (GitHub). With
@@ -3535,6 +3535,39 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
             # inside another one can keep that one's paragraph open.
             blocks.append(Block("footnote_def", attrs(base=base), "\n".join(lines[i:end + 1]), [], start_line,
                                 end_state))
+            # markdown-it has no footnotes: it reads the definition as a
+            # paragraph (or a reference definition) and its lazy and
+            # indented lines as paragraph text. A line right after it that
+            # cmark-gfm starts a block other than a paragraph on but that
+            # does not interrupt a paragraph for markdown-it (raw HTML of
+            # start condition 7, a list item numbered other than 1 or an
+            # empty one, indented code past a container it leaves) may
+            # continue that paragraph, and a fence or an HTML
+            # block that ends it there runs on past cmark-gfm's block (a
+            # paragraph cmark-gfm starts there reads as markdown-it's
+            # paragraph does from there on): the lines from there are
+            # kept byte for byte (see md_list_freeze). No paragraph is open
+            # there for markdown-it after a blank line inside the definition
+            # (it reads the indented lines after it as code), nor when the
+            # definition starts after a blank line and markdown-it reads it
+            # as a reference definition and then code. A definition right
+            # after it is read the same way where it ends.
+            if not inner and end + 1 < n:
+                nxt = lines[end + 1]
+                nbody = _strip_quote(nxt, _quote_depth(nxt)[0])
+                own = [_strip_quote(lines[x], min(quote, _quote_depth(lines[x])[0])) for x in range(i, end + 1)]
+                after_def = _past_container(nbody, base)
+                if (nbody.strip() and not FOOTNOTE_DEF_RE.match(nbody.lstrip(" \t"))
+                        and (_starts_block(after_def, False) or _indent_of(after_def) >= 4)
+                        and all(text.strip(" \t") for text in own)
+                        and not _mdit_interrupts(nxt, quote)):
+                    md_open_end = True
+                    if _md_starts_anew(lines, i, blocks[-2] if len(blocks) > 1 else None):
+                        reading = _mdit_reading([_past_container(text, base) for text in own], 0)
+                        md_open_end = not (reading and reading[-1][0] in ("definition", "code")
+                                           and reading[-1][2] == len(own))
+                    if md_open_end:
+                        md_list_freeze.append(end + 1)
             i = end + 1
             continue
 
@@ -5082,6 +5115,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 return _mdit_interrupts(body.lstrip(" "), 0)
         return _mdit_interrupts(text, level)
 
+    # (The lines of each such run that markdown-it reads as paragraph text.)
+    run_line = [False] * n
     if md_lazy_run:
         starts = sorted(block_at)
         # (The lines an earlier unit already covers: a further list item
@@ -5118,6 +5153,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                        and not (k > first and setext_at(k, level, col))):
                     k += 1
                 covered = k
+                for x in range(at, k):
+                    run_line[x] = True
                 if k < n and k > first and setext_at(k, level, col):
                     # A setext underline ends markdown-it's paragraph as a
                     # heading, and markdown-it reads the lines after it anew,
@@ -5363,6 +5400,11 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 labels = [mdit_label_key(label) for label in _loose_labels(block.raw)]
                 if labels:
                     block.md_label = tuple(block.md_label or ()) + tuple(labels)
+    if _md_lines is not None:
+        # (For _mask_code: the lines markdown-it may read otherwise, kept
+        # byte for byte, read as raw HTML or code, or continuing a paragraph
+        # over blocks cmark-gfm reads there: see md_lazy_run.)
+        _md_lines[:] = [md_kept[k] is not None or raw_line[k] or run_line[k] for k in range(n)]
     return blocks
 
 
@@ -5447,61 +5489,187 @@ def prose_block_count(text):
                 if b.kind not in RAW_KINDS and any(u.strip() for u in b.units)])
 
 
-def _mask_code(text, segments=False, footnotes=False):
-    """``text`` with code blanked out (same length), so markers in code are text.
+def _md_starts_anew(lines, k, prev_block):
+    """Whether markdown-it reads line ``k`` with no paragraph open, as far as
+    the lines before it tell: it is the first line, the line before it is
+    blank, or raw HTML of types 1 to 5 (such as a marker) ends on that line
+    in the block before it (``prev_block``)."""
+    if k == 0:
+        return True
+    prev = _strip_quote(lines[k - 1], _quote_depth(lines[k - 1])[0])
+    if not prev.strip(" \t"):
+        return True
+    if prev_block is None or prev_block.kind != "html" or prev_block.line + prev_block.raw.count("\n") != k:
+        return False
+    head = prev_block.raw.split("\n")[0]
+    head = _strip_quote(head, _quote_depth(head)[0]).lstrip(" ")
+    marker = _html_end_marker(head)
+    return marker is not None and bool(marker.search(prev))
+
+
+def _footnote_content(block_lines, quote, base):
+    """The content of a footnote definition as cmark-gfm reads it, by line:
+    (column where it starts in the line, content). The first line's content
+    follows the label; a line indented four columns past the definition's
+    container is content from there; any other line is a lazy line or blank.
+    The column is None where the content is not the end of the line as
+    written (past an expanded tab)."""
+    out = []
+    for k, line in enumerate(block_lines):
+        depth = _quote_depth(line)[0]
+        body = _strip_quote(line, min(depth, quote))
+        if k == 0:
+            cbody = _past_container(body, base)
+            fm = FOOTNOTE_DEF_RE.match(cbody)
+            text = cbody[fm.end():].lstrip(" \t") if fm else cbody
+        elif not body.strip():
+            text = ""
+        elif depth >= quote and _indent_of(_expand_indent(body)) - base >= 4:
+            text = _past_container(body, base + 4)
+        else:
+            text = body.lstrip(" \t")
+        out.append((len(line) - len(text) if line.endswith(text) else None, text))
+    return out
+
+
+# Footnote definitions read inside each other for markers (see _mask_code);
+# deeper ones are read conservatively.
+FOOTNOTE_MASK_DEPTH = 8
+
+
+def _mask_code(text, segments=False, _depth=0):
+    """``text`` read for markers, as two texts of the same length, one to
+    find polish:off markers in and one to find polish:on markers in, with
+    code blanked out (NUL characters, which no marker contains), so markers
+    in code are text.
 
     Fenced and indented code blocks come from the block parser, so fences
     behind several list markers count too. Code spans are matched only inside
     one block (or one segment line), because a code span cannot cross a block
     boundary; a stray backtick elsewhere cannot hide a real marker. The blocks
     are read as the renderers read them, with the markers as ordinary
-    comments (renamed, same length). With ``footnotes``, footnote definitions
-    are blanked out whole (their code is not read here).
+    comments (renamed, same length). The content of a footnote definition is
+    read the same way, as cmark-gfm reads it. markdown-it has no footnotes:
+    it reads that text as a paragraph, a reference definition or indented
+    code, so a polish:on marker counts there only on a line it reads as
+    paragraph text; a polish:off marker counts where either renderer reads
+    it outside code. Lines whose content cannot be placed (past an expanded
+    tab, or more than ``FOOTNOTE_MASK_DEPTH`` definitions deep) are read the
+    same conservative way: a polish:off marker in them counts and a
+    polish:on marker does not, as does one in a definition's label.
     """
     lines = text.split("\n")
-    masked = list(lines)
+    for_off = list(lines)
+    for_on = list(lines)
+    footnotes = []
+    md_lines = []
     if segments:
         chunks = [(k, k) for k in range(len(lines))]
     else:
         chunks = []
-        for block in parse_blocks(POLISH_MARKER_RE.sub(r"\1-\2", text)):
+        prev_block = None
+        for block in parse_blocks(POLISH_MARKER_RE.sub(r"\1-\2", text),
+                                  _md_lines=md_lines if not _depth else None):
+            before, prev_block = prev_block, block
             if block.kind == "quote":
                 continue
             first = block.line - 1
             last = min(first + block.raw.count("\n"), len(lines) - 1)
-            if block.kind in ("fence", "indented_code") or (footnotes and block.kind == "footnote_def"):
+            if block.kind in ("fence", "indented_code"):
                 for k in range(first, last + 1):
-                    masked[k] = " " * len(lines[k])
+                    for_off[k] = for_on[k] = "\0" * len(lines[k])
+            elif block.kind == "footnote_def":
+                footnotes.append((first, last, block.attrs.get("quote", 0), block.attrs.get("base", 0),
+                                  _md_starts_anew(lines, first, before)))
             elif block.kind not in RAW_KINDS:
                 chunks.append((first, last))
     for first, last in chunks:
-        chunk = "\n".join(masked[first:last + 1])
+        chunk = "\n".join(for_off[first:last + 1])
         chars = list(chunk)
         for kind, start, end, _ in _scan_inline(chunk):
             if kind == "code":
-                _mask(chars, start, end)
-        masked[first:last + 1] = "".join(chars).split("\n")
-    return "\n".join(masked)
+                for k in range(start, end):
+                    if chars[k] != "\n":
+                        chars[k] = "\0"
+        for_off[first:last + 1] = for_on[first:last + 1] = "".join(chars).split("\n")
+    for first, last, quote, base, anew in footnotes:
+        block_lines = lines[first:last + 1]
+        content = _footnote_content(block_lines, quote, base)
+        inner_off = inner_on = None
+        if _depth < FOOTNOTE_MASK_DEPTH:
+            inner_off, inner_on = (part.split("\n") for part in
+                                   _mask_code("\n".join(t for _, t in content), _depth=_depth + 1))
+        # markdown-it's reading of the same lines up to the first blank
+        # line: where it starts anew there, as it reads them (paragraph text
+        # with its own code spans, a reference definition, indented code);
+        # otherwise they continue the paragraph open before them, where a
+        # code span opened earlier may run on (unknown: a polish:off marker
+        # counts and a polish:on marker does not). Past that blank line the
+        # definition's lines are indented code to it.
+        view = [_past_container(_strip_quote(line, min(quote, _quote_depth(line)[0])), base)
+                for line in block_lines]
+        stop = next((k for k, t in enumerate(view) if not t.strip(" \t")), len(view))
+        md_off = ["\0" * len(line) for line in block_lines]
+        md_on = list(md_off)
+        if _depth:
+            # (markdown-it reads only the document's own lines: a definition
+            # inside another one is read with the lines of the outer one.)
+            md_off = md_on = block_lines
+        elif not anew:
+            md_off[:stop] = block_lines[:stop]
+        for r in _mdit_reading(view[:stop], 0) if anew and not _depth else ():
+            if r[0] not in ("paragraph", "heading"):
+                continue
+            texts = [view[k].lstrip(" \t") for k in range(r[1], r[2])]
+            joined = "\n".join(texts)
+            chars = list(joined)
+            for kind, start, end, _ in _scan_inline(joined):
+                if kind == "code":
+                    for x in range(start, end):
+                        if chars[x] != "\n":
+                            chars[x] = "\0"
+            for k, text_k, part in zip(range(r[1], r[2]), texts, "".join(chars).split("\n")):
+                line = block_lines[k]
+                if line.endswith(text_k):
+                    md_off[k] = md_on[k] = line[:len(line) - len(text_k)] + part
+        for k, (col, _) in enumerate(content):
+            line = lines[first + k]
+            if col is None or inner_off is None:
+                for_off[first + k] = line
+                for_on[first + k] = "\0" * len(line)
+                continue
+            cm_off = line[:col] + inner_off[k]
+            cm_on = ("\0" * col if k == 0 else line[:col]) + inner_on[k]
+            for_off[first + k] = "".join(a if a != "\0" else b for a, b in zip(cm_off, md_off[k]))
+            for_on[first + k] = "".join(a if b != "\0" else "\0" for a, b in zip(cm_on, md_on[k]))
+    for k, flag in enumerate(md_lines[:len(lines)]):
+        if flag:
+            # (A line markdown-it may read otherwise, as code or raw HTML
+            # where cmark-gfm reads prose or the reverse: a polish:off
+            # marker counts there and a polish:on marker does not.)
+            for_off[k] = lines[k]
+            for_on[k] = "\0" * len(lines[k])
+    return "\n".join(for_off), "\n".join(for_on)
 
 
-def protected_slices(text, segments=False, footnotes=False):
+def protected_slices(text, segments=False):
     """Exact source slices covered by polish:off regions, in order.
 
     A region runs from a polish:off marker to the next polish:on marker, or to
-    the end of the text when it is never closed. Markers inside code are text;
-    with ``footnotes``, so are markers inside footnote definitions.
+    the end of the text when it is never closed. Markers inside code are text
+    (see _mask_code).
     """
     if not POLISH_OFF_RE.search(text):
         # (Masking only hides markers: no marker, no region.)
         return []
-    masked = _mask_code(text, segments, footnotes)
+    for_off, for_on = _mask_code(text, segments)
     slices = []
     pos = 0
     while True:
-        m = POLISH_OFF_RE.search(masked, pos)
+        m = POLISH_OFF_RE.search(for_off, pos)
         if not m:
             break
-        e = POLISH_ON_RE.search(masked, m.end())
+        e = POLISH_ON_RE.search(for_on, m.end())
         end = e.end() if e else len(text)
         slices.append(text[m.start():end])
         pos = end
@@ -5509,22 +5677,16 @@ def protected_slices(text, segments=False, footnotes=False):
 
 
 def check_regions(source, candidate, segments=False):
-    """Reject any change to text inside polish:off regions, including whitespace.
-
-    Code inside a footnote definition is not read here, so a marker inside a
-    footnote definition is read both ways, as a marker and as text: the
-    regions must stay the same under both readings."""
-    both = not segments and ("[^" in source or "[^" in candidate)
-    for footnotes in ((False, True) if both else (False,)):
-        src = protected_slices(source, segments, footnotes)
-        cand = protected_slices(candidate, segments, footnotes)
-        if src != cand:
-            if len(src) != len(cand):
-                detail = "the number of polish:off regions changed from %d to %d" % (len(src), len(cand))
-            else:
-                idx = next(k for k in range(len(src)) if src[k] != cand[k])
-                detail = "polish:off region %d changed" % (idx + 1)
-            raise GuardReject("region_changed", detail)
+    """Reject any change to text inside polish:off regions, including whitespace."""
+    src = protected_slices(source, segments)
+    cand = protected_slices(candidate, segments)
+    if src != cand:
+        if len(src) != len(cand):
+            detail = "the number of polish:off regions changed from %d to %d" % (len(src), len(cand))
+        else:
+            idx = next(k for k in range(len(src)) if src[k] != cand[k])
+            detail = "polish:off region %d changed" % (idx + 1)
+        raise GuardReject("region_changed", detail)
 
 
 def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=DOC_RATIO_BOUNDS):
