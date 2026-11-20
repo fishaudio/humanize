@@ -3294,6 +3294,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # (first line, line) of a paragraph cmark-gfm ends at a line that
     # markdown-it reads as a lazy continuation of it.
     md_lazy_run = []
+    # (Lines of a paragraph cmark-gfm reads that markdown-it reads as
+    # another kind, see ``over`` below.)
+    over_line = [False] * n
     # (The first line of a paragraph markdown-it reads right before a range
     # it may read in any way, by the lazy run of that range: the paragraph
     # may continue into the range, so the two are also compared as one
@@ -4128,6 +4131,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 elif not (under and r[1] == rest and r[0] in ("break", "item")):
                     over.append(r)
             kept_lines = list(content)
+            for r in over:
+                for x in range(max(r[1], rest), r[2]):
+                    over_line[i + x] = True
             # (Measured past the quote markers of markdown-it's paragraph,
             # as written: a quote marker after the indentation is text.)
             md_depth = (_quote_depth(lines[i + md_read[-1][1]])[0] if md_read[-1][1] in quote_lazy
@@ -5402,9 +5408,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                     block.md_label = tuple(block.md_label or ()) + tuple(labels)
     if _md_lines is not None:
         # (For _mask_code: the lines markdown-it may read otherwise, kept
-        # byte for byte, read as raw HTML or code, or continuing a paragraph
-        # over blocks cmark-gfm reads there: see md_lazy_run.)
-        _md_lines[:] = [md_kept[k] is not None or raw_line[k] or run_line[k] for k in range(n)]
+        # byte for byte, read as another kind inside cmark-gfm's paragraph,
+        # read as raw HTML or code, or continuing a paragraph over blocks
+        # cmark-gfm reads there: see md_lazy_run.)
+        _md_lines[:] = [md_kept[k] is not None or raw_line[k] or run_line[k] or over_line[k] for k in range(n)]
     return blocks
 
 
@@ -5556,12 +5563,15 @@ def _mask_code(text, segments=False, _depth=0):
     it outside code. Lines whose content cannot be placed (past an expanded
     tab, or more than ``FOOTNOTE_MASK_DEPTH`` definitions deep) are read the
     same conservative way: a polish:off marker in them counts and a
-    polish:on marker does not, as does one in a definition's label.
+    polish:on marker does not, as does one in a definition's label and in a
+    reference definition, front matter or math. In a table row kept whole,
+    code is read both ways (cells first, and the row as paragraph text).
     """
     lines = text.split("\n")
     for_off = list(lines)
     for_on = list(lines)
     footnotes = []
+    tables = []
     md_lines = []
     if segments:
         chunks = [(k, k) for k in range(len(lines))]
@@ -5581,6 +5591,15 @@ def _mask_code(text, segments=False, _depth=0):
             elif block.kind == "footnote_def":
                 footnotes.append((first, last, block.attrs.get("quote", 0), block.attrs.get("base", 0),
                                   _md_starts_anew(lines, first, before)))
+            elif block.kind in ("refdef", "frontmatter", "math"):
+                # (A definition's destination or title, front matter and
+                # math hold no comment to cmark-gfm, while markdown-it may
+                # read them as paragraph text: a polish:off marker counts
+                # there and a polish:on marker does not.)
+                for k in range(first, last + 1):
+                    for_on[k] = "\0" * len(lines[k])
+            elif block.kind == "table_raw":
+                tables.append((first, last))
             elif block.kind not in RAW_KINDS:
                 chunks.append((first, last))
     for first, last in chunks:
@@ -5592,6 +5611,35 @@ def _mask_code(text, segments=False, _depth=0):
                     if chars[k] != "\n":
                         chars[k] = "\0"
         for_off[first:last + 1] = for_on[first:last + 1] = "".join(chars).split("\n")
+    for first, last in tables:
+        # A table row with raw HTML (or text only cmark-gfm reads as a
+        # table): cmark-gfm splits each row into cells at unescaped pipes
+        # before it reads code spans, markdown-it reads the lines as one
+        # paragraph. A polish:on marker counts outside code in both
+        # readings, a polish:off marker outside code in either.
+        joined = "\n".join(lines[first:last + 1])
+        md_code = [False] * len(joined)
+        for kind, start, end, _ in _scan_inline(joined):
+            if kind == "code":
+                for x in range(start, end):
+                    md_code[x] = True
+        cm_code = [False] * len(joined)
+        cell = 0
+        x = 0
+        while x <= len(joined):
+            if x == len(joined) or joined[x] in "|\n":
+                for kind, start, end, _ in _scan_inline(joined[cell:x]):
+                    if kind == "code":
+                        for y in range(cell + start, cell + end):
+                            cm_code[y] = True
+                cell = x + 1
+            elif joined[x] == "\\":
+                x += 1
+            x += 1
+        off = "".join("\0" if md_code[x] and cm_code[x] and ch != "\n" else ch for x, ch in enumerate(joined))
+        on = "".join("\0" if (md_code[x] or cm_code[x]) and ch != "\n" else ch for x, ch in enumerate(joined))
+        for_off[first:last + 1] = off.split("\n")
+        for_on[first:last + 1] = on.split("\n")
     for first, last, quote, base, anew in footnotes:
         block_lines = lines[first:last + 1]
         content = _footnote_content(block_lines, quote, base)

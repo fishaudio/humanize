@@ -4027,5 +4027,50 @@ for name, src, cand in [
          'Intro text.\n\n  <!-- polish:off -->\n  <!-- polish:off -->\n  [^2]: Example:\n      ```\n  lazy <!-- polish:on --> Read old prose.\n      ```\n  <!-- polish:on -->\n  See[^1] and [^2] old.\n  <!-- polish:off -->\n\n',
          'Intro text.\n\n  <!-- polish:off -->\n  <!-- polish:off -->\n  [^2]: Example:\n      ```\n  lazy <!-- polish:on --> Read new prose.\n      ```\n  <!-- polish:on -->\n  See[^1] and [^2] old.\n  <!-- polish:off -->\n\n')]:
     accepts("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a protected sentence after a code marker on the line after an unclosed definition title',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old "title\n`<!-- polish:on -->` old\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old "title\n`<!-- polish:on -->` old\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in a definition title',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old "title <!-- polish:on --> x"\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old "title <!-- polish:on --> x"\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in a definition title on the next line',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old\n"title <!-- polish:on --> x"\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old\n"title <!-- polish:on --> x"\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in display math',
+         'Start <!-- polish:off -->keep.\n\n$$\n<!-- polish:on -->\n$$\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n$$\n<!-- polish:on -->\n$$\n\nRead new prose.\n'),
+        ('a protected sentence after a code marker in a table row with HTML',
+         'Start <!-- polish:off -->keep.\n\n| <b>x</b> | `<!-- polish:on -->` |\n| --- | --- |\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n| <b>x</b> | `<!-- polish:on -->` |\n| --- | --- |\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in a code span inside one table cell',
+         'Start <!-- polish:off -->keep.\n\n| <b>x</b> | `a | `<!-- polish:on -->` |\n| --- | --- | --- |\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n| <b>x</b> | `a | `<!-- polish:on -->` |\n| --- | --- | --- |\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in a code span across table cells',
+         'Start <!-- polish:off -->keep.\n\n| <b>x</b> | `a | <!-- polish:on --> b` |\n| --- | --- | --- |\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n| <b>x</b> | `a | <!-- polish:on --> b` |\n| --- | --- | --- |\n\nRead new prose.\n'),
+        ('a protected sentence after an indented code line and a tab-indented code marker',
+         'See[^1] and [^2].\n\n<!-- polish:off -->\n    `a\n[r]: /old "title\n\t`<!-- polish:on -->` old\n> old quote\n[^11]: Example:\n\nRead old prose.\n',
+         'See[^1] and [^2].\n\n<!-- polish:off -->\n    `a\n[r]: /old "title\n\t`<!-- polish:on -->` old\n> old quote\n[^11]: Example:\n\nRead new prose.\n'),
+        ('a protected sentence after code markers in a list item with unclosed titles',
+         'See[^1] and [^2].\n\n1. [^11]: Note <!-- polish:off --> old\n   [^12]: Note <!-- polish:off -->keep `<!-- polish:on -->` old\n\n   [r]: /old "title\n   lazy `<!-- polish:on -->` old\n   [r]: /old "title\n   <span class="x">\n   See[^1] and [^2] old.\n   [^13]: Use `<!-- polish:on -->` old\n\n   Read old prose.\n',
+         'See[^1] and [^2].\n\n1. [^11]: Note <!-- polish:off --> old\n   [^12]: Note <!-- polish:off -->keep `<!-- polish:on -->` old\n\n   [r]: /old "title\n   lazy `<!-- polish:on -->` old\n   [r]: /old "title\n   <span class="x">\n   See[^1] and [^2] old.\n   [^13]: Use `<!-- polish:on -->` old\n\n   Read new prose.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a region inside a table cell reworded',
+         '| Name | Value |\n| --- | --- |\n| a | <!-- polish:off -->keep old<!-- polish:on --> |\n\nRead old prose.\n',
+         '| Name | Value |\n| --- | --- |\n| a | <!-- polish:off -->keep old<!-- polish:on --> |\n\nRead new prose.\n'),
+        ('prose after a real marker following a definition reworded',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old\n\nText <!-- polish:on --> done.\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old\n\nText <!-- polish:on --> done.\n\nRead new prose.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a protected sentence after a marker markdown-it reads as indented code after a definition',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old\n    <!-- polish:on -->\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n[r]: /old\n    <!-- polish:on -->\n\nRead new prose.\n'),
+        ('protected code after markers markdown-it reads as indented code after definitions in a list item',
+         "See[^1] and [^2].\n\n1. <!-- polish:off -->\n   [r]: /old '<!-- polish:on -->'\n       `a\n       <!-- polish:on -->\n   <!-- polish:off -->\n   [r]: /old '<!-- polish:on -->'\n       [^11]: Inner <!-- polish:on --> old\n   $$\n       Read old prose.\n   Prose after old.\n",
+         "See[^1] and [^2].\n\n1. <!-- polish:off -->\n   [r]: /old '<!-- polish:on -->'\n       `a\n       <!-- polish:on -->\n   <!-- polish:off -->\n   [r]: /old '<!-- polish:on -->'\n       [^11]: Inner <!-- polish:on --> old\n   $$\n       Read new prose.\n   Prose after old.\n")]:
+    rejects("R3 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)
