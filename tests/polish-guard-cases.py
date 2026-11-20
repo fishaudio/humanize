@@ -4676,7 +4676,10 @@ for name, src, cand in [
          '- a\n  - Read [^n].\n    [^n]: - Note.\n  \n  - Next.\n'),
         ('the blank line after a footnote ending in a fence changed',
          '- Read [^n].\n  [^n]: ```\n  code\n  ```\n\n- Next.\n',
-         '- Read [^n].\n  [^n]: ```\n  code\n  ```\n \n- Next.\n')]:
+         '- Read [^n].\n  [^n]: ```\n  code\n  ```\n \n- Next.\n'),
+        ('a fence after a quote marker and a tab changed',
+         '>\n    >\t```\n> Keep old text.\n> ```\n\nRead plain text.\n',
+         '>\n    >\t```\n> Keep new text.\n> ```\n\nRead plain text.\n')]:
     rejects("R4 " + name, src, cand)
 for name, src, cand in [
         ('link text with brackets and the prose around it reworded',
@@ -4694,7 +4697,12 @@ for name, src, cand in [
          FOOTNOTE_LIST.replace('- Next.', '- The next one.')),
         ('the item after a footnote and a blank line with spaces reworded',
          FOOTNOTE_LIST.replace('.\n\n-', '.\n  \n-'),
-         FOOTNOTE_LIST.replace('.\n\n-', '.\n  \n-').replace('- Next.', '- The next one.'))]:
+         FOOTNOTE_LIST.replace('.\n\n-', '.\n  \n-').replace('- Next.', '- The next one.')),
+        ('a paragraph right after the quote an indented quote marker continued reworded',
+         '>\n    > ```\nRead old text.\n', '>\n    > ```\nRead new text.\n'),
+        ('prose next to a reference inside a tag whose attribute holds "](" reworded',
+         '<span title="](">Read [the guide][r] here.</span>\n\n[r]: /guide\n',
+         '<span title="](">See [the guide][r] here.</span>\n\n[r]: /guide\n')]:
     accepts("R4 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)

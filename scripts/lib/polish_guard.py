@@ -521,10 +521,12 @@ def _ref_label_close(text, open_bracket):
     return None
 
 
-def _stray_brackets(masked):
-    """True when ``masked`` holds a square bracket with no partner (backslash
+def _failed_tail_brackets(masked):
+    """True when ``masked`` holds a "](" and a square bracket with no
+    partner, both outside code spans, autolinks and raw HTML (backslash
     escapes skipped)."""
     depth = 0
+    stray = tail = False
     i = 0
     n = len(masked)
     while i < n:
@@ -532,14 +534,22 @@ def _stray_brackets(masked):
         if ch == "\\":
             i += 2
             continue
+        if ch in "`<":
+            opaque = _opaque_end(masked, i)
+            if opaque is not None:
+                i = opaque
+                continue
         if ch == "[":
             depth += 1
         elif ch == "]":
+            if masked[i + 1:i + 2] == "(":
+                tail = True
             if depth == 0:
-                return True
-            depth -= 1
+                stray = True
+            else:
+                depth -= 1
         i += 1
-    return depth != 0
+    return tail and (stray or depth != 0)
 
 
 def _scan_refs(masked, original, resolve, offset=0):
@@ -1554,7 +1564,7 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt
                   None) for _, ls, le, _, kind, _ in links]
         ref_spans = _scan_refs(current(), text, resolve)
         spans += ref_spans
-        if ref_spans and "](" in current() and _stray_brackets(current()):
+        if ref_spans and _failed_tail_brackets(current()):
             # A "](" that opened no inline link (those are masked by now)
             # next to a reference that may resolve and an unpaired bracket:
             # the renderers differ in what the failed tail and the brackets
@@ -5151,6 +5161,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # code and up to a blank line, and after a quoted fence that cmark-gfm
     # ended with the quote, that fence: those lines are kept byte for byte.)
     md_html_run = []
+    md_quote_raw = []
     prev_block = None
     for block in blocks:
         if block.kind == "indented_code":
@@ -5158,17 +5169,21 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             after = first + block.raw.count("\n") + 1
             # Code whose lines start with a quote marker, right after a quoted
             # line (also one behind list markers): markdown-it may continue
-            # the quote there. When the text after such a marker opens a
-            # fence or an HTML block for markdown-it, the lines from the code
-            # to the next blank line are kept byte for byte.
+            # the quote there. When the text after such a marker may open a
+            # fence or an HTML block for markdown-it (any indentation, so
+            # tabs need no column count), the lines from the code up to the
+            # first blank line or line without a quote marker, where
+            # markdown-it's quote and that block end, are kept byte for byte.
             prev = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "",
                           orig_lines[first - 1]) if first else ""
             if prev.lstrip(" \t").startswith(">") and any(
-                    _fence_opener(body.lstrip(" ")) or _is_html_start(body.lstrip(" "))
-                    for body in (re.sub(r"^(?:[ \t]*>)+ ?", "", line)
-                                 for line in orig_lines[first:after] if line.lstrip(" \t").startswith(">"))
-                    if _indent_of(body) < 4):
-                md_html_run.append((first, after, None, 0))
+                    _fence_opener(body) or _is_html_start(body)
+                    for body in (re.sub(r"^(?:[ \t]*>)+[ \t]*", "", line)
+                                 for line in orig_lines[first:after] if line.lstrip(" \t").startswith(">"))):
+                end = after
+                while end < n and orig_lines[end].strip() and orig_lines[end].lstrip(" \t").startswith(">"):
+                    end += 1
+                md_quote_raw.append((first, end))
             if (first and orig_lines[first - 1].strip() and _quote_depth(orig_lines[first - 1])[0]
                     and orig_lines[first].lstrip(" \t").startswith(">")):
                 # (So a blank line that ends that quote for markdown-it, and
@@ -5239,6 +5254,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # Lines kept byte for byte by the block that holds them, also inside
     # another block or between blocks (see md_item_lines and the exit walk).
     md_kept = [None] * n
+    for start, end in md_quote_raw:
+        for x in range(start, end):
+            md_kept[x] = 0
     # The lines a freeze of a container markdown-it closed already kept (a
     # later one stops there; it runs on over HTML blocks frozen above).
     closed_line = [False] * n
