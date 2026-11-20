@@ -7,6 +7,7 @@ Run by tests/test-polish-gemini-guard.sh. Prints one "PASS: name" or
 Multilingual fixtures use \\u escapes so this file stays ASCII-only.
 """
 
+import itertools
 import os
 import sys
 import time
@@ -4882,5 +4883,48 @@ for name, src in [
         ("a paragraph right after a fence with an indented quote marker reworded",
          "```\n    > quoted\n```\nRead the old text.\n")]:
     rejects("R8 " + name, src, src.replace("old", "new"))
+
+# Round 9 (R8-M1): a footnote definition inside a list item that takes a lazy
+# line. markdown-it may have read its first line as a reference definition and
+# closed the list there, so later lines are inside the list to one renderer and
+# outside it to the other, also past a blank line.
+R9_CASES = []
+for mark, lazy, pad in itertools.product(("- ", "1. ", "2) "), ("", " "), ("    ", "\t")):
+    prefix = mark + "[^n]: Note.\n" + lazy + "Lazy words.\n"
+    where = "after %r, lazy line at column %d, %s" % (mark.strip(), len(lazy), "spaces" if pad == "    " else "a tab")
+    for kind, opener, body, _ in R8_KINDS[:4]:
+        R9_CASES.append(("a %s in nested quotes %s" % (kind, where),
+                         prefix + pad + "> - > - " + opener + "\n" + pad + ">     > > " + body + "\n\nRead plain text.\n"))
+    R9_CASES.append(("indented code after a blank line " + where,
+                     prefix + "\n" + pad + "Keep old text.\n\nRead plain text.\n"))
+for mark, lazy in itertools.product(("- ", "1. ", "2) "), ("", " ")):
+    prefix = mark + "[^n]: Note.\n" + lazy + "Lazy words.\n"
+    pad = " " * len(mark)
+    where = "after %r, lazy line at column %d" % (mark.strip(), len(lazy))
+    for kind, opener, closer in (("fence", "```", "```"), ("div block", "<div>", "</div>"), ("pre block", "<pre>", "</pre>")):
+        R9_CASES.append(("a %s with an unindented body %s" % (kind, where),
+                         prefix + pad + opener + "\nKeep old text.\n" + pad + closer + "\n\nRead plain text.\n"))
+for mark, lazy, pad in itertools.product(("- > ", "- > - ", "- > - > "), ("", " "), ("    ", "\t")):
+    R9_CASES.append(("indented code after a blank line after %r, lazy line at column %d, %s"
+                     % (mark.strip(), len(lazy), "spaces" if pad == "    " else "a tab"),
+                     mark + "[^n]: Note.\n" + lazy + "Lazy words.\n\n" + pad + "Keep old text.\n\nRead plain text.\n"))
+assert len(R9_CASES) == 90
+for name, doc in R9_CASES:
+    rejects("R9 " + name + " after a lazy footnote line in a list changed", doc, doc.replace("old", "new"))
+    accepts("R9 " + name + " after a lazy footnote line in a list unchanged", doc, doc)
+    outside = doc.replace("Read plain text.", "Please read the plain text.")
+    if " fence " in name or " pre block " in name:
+        # (Kept on purpose: a fence or a pre block may run on over blank
+        # lines, so the rest of the document is kept byte for byte.)
+        rejects("R9 prose after " + name + " reworded (kept to the end)", doc, outside)
+    else:
+        accepts("R9 prose after " + name + " reworded", doc, outside)
+# A footnote in a list item without a lazy line keeps its own reading.
+accepts("R9 prose after a blank line following a footnote in a list item without a lazy line reworded",
+        "- [^n]: Note.\n  More words.\n\nRead the old text.\n", "- [^n]: Note.\n  More words.\n\nRead the new text.\n")
+# (Kept on purpose: an indented line after the blank line does not end the
+# kept stretch; the next line at the left margin after a blank line does.)
+rejects("R9 an indented paragraph after a lazy footnote line in a list reworded",
+        "- [^n]: Note.\nLazy words.\n\n  Read the old text.\n", "- [^n]: Note.\nLazy words.\n\n  Read the new text.\n")
 
 sys.exit(1 if FAILED else 0)

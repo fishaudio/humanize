@@ -108,7 +108,7 @@ def child(mode, work):
             "--base-url", "http://127.0.0.1:9/api/v1", "--template-dir", TEMPLATES,
             "--project-root", work, "--timeout", "30"]
     target = os.path.join(work, "output.md")
-    if mode.startswith(("quote_list_", "quote_lazy_", "quote_fn_", "quote_pred_", "quote_exit_")):
+    if mode.startswith(("quote_list_", "quote_lazy_", "quote_fn_", "quote_pred_", "quote_exit_", "quote_lexit_")):
         # R4-M1, R5-M1, R6-M1: a reply that changes the code, HTML or link
         # title markdown-it reads after an indented quote marker (in a list
         # item, on a lazy line without a marker, or absorbed by a quoted
@@ -299,18 +299,31 @@ QUOTE_RUNNER_DOCS = {
     "quote_exit_comment": "> [^n]: Note.\n  Lazy words.\n2. Before <!--\n    > Keep old text. -->\n\nRead plain text.\n",
     "quote_exit_attribute": '> [^n]: Note.\n  Lazy words.\n2. Before <span title="\n    > Keep old text.">\n\nRead plain text.\n',
     "quote_exit_title": '> [^n]: Note.\n  Lazy words.\n2. Before [text](url "\n    > Keep old text.")\n\nRead plain text.\n',
+    "quote_lexit_code": ("- [^n]: Note.\nLazy words.\n    > - > - Before `\n    >     > > Keep old text.`\n"
+                         "\nRead plain text.\n"),
+    "quote_lexit_comment": ("- [^n]: Note.\nLazy words.\n    > - > - Before <!--\n    >     > > Keep old text. -->\n"
+                            "\nRead plain text.\n"),
+    "quote_lexit_attribute": ('- [^n]: Note.\nLazy words.\n    > - > - Before <span title="\n'
+                              '    >     > > Keep old text.">\n\nRead plain text.\n'),
+    "quote_lexit_title": ('- [^n]: Note.\nLazy words.\n    > - > - Before [text](url "\n'
+                          '    >     > > Keep old text.")\n\nRead plain text.\n'),
+    "quote_lexit_indented": "- [^n]: Note.\nLazy words.\n\n    Keep old text.\n\nRead plain text.\n",
+    "quote_lexit_fence": "- [^n]: Note.\nLazy words.\n  ```\nKeep old text.\n  ```\n\nRead plain text.\n",
+    "quote_lexit_div": "- [^n]: Note.\nLazy words.\n  <div>\nKeep old text.\n  </div>\n\nRead plain text.\n",
+    "quote_lexit_pre": "- [^n]: Note.\nLazy words.\n  <pre>\nKeep old text.\n  </pre>\n\nRead plain text.\n",
+    "quote_lexit_quoted": "- > [^n]: Note.\nLazy words.\n\n    Keep old text.\n\nRead plain text.\n",
 }
 
 
 def quote_list_cases():
-    # R4-M1 to R7-M2 through the real runner: the guard rejects, the
+    # R4-M1 to R8-M1 through the real runner: the guard rejects, the
     # original is delivered byte for byte; strict in-place output exits 3.
     for mode, doc in sorted(QUOTE_RUNNER_DOCS.items()):
         for strict in (False, True):
             r = run_child(mode + ("_strict" if strict else ""))
             delivered = r["input"] if strict else r["output"]
             report("%s %s after an indented quote marker changed%s: rejected, original delivered, exit %d"
-                   % ({"list": "R4-M1", "lazy": "R5-M1", "fn": "R6-M1", "pred": "R7-M1", "exit": "R7-M2"}[mode.split("_")[1]], mode.split("_", 2)[2],
+                   % ({"list": "R4-M1", "lazy": "R5-M1", "fn": "R6-M1", "pred": "R7-M1", "exit": "R7-M2", "lexit": "R8-M1"}[mode.split("_")[1]], mode.split("_", 2)[2],
                       " (strict, in place)" if strict else "", 3 if strict else 0),
                    r["rc"] == (3 if strict else 0) and delivered == doc and not r["leftovers"]
                    and r["outcomes"] == [OUTCOME_PREFIX + "rejected reason=structure delivered=yes"],

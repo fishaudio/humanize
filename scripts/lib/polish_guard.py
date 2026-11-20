@@ -3929,6 +3929,19 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 content.append(_lazy_stand_in(lazy))
             else:
                 content.append(lazy.lstrip(" \t"))
+            if any(ancestry):
+                # A lazy line continues the definition inside its list item
+                # here, while markdown-it may have read the first line as a
+                # reference definition and closed the list before this line:
+                # every later line is then read outside the list by one
+                # renderer and inside it by the other, also past a blank
+                # line (indented code, a fence or HTML block the list no
+                # longer takes). Such a definition is kept byte for byte
+                # from its start like any other list reading the renderers
+                # do not share (see md_list_freeze): to a line at the left
+                # margin after a blank line, or to the end of the document
+                # when a fence or HTML block may run on.
+                md_list_freeze.append(start)
             last = k
             k += 1
         # Only a parse of footnote content reads the state of a definition
