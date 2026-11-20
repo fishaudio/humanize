@@ -521,6 +521,15 @@ def _ref_label_close(text, open_bracket):
     return None
 
 
+def _indented_quote_marker(line):
+    """Whether a quote marker in the run of markers that starts ``line`` has
+    four or more columns of spaces or tabs before it: markdown-it may read it
+    as a marker where cmark-gfm reads code (a marker with less before it is a
+    marker to both)."""
+    run = re.match(r"(?:[ \t]*>)+", line)
+    return bool(run) and any(len(gap.expandtabs(4)) >= 4 for gap in re.findall(r"([ \t]*)>", run.group(0)))
+
+
 def _unpaired_bracket(masked):
     """True when ``masked`` holds a square bracket with no partner outside
     code spans, autolinks and raw HTML (backslash escapes skipped)."""
@@ -5165,22 +5174,15 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             # Code whose lines start with a quote marker, right after a quoted
             # line (also one behind list markers): markdown-it continues the
             # quote there, and what it reads after the marker (a fence, an
-            # HTML block, a list item holding either, ...) is not modeled.
-            # The lines from the code up to the first blank line or line
-            # without a quote marker, where markdown-it's quote ends, are kept
-            # byte for byte, and after them the lines indented four or more
-            # columns (code for markdown-it, possibly lazy text for
-            # cmark-gfm) up to a blank or less indented line.
+            # HTML block, a list item holding either, a paragraph that runs
+            # on lazily over lines without a marker, ...) is not modeled.
+            # The lines from the code up to the next blank line (spaces and
+            # tabs only) are kept byte for byte; see md_quote_raw below.
             prev = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "",
                           orig_lines[first - 1]) if first else ""
             if prev.lstrip(" \t").startswith(">") and any(
-                    line.lstrip(" \t").startswith(">") for line in orig_lines[first:after]):
-                end = after
-                while end < n and orig_lines[end].strip() and orig_lines[end].lstrip(" \t").startswith(">"):
-                    end += 1
-                while end < n and orig_lines[end].strip() and _indent_of(orig_lines[end].expandtabs(4)) >= 4:
-                    end += 1
-                md_quote_raw.append((first, end))
+                    _indented_quote_marker(line) for line in orig_lines[first:after]):
+                md_quote_raw.append((first, after))
             if (first and orig_lines[first - 1].strip() and _quote_depth(orig_lines[first - 1])[0]
                     and orig_lines[first].lstrip(" \t").startswith(">")):
                 # (So a blank line that ends that quote for markdown-it, and
@@ -5251,9 +5253,21 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # Lines kept byte for byte by the block that holds them, also inside
     # another block or between blocks (see md_item_lines and the exit walk).
     md_kept = [None] * n
-    for start, end in md_quote_raw:
-        for x in range(start, end):
-            md_kept[x] = 0
+    if md_quote_raw:
+        # Each such code block is kept with the lines after it up to the next
+        # blank line, quoted or not: a missing quote marker does not end
+        # markdown-it's quote while its paragraph runs on lazily. (One pass:
+        # the next blank line is looked up, and overlapping runs are marked
+        # once.)
+        next_blank = [n] * (n + 1)
+        for k in range(n - 1, -1, -1):
+            next_blank[k] = k if _md_blank(orig_lines[k]) else next_blank[k + 1]
+        marked = 0
+        for start, after in md_quote_raw:
+            end = next_blank[after]
+            for x in range(max(start, marked), end):
+                md_kept[x] = 0
+            marked = max(marked, end)
     # The lines a freeze of a container markdown-it closed already kept (a
     # later one stops there; it runs on over HTML blocks frozen above).
     closed_line = [False] * n

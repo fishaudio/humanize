@@ -4710,8 +4710,6 @@ for name, src, cand in [
         ('the item after a footnote and a blank line with spaces reworded',
          FOOTNOTE_LIST.replace('.\n\n-', '.\n  \n-'),
          FOOTNOTE_LIST.replace('.\n\n-', '.\n  \n-').replace('- Next.', '- The next one.')),
-        ('a paragraph right after the quote an indented quote marker continued reworded',
-         '>\n    > ```\nRead old text.\n', '>\n    > ```\nRead new text.\n'),
         ('prose next to a reference inside a tag whose attribute holds "](" reworded',
          '<span title="](">Read [the guide][r] here.</span>\n\n[r]: /guide\n',
          '<span title="](">See [the guide][r] here.</span>\n\n[r]: /guide\n')]:
@@ -4742,5 +4740,36 @@ for name, src in [
         ('a heading after an indented quote marker before quoted text',
          '>\n    > # Title\n> Keep old text.\n\nRead plain text.\n')]:
     rejects("R5 " + name + " changed", src, src.replace("old", "new"))
+
+# Round 6 (R5-M1): a line without a quote marker does not end the quote an
+# indented marker continued, as markdown-it's paragraph runs on lazily. The
+# lines up to the next blank line are kept byte for byte.
+for kind, opener, ending in (("code span", "Before `", "Keep old text.`"),
+                             ("comment", "Before <!--", "Keep old text. -->"),
+                             ("attribute", 'Before <span title="', 'Keep old text.">'),
+                             ("link title", 'Before [text](url "', 'Keep old text.")')):
+    for mark, label in (("", ""), ("- ", " in a bullet item"), ("1. ", " in an ordered item")):
+        for pad in ("", "  "):
+            doc = ">\n    > " + mark + opener + "\n" + pad + ending + "\n\nRead plain text.\n"
+            where = "%s%s, continued at column %d" % (kind, label, len(pad))
+            rejects("R6 a %s opened after an indented quote marker changed on an unmarked line" % where,
+                    doc, doc.replace("old", "new"))
+            accepts("R6 prose after a %s opened after an indented quote marker reworded" % where,
+                    doc, doc.replace("Read plain text.", "Please read the plain text."))
+for name, src in [
+        ('a code span over two unmarked lines after an indented quote marker',
+         '>\n    > Before `\nKeep old\ntext.`\n\nRead plain text.\n'),
+        ('a code span closed on a quoted line after an unmarked one',
+         '>\n    > Before `\nKeep old\n> text.`\n\nRead plain text.\n'),
+        ('a code span after a tab before the quote marker',
+         '>\n\t> Before `\nKeep old text.`\n\nRead plain text.\n')]:
+    rejects("R6 " + name + " changed", src, src.replace("old", "new"))
+# (Kept on purpose: a line without a marker right after such a region is
+# frozen too, even where markdown-it's quote has ended.)
+rejects("R6 a paragraph right after the quote an indented quote marker continued reworded",
+        '>\n    > ```\nRead old text.\n', '>\n    > ```\nRead new text.\n')
+accepts("R6 prose after indented code inside a quote reworded",
+        'See[^1].\n\n> [^1]: note\n>\n>     Body.\nRead old prose.\n',
+        'See[^1].\n\n> [^1]: note\n>\n>     Body.\nRead new prose.\n')
 
 sys.exit(1 if FAILED else 0)
