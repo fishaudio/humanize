@@ -5163,21 +5163,18 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             first = block.line - 1
             after = first + block.raw.count("\n") + 1
             # Code whose lines start with a quote marker, right after a quoted
-            # line (also one behind list markers): markdown-it may continue
-            # the quote there. When the text after such a marker may open a
-            # fence or an HTML block for markdown-it (at any indentation, as
-            # list items inside the quote move the columns), the lines from
-            # the code up to the first blank line or line without a quote
-            # marker, where markdown-it's quote and that block end, are kept
+            # line (also one behind list markers): markdown-it continues the
+            # quote there, and what it reads after the marker (a fence, an
+            # HTML block, a list item holding either, ...) is not modeled.
+            # The lines from the code up to the first blank line or line
+            # without a quote marker, where markdown-it's quote ends, are kept
             # byte for byte, and after them the lines indented four or more
             # columns (code for markdown-it, possibly lazy text for
             # cmark-gfm) up to a blank or less indented line.
             prev = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "",
                           orig_lines[first - 1]) if first else ""
             if prev.lstrip(" \t").startswith(">") and any(
-                    _fence_opener(body) or _is_html_start(body)
-                    for body in (re.sub(r"^(?:[ \t]*>)+[ \t]*", "", line)
-                                 for line in orig_lines[first:after] if line.lstrip(" \t").startswith(">"))):
+                    line.lstrip(" \t").startswith(">") for line in orig_lines[first:after]):
                 end = after
                 while end < n and orig_lines[end].strip() and orig_lines[end].lstrip(" \t").startswith(">"):
                     end += 1

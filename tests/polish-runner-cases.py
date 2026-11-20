@@ -108,6 +108,25 @@ def child(mode, work):
             "--base-url", "http://127.0.0.1:9/api/v1", "--template-dir", TEMPLATES,
             "--project-root", work, "--timeout", "30"]
     target = os.path.join(work, "output.md")
+    if mode.startswith("quote_list_"):
+        # R4-M1: a reply that changes the code or HTML markdown-it reads in a
+        # list item after an indented quote marker is rejected, and the
+        # original is delivered (in place with --strict: exit 3).
+        opener, closer = ("<div>", "</div>") if "_html" in mode else ("```", "```")
+        doc = (">\n    > - " + opener + "\n>   Keep old text.\n>   " + closer + "\n\nRead plain text.\n")
+        with open(source, "w") as fh:
+            fh.write(doc)
+
+        def transport(url, body, headers, timeout):
+            user = json.loads(body)["messages"][1]["content"]
+            nonce = re.search(r"DOCUMENT-BEGIN-([A-Fa-f0-9]+)@@", user).group(1)
+            content = ("@@HUMANIZE-POLISH-OUTPUT-BEGIN-%s@@\n%s\n@@HUMANIZE-POLISH-OUTPUT-END-%s@@"
+                       % (nonce, doc.replace("old", "new").rstrip("\n"), nonce))
+            return 200, {}, json.dumps({"choices": [{"finish_reason": "stop",
+                                                     "message": {"content": content}}]}).encode()
+
+        p.http_post = transport
+        args += ["--output", source, "--strict"] if mode.endswith("_strict") else ["--output", target]
     if mode == "signal_at_file_delivery":
         original = p.Runner._atomic_write
 
@@ -214,10 +233,13 @@ def run_child(mode):
     output = None
     if os.path.exists(os.path.join(work, "output.md")):
         output = open(os.path.join(work, "output.md")).read()
+    source = None
+    if os.path.exists(os.path.join(work, "input.md")):
+        source = open(os.path.join(work, "input.md")).read()
     leftovers = [f for f in os.listdir(work) if f.startswith(".polish-gemini-")]
     shutil.rmtree(work, ignore_errors=True)
     return {"rc": proc.returncode, "stdout": proc.stdout, "err": err, "outcomes": outcomes,
-            "meta": meta, "efforts": efforts, "output": output, "leftovers": leftovers}
+            "meta": meta, "efforts": efforts, "output": output, "input": source, "leftovers": leftovers}
 
 
 def meta_value(meta, key):
@@ -249,6 +271,22 @@ def effort_cases():
                    r["stdout"] == b"Read this clear sentence about the setup steps.\n", r["stdout"])
         else:
             report("%s: nothing is delivered" % mode, r["stdout"] == b"", r["stdout"])
+
+
+def quote_list_cases():
+    # R4-M1 through the real runner: the guard rejects, the original is
+    # delivered byte for byte; strict in-place output exits 3.
+    for kind in ("fence", "html"):
+        opener, closer = ("<div>", "</div>") if kind == "html" else ("```", "```")
+        doc = ">\n    > - " + opener + "\n>   Keep old text.\n>   " + closer + "\n\nRead plain text.\n"
+        for strict in (False, True):
+            r = run_child("quote_list_%s%s" % (kind, "_strict" if strict else ""))
+            delivered = r["input"] if strict else r["output"]
+            report("R4-M1 %s in a list item after an indented quote marker changed%s: rejected, original "
+                   "delivered, exit %d" % (kind, " (strict, in place)" if strict else "", 3 if strict else 0),
+                   r["rc"] == (3 if strict else 0) and delivered == doc and not r["leftovers"]
+                   and r["outcomes"] == [OUTCOME_PREFIX + "rejected reason=structure delivered=yes"],
+                   "rc=%s %r %r" % (r["rc"], r["outcomes"], delivered))
 
 
 def file_signal_cases():
@@ -1288,6 +1326,7 @@ def main():
     signal.signal(signal.SIGINT, signal.default_int_handler)
     effort_cases()
     file_signal_cases()
+    quote_list_cases()
     late_signal_cases()
     shell_finish_race_cases()
     blocked_stdout_cases()

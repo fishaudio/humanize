@@ -1081,8 +1081,10 @@ for name, src, cand in [
 # rows, and original bytes for raw blocks after quote relocation.
 LEAF = "> - Parent.\n>   - Child.\n>     - Leaf.\n>       >\t  OLD\n"
 QFENCE = "- Parent.\n  - Child.\n    > ```\n    > keep\n    > ```\n"
+# (Rejected as a structure change since R4-M1: the indented quote marker
+# continues the quote for markdown-it, so its lines are kept byte for byte.)
+rejects("indented code after a tab in a relocated quote changed", LEAF, LEAF.replace("OLD", "NEW"))
 for name, src, cand in [
-        ("indented code after a tab in a relocated quote changed", LEAF, LEAF.replace("OLD", "NEW")),
         ("the prefix bytes of a fence in a relocated quote changed", QFENCE, QFENCE.replace("    >", "\t>")),
         ("an indented code line written with a tab instead of spaces", "Text.\n\n\tcode\n", "Text.\n\n    code\n")]:
     rejects(name, src, cand, "region_changed")
@@ -4714,5 +4716,31 @@ for name, src, cand in [
          '<span title="](">Read [the guide][r] here.</span>\n\n[r]: /guide\n',
          '<span title="](">See [the guide][r] here.</span>\n\n[r]: /guide\n')]:
     accepts("R4 " + name, src, cand)
+
+# Round 5 (R4-M1): whatever follows an indented quote marker that continues
+# a quote for markdown-it (here a list item holding a fence or HTML block),
+# the quoted lines are kept byte for byte.
+for marker in ("-", "1."):
+    pad = " " * (len(marker) + 1)
+    for kind, opener, closer in (("fence", "```", "```"), ("tilde fence", "~~~", "~~~"),
+                                 ("div block", "<div>", "</div>"), ("comment", "<!--", "-->")):
+        doc = ">\n    > " + marker + " " + opener + "\n> " + pad + "Keep old text.\n> " + pad + closer + "\n\nRead plain text.\n"
+        item = "a bullet" if marker == "-" else "an ordered"
+        rejects("R5 a %s in %s list item after an indented quote marker changed" % (kind, item),
+                doc, doc.replace("old", "new"))
+        accepts("R5 prose after a %s in %s list item after an indented quote marker reworded" % (kind, item), doc,
+                doc.replace("Read plain text.", "Please read the plain text."))
+for name, src in [
+        ('a fence in a nested list item after an indented quote marker',
+         '>\n    > - - ```\n>     Keep old text.\n>     ```\n\nRead plain text.\n'),
+        ('a fence in a list item after an indented nested quote marker',
+         '> >\n    > > - ```\n> >   Keep old text.\n> >   ```\n\nRead plain text.\n'),
+        ('a fence in a list item behind a quote inside a list item',
+         '- >\n      > - ```\n  >   Keep old text.\n  >   ```\n\nRead plain text.\n'),
+        ('a fence in a quote inside a list item after an indented quote marker',
+         '>\n    > - > ```\n>   > Keep old text.\n>   > ```\n\nRead plain text.\n'),
+        ('a heading after an indented quote marker before quoted text',
+         '>\n    > # Title\n> Keep old text.\n\nRead plain text.\n')]:
+    rejects("R5 " + name + " changed", src, src.replace("old", "new"))
 
 sys.exit(1 if FAILED else 0)
