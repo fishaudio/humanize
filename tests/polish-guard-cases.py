@@ -4683,7 +4683,13 @@ for name, src, cand in [
         ('indented code after the quote an indented quote marker continued changed',
          '>\n    > ```\n> plain text.\n    Keep old text.\n', '>\n    > ```\n> plain text.\n    Keep new text.\n'),
         ('a reference link next to a tag whose attribute holds "](" removed',
-         '<span title="](">[r][r][` ]( ` now.\n\n[r]: /guide\n', '<span title="](">r][r][` ]( ` now.\n\n[r]: /guide\n')]:
+         '<span title="](">[r][r][` ]( ` now.\n\n[r]: /guide\n', '<span title="](">r][r][` ]( ` now.\n\n[r]: /guide\n'),
+        ('a fence in a list item inside a quote an indented quote marker continued changed',
+         '> -\n    >     ```\n>   Read old text.\n', '> -\n    >     ```\n>   Read new text.\n'),
+        # (Kept on purpose: any fence-like text after the marker freezes
+        # the quoted lines, whatever the list columns.)
+        ('prose after an overindented fence-like line behind an indented quote marker reworded',
+         '>\n    >     ```\n> Read old text.\n', '>\n    >     ```\n> Read new text.\n')]:
     rejects("R4 " + name, src, cand)
 for name, src, cand in [
         ('link text with brackets and the prose around it reworded',
@@ -4706,9 +4712,7 @@ for name, src, cand in [
          '>\n    > ```\nRead old text.\n', '>\n    > ```\nRead new text.\n'),
         ('prose next to a reference inside a tag whose attribute holds "](" reworded',
          '<span title="](">Read [the guide][r] here.</span>\n\n[r]: /guide\n',
-         '<span title="](">See [the guide][r] here.</span>\n\n[r]: /guide\n'),
-        ('prose after an overindented fence-like line behind an indented quote marker reworded',
-         '>\n    >     ```\n> Read old text.\n', '>\n    >     ```\n> Read new text.\n')]:
+         '<span title="](">See [the guide][r] here.</span>\n\n[r]: /guide\n')]:
     accepts("R4 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)

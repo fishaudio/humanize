@@ -5164,18 +5164,19 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             after = first + block.raw.count("\n") + 1
             # Code whose lines start with a quote marker, right after a quoted
             # line (also one behind list markers): markdown-it may continue
-            # the quote there. When the text after such a marker opens a fence
-            # or an HTML block for markdown-it (columns counted with tabs
-            # expanded), the lines from the code up to the first blank line or
-            # line without a quote marker, where markdown-it's quote and that
-            # block end, are kept byte for byte, and after them the lines
-            # indented four or more columns (code for markdown-it, possibly
-            # lazy text for cmark-gfm) up to a blank or less indented line.
+            # the quote there. When the text after such a marker may open a
+            # fence or an HTML block for markdown-it (at any indentation, as
+            # list items inside the quote move the columns), the lines from
+            # the code up to the first blank line or line without a quote
+            # marker, where markdown-it's quote and that block end, are kept
+            # byte for byte, and after them the lines indented four or more
+            # columns (code for markdown-it, possibly lazy text for
+            # cmark-gfm) up to a blank or less indented line.
             prev = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "",
                           orig_lines[first - 1]) if first else ""
             if prev.lstrip(" \t").startswith(">") and any(
-                    _indent_of(body) < 4 and (_fence_opener(body.lstrip(" ")) or _is_html_start(body.lstrip(" ")))
-                    for body in (re.sub(r"^(?:[ \t]*>)+ ?", "", line.expandtabs(4))
+                    _fence_opener(body) or _is_html_start(body)
+                    for body in (re.sub(r"^(?:[ \t]*>)+[ \t]*", "", line)
                                  for line in orig_lines[first:after] if line.lstrip(" \t").startswith(">"))):
                 end = after
                 while end < n and orig_lines[end].strip() and orig_lines[end].lstrip(" \t").startswith(">"):
