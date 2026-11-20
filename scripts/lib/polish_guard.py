@@ -3246,10 +3246,42 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             rows.append(j)
             j += 1
         has_html = any(next(_iter_html(_strip_quote(lines[r], quote), loose=True), None) for r in rows)
+        # markdown-it has no tables: it reads the rows as paragraph text,
+        # with the paragraph right before them and the lines after them
+        # that do not end its paragraph (lazy lines after a quoted table, a
+        # list item numbered other than 1, another table). A row where a code span, raw
+        # HTML, a link, math or emphasis it reads there crosses a cell or a
+        # row (or follows a cell that leaves a "[" open) is kept byte for
+        # byte, and where that reaches the paragraph before the table or
+        # the lazy lines after it, the lines from there are kept too (see
+        # md_list_freeze).
+        raw_rows = set()
+        if not has_html:
+            before = []
+            if blocks and blocks[-1].kind == "paragraph" and \
+                    blocks[-1].line + blocks[-1].raw.count("\n") == i:
+                before = [_strip_quote(lines[x], quote) for x in range(blocks[-1].line - 1, i)]
+            lazy = []
+            if not inner and j < n and lines[j].strip() and not _mdit_interrupts(lines[j], quote):
+                x = j
+                while x < n and lines[x].strip() and not _mdit_interrupts(lines[x], quote):
+                    lazy.append(_strip_quote(lines[x], _quote_depth(lines[x])[0]))
+                    x += 1
+            row_texts = [_strip_quote(lines[i], quote), _strip_quote(lines[i + 1], quote)] + \
+                [_strip_quote(lines[r], quote) for r in rows[1:]]
+            touched = _md_table_crosses(before, row_texts, lazy)
+            if touched:
+                b = len(before)
+                if min(touched) < b and not inner:
+                    md_list_freeze.append(blocks[-1].line - 1)
+                if max(touched) >= b + len(row_texts) and not inner:
+                    md_list_freeze.append(j)
+                raw_rows = {rows[0]} if b in touched else set()
+                raw_rows.update(rows[t] for t in range(1, len(rows)) if b + 1 + t in touched)
         for idx, r in enumerate(rows):
             row_body = _strip_quote(lines[r], quote)
             cells = _split_cells(row_body)
-            if has_html:
+            if has_html or r in raw_rows:
                 blocks.append(Block("table_raw", attrs(), lines[r], [], r + 1))
             elif idx == 0:
                 # markdown-it needs a pipe in the header row; cmark-gfm does
@@ -3356,6 +3388,11 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         return True
 
     while i < n:
+        if math_chain is not None and i > math_chain[0]:
+            # (The line after a chain of math blocks was read as another
+            # block: the renderers read it on in the chain's paragraph.)
+            md_list_freeze.append(math_chain[0])
+            math_chain = None
         line = lines[i]
         quote, body = _quote_depth(line)
         if not body.strip():
@@ -3565,11 +3602,17 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                     md_list_freeze.append(chain[1] if chain else i)
                     math_skip = x - 1
                 else:
-                    texts = (chain[2] if chain else []) + texts
+                    if chain:
+                        chain[2].extend(texts)
+                        texts = chain[2]
                     nxt = lines[end + 1]
                     nrel = _past_container(_strip_quote(nxt, quote), base)
                     continues = bool(nrel.strip(" \t")) and not _mdit_interrupts(nxt, quote)
-                    if continues and nrel.lstrip().startswith("$$"):
+                    if (continues and nrel.lstrip().startswith("$$") and _indent_of(nrel) < 4
+                            and _quote_depth(nxt)[0] == quote and in_container(end + 1, quote, depth, base)):
+                        # (The next line starts a math block the guard reads
+                        # next; should it read that line otherwise, the
+                        # lines from there are kept, see the main loop.)
                         math_chain = (end + 1, chain[1] if chain else i, texts)
                     elif continues:
                         tail = texts
@@ -5424,6 +5467,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 labels = [mdit_label_key(label) for label in _loose_labels(block.raw)]
                 if labels:
                     block.md_label = tuple(block.md_label or ()) + tuple(labels)
+    if math_chain is not None:
+        md_list_freeze.append(math_chain[0])
     # A list markdown-it opens where cmark-gfm reads a paragraph is kept byte
     # for byte, quote markers and indentation included, from its first line
     # to the first line after a blank line (spaces and tabs only) that
@@ -5602,17 +5647,76 @@ def _md_runs_on(body, after):
     return False
 
 
+def _delimiter_text(text):
+    """``text`` with backslash escapes, code spans, raw HTML, autolinks,
+    link tails and math blanked out (same length), for _delimiter_runs:
+    delimiters there do not pair."""
+    chars = list(text)
+    for kind, start, end, _ in _inline_constructs(text):
+        for x in range(start, end):
+            if chars[x] != "\n":
+                chars[x] = " "
+    return "".join(chars)
+
+
+def _emphasis_spans(text):
+    """The emphasis and strikethrough spans (start, end) of ``text`` read as
+    one paragraph, in both readings."""
+    masked = _delimiter_text(text)
+    out = []
+    for gfm in (True, False):
+        spans = []
+        _pair_delimiters(_delimiter_runs(text, masked, gfm), spans, {}, gfm)
+        out.extend((a, b) for a, b, _ in spans)
+    return out
+
+
 def _md_emphasis_runs_on(body, after):
     """Whether emphasis or strikethrough pairs a delimiter in ``body`` with
     one in ``after`` when they are read as one paragraph (either reading)."""
-    text = body + "\n" + after
     cut = len(body)
-    for gfm in (True, False):
-        spans = []
-        _pair_delimiters(_delimiter_runs(text, text, gfm), spans, {}, gfm)
-        if any(a < cut < b for a, b, _ in spans):
-            return True
-    return False
+    return any(a < cut < b for a, b in _emphasis_spans(body + "\n" + after))
+
+
+def _md_table_crosses(before, rows, after):
+    """The indices of the lines (``before`` + ``rows`` + ``after``, which
+    markdown-it reads as one paragraph) where markdown-it's reading crosses
+    what cmark-gfm reads apart in a table's ``rows``: a code span, raw
+    HTML, an autolink, math, a link tail or emphasis that spans a row end
+    or an unescaped pipe of a row covers the lines from its start to its
+    end; a cell that leaves a "[" open, its row and every line after it."""
+    lines = before + rows + after
+    text = "\n".join(lines)
+    cuts = []
+    starts = []
+    touched = set()
+    pos = 0
+    for k, line in enumerate(lines):
+        starts.append(pos)
+        if pos:
+            cuts.append(pos - 1)
+        if len(before) <= k < len(before) + len(rows):
+            for x, ch in enumerate(line):
+                if ch == "|" and (x == 0 or line[x - 1] != "\\"):
+                    cuts.append(pos + x)
+            if not touched.issuperset(range(k, len(lines))) and \
+                    any(_open_bracket(cell) for cell in _split_cells(line)):
+                touched.update(range(k, len(lines)))
+        pos += len(line) + 1
+    cuts.sort()
+
+    def mark(a, b):
+        c = bisect.bisect_right(cuts, a)
+        if c < len(cuts) and cuts[c] < b:
+            touched.update(range(bisect.bisect_right(starts, a) - 1, bisect.bisect_right(starts, b - 1)))
+
+    for _, constructs in _inline_readings(text, None):
+        for kind, start, end, _ in constructs:
+            if kind != "escape":
+                mark(start, end)
+    for a, b in _emphasis_spans(text):
+        mark(a, b)
+    return touched
 
 
 def _open_bracket(text):
@@ -5650,6 +5754,9 @@ def _md_starts_anew(lines, k, prev_block):
         if marker is not None and marker.search(prev):
             return True
     own, own_body = _quote_depth(lines[k])
+    if _mdit_interrupts(lines[k], own):
+        # (It ends a paragraph at its own depth, so at any depth.)
+        return True
     marked = bool(re.match(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", own_body))
     level = 0
     for x in range(k - 1, max(-1, k - 1 - MD_ANEW_LOOKBACK), -1):
@@ -5718,41 +5825,31 @@ def _footnote_content(block_lines, quote, base):
 FOOTNOTE_MASK_DEPTH = 8
 
 
-def _image_texts(text):
-    """(start, end) of each "![...]" in ``text`` with its closing bracket,
-    outside code spans and raw HTML of the first reading (backslash escapes
-    skipped): text that is an image's alt text where a link follows."""
+def _hidden_brackets(text):
+    """(start, end) of each bracket pair in ``text`` whose text no renderer
+    emits as written: an image's text (alt text: cmark-gfm escapes a
+    comment there and markdown-it drops it) and the label of an explicit
+    reference ("[text][label]"). Brackets in code spans, raw HTML,
+    autolinks and link tails (destinations and titles) of the first
+    reading do not count, and backslash escapes are skipped; a pair that is
+    no image or reference after all is read the conservative way."""
     skip = {}
     for kind, start, end, _ in _inline_constructs(text):
-        if kind in ("code", "html", "autolink"):
+        if kind in ("code", "html", "autolink", "linktail", "escape"):
             skip[start] = end
     out = []
+    stack = []
     x = 0
     while x < len(text):
         if x in skip:
             x = skip[x]
             continue
-        if text[x] == "\\":
-            x += 2
-            continue
-        if text.startswith("![", x):
-            depth = 0
-            y = x + 1
-            while y < len(text):
-                if y in skip:
-                    y = skip[y]
-                    continue
-                if text[y] == "\\":
-                    y += 2
-                    continue
-                if text[y] == "[":
-                    depth += 1
-                elif text[y] == "]":
-                    depth -= 1
-                    if not depth:
-                        out.append((x, y + 1))
-                        break
-                y += 1
+        if text[x] == "[":
+            stack.append(x)
+        elif text[x] == "]" and stack:
+            o = stack.pop()
+            if o and (text[o - 1] == "]" or (text[o - 1] == "!" and skip.get(o - 2) != o)):
+                out.append((o, x + 1))
         x += 1
     return out
 
@@ -5769,9 +5866,7 @@ def _marker_masks(text):
     every = None
     esc = [False] * len(text)
     hidden = [False] * len(text)
-    for start, end in _image_texts(text):
-        # (Image text is alt text: cmark-gfm escapes a comment there and
-        # markdown-it drops it.)
+    for start, end in _hidden_brackets(text):
         hidden[start:end] = [True] * (end - start)
     for _, constructs in _inline_readings(text, None):
         code = [False] * len(text)
