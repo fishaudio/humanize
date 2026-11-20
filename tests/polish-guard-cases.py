@@ -3677,4 +3677,69 @@ for src, cand in [
          '1. > > > [docs]: /guide\n   > Read the guide\n   > 2. # Notes\n   >  ===\n   >     ```\n   >     Read the notes.\n   \\   Continue with care.\n\n   > See [ref].\n')]:
     rejects("R3 an older fuzz find after a definition kept byte for byte: " + repr(src[:40]), src, cand)
 
+# (d37cc77 re-review: blank lines by Markdown's rule, a table header row
+# markdown-it reads as a block of its own after a definition, kept lines
+# hashed from the bytes as written, polish:on inside an open fence or HTML
+# block, and list markers with ASCII digits only.)
+for name, src, cand in [
+        ("a no-break space line in a list markdown-it opens after a definition",
+         "[docs]: /guide\n2. Read `echo\n\u00a0\nold` carefully.\n",
+         "[docs]: /guide\n2. Read `echo\n\u00a0\nnew` carefully.\n"),
+        ("a numbered table header row after a definition, a later line moved out of the item",
+         "[docs]: /guide\n2. Read\n:---\n\n   Read the notes carefully.\n",
+         "[docs]: /guide\n2. Read\n:---\n\n  Read the notes carefully.\n"),
+        ("an indented table header row after a definition (code to markdown-it)",
+         "[docs]: /guide\n    alpha | b\n--- | ---\n",
+         "[docs]: /guide\n    gamma | b\n--- | ---\n"),
+        ("a line added below a table markdown-it reads as a paragraph after a definition",
+         "[docs]: /guide\n<span> | old\n--- | ---\n   ---\n\n3. old item\n",
+         "[docs]: /guide\n<span> | old\n--- | ---\n \n   ---\n\n3. old item\n"),
+        ("whitespace after polish:on inside a pre block in a region kept after a definition",
+         "[docs]: /guide\n2. Read the notes.\n<!-- polish:off -->\n<pre>\nKeep old text.\n"
+         "<!-- polish:on --> Read the notes.\n</pre>\n",
+         "[docs]: /guide\n2. Read the notes.\n<!-- polish:off -->\n<pre>\nKeep old text.\n"
+         "<!-- polish:on -->\tRead the notes.\n</pre>\n"),
+        ("text after polish:on inside a pre block opened in the region",
+         "<!-- polish:off -->\n<pre>\nKeep old text.\n<!-- polish:on --> Read the notes.\n</pre>\n",
+         "<!-- polish:off -->\n<pre>\nKeep old text.\n<!-- polish:on --> Review the notes.\n</pre>\n"),
+        ("code after polish:on inside a fence opened in the region",
+         "<!-- polish:off -->\n```\ncode\n<!-- polish:on -->\nmore code\n```\nText after.\n",
+         "<!-- polish:off -->\n```\ncode\n<!-- polish:on -->\nless code\n```\nText after.\n"),
+        ("a code span over a no-break space line",
+         "Read `echo\n\u00a0\nold` carefully.\n", "Read `echo\n\u00a0\nnew` carefully.\n"),
+        ("an attribute over an ideographic space line",
+         "Read <span title=\"a\n\u3000\nold\">x</span> now.\n", "Read <span title=\"a\n\u3000\nnew\">x</span> now.\n"),
+        ("a code span over a form feed line in a list item",
+         "- Read `echo\n  \x0c\n  old` carefully.\n", "- Read `echo\n  \x0c\n  new` carefully.\n"),
+        ("a code span over a quoted no-break space line",
+         "> Read `echo\n> \u00a0\n> old` carefully.\n", "> Read `echo\n> \u00a0\n> new` carefully.\n"),
+        ("an HTML block over a no-break space line",
+         "<div>\n\u00a0\nold text\n</div>\n", "<div>\n\u00a0\nnew text\n</div>\n"),
+        ("indented code after carriage returns without line feeds",
+         "Read this.\r\r    echo old\r\n", "Read this.\r\r    echo new\r\n"),
+        ("indented code after a fullwidth-numbered line (no list item)",
+         "\uff12. Read\n\n    echo old\n", "\uff12. Read\n\n    echo new\n"),
+        ("indented code after an Arabic-Indic-numbered line (no list item)",
+         "\u0663. Read\n\n    echo old\n", "\u0663. Read\n\n    echo new\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("prose after a triple-backtick code span in a region kept after a definition",
+         "[docs]: /guide\n2. Read the notes.\n   ```Use ``old`` here``` carefully.\n\n"
+         "Read the next section carefully.\n",
+         "[docs]: /guide\n2. Read the notes.\n   ```Use ``old`` here``` carefully.\n\n"
+         "Review the next section carefully.\n"),
+        ("a fullwidth-numbered line after a definition reworded",
+         "[docs]: /guide\n\uff12. Read the notes carefully.\n", "[docs]: /guide\n\uff12. Review the notes carefully.\n"),
+        ("a fullwidth-numbered paragraph after a region kept after a definition reworded",
+         "[docs]: /guide\n2. Read the notes.\n\n\uff12. Read the notes carefully.\n",
+         "[docs]: /guide\n2. Read the notes.\n\n\uff12. Review the notes carefully.\n"),
+        ("a document with carriage return line endings reworded",
+         "Read this.\r\n\r\nMore text.\r\n", "Read this.\r\n\r\nSome text.\r\n"),
+        ("a line with a no-break space between words reworded",
+         "Read the\u00a0notes now.\n", "Review the\u00a0notes now.\n"),
+        ("prose after polish:on when the fence in the region is closed",
+         "<!-- polish:off -->\n```\ncode\n```\n<!-- polish:on -->\nRead the notes.\n",
+         "<!-- polish:off -->\n```\ncode\n```\n<!-- polish:on -->\nReview the notes.\n")]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
