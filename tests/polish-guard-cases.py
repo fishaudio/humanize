@@ -3742,4 +3742,65 @@ for name, src, cand in [
          "<!-- polish:off -->\n```\ncode\n```\n<!-- polish:on -->\nReview the notes.\n")]:
     accepts("R3 " + name, src, cand)
 
+# (5e23e8d re-review: mixed line endings, a definition title running onto a
+# table header row, polish:on inside a raw block as the renderers read it,
+# and whitespace other than spaces and tabs at the edges of a line's text.)
+for name, src, cand in [
+        ("a fence after a bare carriage return",
+         "Read the notes.\r```text\n\nRead old text.\n```\n", "Read the notes.\r```text\n\nRead new text.\n```\n"),
+        ("one line with a CRLF ending in an LF document",
+         "- 1. [docs]: /guide\r\n     Read the guide.\n  2. The notes explain everything.\n",
+         "- 1. [docs]: /guide\r\nRead the guide.\n  2. The notes explain everything.\n"),
+        ("a definition title running onto a table header row",
+         "[docs]: /guide\n\"Read old\nmore | words\"\n--- | ---\n\nSee [docs] now.\n",
+         "[docs]: /guide\n\"Read new\nmore | words\"\n--- | ---\n\nSee [docs] now.\n"),
+        ("text after polish:on on its own line inside a div opened in the region",
+         "<!-- polish:off -->\n<div>\nKeep text.\n<!-- polish:on -->\nRead old text.\n</div>\n",
+         "<!-- polish:off -->\n<div>\nKeep text.\n<!-- polish:on -->\nRead new text.\n</div>\n"),
+        ("text after polish:on inside a span block opened in the region",
+         "<!-- polish:off -->\n<span>\nKeep text.\n<!-- polish:on -->\nRead old text.\n</span>\n",
+         "<!-- polish:off -->\n<span>\nKeep text.\n<!-- polish:on -->\nRead new text.\n</span>\n"),
+        ("text after polish:on inside a div in a list item",
+         "- <!-- polish:off -->\n  <div>\n  Keep text.\n  <!-- polish:on -->\n  Read old text.\n  </div>\n",
+         "- <!-- polish:off -->\n  <div>\n  Keep text.\n  <!-- polish:on -->\n  Read new text.\n  </div>\n"),
+        ("text after polish:on when an indented backtick line does not close the fence",
+         "<!-- polish:off -->\n```markdown\n    ```\n<!-- polish:on -->\nRead old text.\n```\n",
+         "<!-- polish:off -->\n```markdown\n    ```\n<!-- polish:on -->\nRead new text.\n```\n"),
+        ("text after polish:on when a quoted backtick line does not close the fence",
+         "<!-- polish:off -->\n```markdown\n> ```\n<!-- polish:on -->\nRead old text.\n```\n",
+         "<!-- polish:off -->\n```markdown\n> ```\n<!-- polish:on -->\nRead new text.\n```\n"),
+        ("text after polish:on on a line that opens a pre block before the marker",
+         "<!-- polish:off -->\nKeep.\n<pre><!-- polish:on --> text old\n</pre>\n",
+         "<!-- polish:off -->\nKeep.\n<pre><!-- polish:on --> text new\n</pre>\n"),
+        ("a list item holding only an ideographic space before a heading item",
+         "> [docs]: /guide\n- \u3000\nRead the guide\n2. # Notes\n",
+         "> [docs]: /guide\n- \u3000\nRead the guide\n2. #Notes\n"),
+        ("a definition ending in a vertical tab",
+         "1. See ![x][docs](old) and `echo old` now.\n> old` here\u00a0\n\n[docs]: <x`y>\u000b\n",
+         "1. See ![x][docs](old) and `echo old` now.\n> old` here\u00a0\n\n[docs]:'<x`y>\u000b\n"),
+        ("a line starting with an ideographic space before a list marker",
+         "- - 1. [docs]: /guide\n       Read the guide.\n    2. The notes explain everything.\n  <span>\n  ```\n"
+         "  \u3000- See ![the option][ref](file:///a \"` t\") for details.\n\n  [ref]: <x`y>\n\n"
+         "  | a | b |\n  | - | - |\n  | old | x |\n",
+         "- - 1. [docs]: /guide\n       Read the guide.\n    2. The notes explain everything.\n  <span>\n  ```\n"
+         "  \u3000- See ![the option][ref](file:///a \"` t\") for details.\n\n  [ref]: <x`y>\n\n"
+         "  | a | b |\n  | - |- |\n  | old | x |\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("prose after a comment the polish:on marker closes",
+         "<!-- polish:off -->\n<!-- keep this comment\n<!-- polish:on -->\n\nRead old notes.\n",
+         "<!-- polish:off -->\n<!-- keep this comment\n<!-- polish:on -->\n\nRead new notes.\n"),
+        ("prose after a quoted fence that ended with its quote before polish:on",
+         "> <!-- polish:off -->\n> ```text\n> Keep this example.\n\n<!-- polish:on -->\n\nRead old notes.\n",
+         "> <!-- polish:off -->\n> ```text\n> Keep this example.\n\n<!-- polish:on -->\n\nRead new notes.\n"),
+        ("prose after a div that a blank line closed before polish:on",
+         "<!-- polish:off -->\n<div>\nKeep.\n\n<!-- polish:on -->\nRead old.\n",
+         "<!-- polish:off -->\n<div>\nKeep.\n\n<!-- polish:on -->\nRead new.\n"),
+        ("many closed fences in polish:off regions, prose after one reworded",
+         "".join("<!-- polish:off -->\n```\ncode %d\n```\n<!-- polish:on -->\nRead the notes %d.\n\n" % (x, x)
+                 for x in range(2000)),
+         "".join("<!-- polish:off -->\n```\ncode %d\n```\n<!-- polish:on -->\n%s the notes %d.\n\n"
+                 % (x, "Review" if x == 5 else "Read", x) for x in range(2000)))]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)

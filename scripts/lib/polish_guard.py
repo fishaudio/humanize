@@ -2512,16 +2512,18 @@ def _md_blank(line):
 
 def _odd_blank(line):
     """Whether the guard's block reading, which takes any whitespace as
-    blank, may part from the renderers' on ``line``: past its quote markers
-    and indentation it holds only whitespace, some of it other than spaces
-    and tabs (a no-break space, a form feed), or it holds a carriage return
-    that is not followed by a line feed (a line ending to the renderers)."""
+    blank or as indentation, may part from the renderers' on ``line``: past
+    its quote markers, list markers and indentation, its text starts or
+    ends with whitespace other than spaces and tabs (a no-break space, a
+    form feed, an ideographic space), which is text to the renderers, or
+    it holds a carriage return that is not followed by a line feed (a line
+    ending to the renderers)."""
     if line.endswith("\r"):
         line = line[:-1]
     if "\r" in line:
         return True
-    rest = line.lstrip(" \t>")
-    return bool(rest) and not rest.strip()
+    rest = re.sub(r"^(?:[ \t>]|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$))*", "", line).rstrip(" \t")
+    return bool(rest) and (rest[0].isspace() or rest[-1].isspace())
 
 
 def _fence_opener(text):
@@ -2531,32 +2533,6 @@ def _fence_opener(text):
     if m and (m.group(2)[0] == "~" or "`" not in m.group(3)):
         return m.group(2)[0], len(m.group(2))
     return None
-
-
-def _raw_block_step(state, line):
-    """One line of a rough reading of fences and HTML blocks across
-    containers (quote and list markers and indentation dropped, so it may
-    see more than the renderers do): the state after ``line``, None when no
-    fence or HTML block is open, else ("fence", character, length) or
-    ("html", end pattern or None for types 6 and 7)."""
-    text = re.sub(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*", "",
-                  line[:-1] if line.endswith("\r") else line)
-    if state is None:
-        fence = _fence_opener(text)
-        if fence is not None:
-            return ("fence",) + fence
-        if _is_html_start(text):
-            end = _html_end_marker(text)
-            if end is None:
-                return ("html", None)
-            return None if end.search(text) else ("html", end)
-        return None
-    if state[0] == "fence":
-        m = re.match(r"(`{3,}|~{3,})[ \t]*$", text)
-        return None if m and m.group(1)[0] == state[1] and len(m.group(1)) >= state[2] else state
-    if state[1] is None:
-        return None if _md_blank(line) else state
-    return None if state[1].search(line) else state
 
 
 def _is_table_sep(line):
@@ -2907,6 +2883,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
     # as written.
     orig_lines = text.split("\n")
     src_lines = list(orig_lines)
+    raw_spans = None
     lines = [_expand_structure(line) for line in orig_lines]
     n = len(lines)
     # (Which reference labels the document may define, for the span records.)
@@ -3424,25 +3401,27 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 continue
             on = POLISH_ON_RE.search(lines[j])
             rest = lines[j][on.end():]
-            # A fence or HTML block opened in the region and still open at
-            # the polish:on marker runs on past it for both renderers (the
-            # marker is text inside it): the region is kept to that block's
-            # end, since its lines are code or raw HTML there, not prose.
-            raw_state = None
-            for k in range(i + 1, j):
-                raw_state = _raw_block_step(raw_state, src_lines[k])
-            src_on = POLISH_ON_RE.search(src_lines[j])
-            raw_state = _raw_block_step(raw_state, src_lines[j][:src_on.start()])
-            if raw_state is not None:
-                if raw_state[0] == "html" and raw_state[1] is not None and raw_state[1].search(
-                        src_lines[j][src_on.end():]):
-                    raw_state = None
-                e = j
-                while raw_state is not None and e + 1 < n:
-                    if raw_state[0] == "html" and raw_state[1] is None and _md_blank(src_lines[e + 1]):
-                        break
-                    e += 1
-                    raw_state = _raw_block_step(raw_state, src_lines[e])
+            # A raw block (a fence, an HTML block, indented code, a
+            # definition) that starts inside the region, or on the marker's
+            # line with text before the marker, and still runs at the
+            # polish:on marker for the renderers, to whom the markers are
+            # plain HTML comments, takes the marker as its own text: the
+            # region is kept to that block's end, read by this parser with
+            # the markers renamed to ordinary comments of the same length.
+            if raw_spans is None:
+                # (The raw block covering each line, as (first, last).)
+                raw_spans = [None] * n
+                for b in parse_blocks(re.sub(r"(<!--\s*polish):(o(?:n|ff)\s*-->)", r"\1-\2", text),
+                                      spec_blank_items, inner):
+                    if b.kind in RAW_KINDS:
+                        span = (b.line - 1, min(n - 1, b.line - 1 + b.raw.count("\n")))
+                        for x in range(span[0], span[1] + 1):
+                            raw_spans[x] = span
+            lead = re.sub(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*", "",
+                          lines[j][:on.start()])
+            cover = raw_spans[j]
+            e = cover[1] if cover is not None and i < cover[0] and (cover[0] < j or lead) else None
+            if e is not None:
                 blocks.append(Block("protected", attrs(base=base), "\n".join(src_lines[i:e + 1]), [],
                                     start_line))
                 i = e + 1
@@ -3853,7 +3832,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None):
                 tuple(tuple(c for _, c in stack) for stack in level_stacks))
             row = next((r for r in trial if r[1] <= len(content) < r[2]), None)
             if row is None or row[0] != "paragraph" or row[3]:
-                md_list_freeze.append(j)
+                # (From where that reading starts: a definition whose title
+                # runs onto the row starts above it.)
+                md_list_freeze.append(i + min(row[1], len(content)) if row is not None else j)
             elif row[1] == len(content) and j + 1 < n:
                 md_list_freeze.append(j + 1)
         if md_item_col is not None and j < n:
@@ -5534,6 +5515,16 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
     """Verify a Markdown or text candidate against its source. Raises GuardReject."""
     if candidate.count("\r") != source.count("\r"):
         raise GuardReject("structure", "carriage-return line endings changed")
+    if "\r" in source:
+        # Line endings that are CRLF throughout read as line feeds; mixed
+        # line endings and bare carriage returns, which the renderers also
+        # read as line ends, are not supported (the runner does not send
+        # such documents either).
+        if any(text.count("\r") != text.count("\r\n") or text.count("\n") - text.count("\r\n") > 0
+               for text in (source, candidate)):
+            raise GuardReject("structure", "mixed line endings or bare carriage returns are not supported")
+        source = source.replace("\r\n", "\n")
+        candidate = candidate.replace("\r\n", "\n")
     check_regions(source, candidate)
     src_blocks = parse_blocks(source)
     cand_blocks = parse_blocks(candidate)
