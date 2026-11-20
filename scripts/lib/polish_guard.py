@@ -521,6 +521,27 @@ def _ref_label_close(text, open_bracket):
     return None
 
 
+def _stray_brackets(masked):
+    """True when ``masked`` holds a square bracket with no partner (backslash
+    escapes skipped)."""
+    depth = 0
+    i = 0
+    n = len(masked)
+    while i < n:
+        ch = masked[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "[":
+            depth += 1
+        elif ch == "]":
+            if depth == 0:
+                return True
+            depth -= 1
+        i += 1
+    return depth != 0
+
+
 def _scan_refs(masked, original, resolve, offset=0):
     """Reference links and images in ``masked`` (a prose unit whose code,
     autolinks and inline link syntax are already masked; ``original`` has the
@@ -1531,7 +1552,22 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt
         # "file:" destination, is a boundary in cmark-gfm's reading only.)
         spans = [(ls, le, kind, "cm" if text[le + 1:le + 2] == "(" and _mdit_bad_tail(text, le + 1) else "yes",
                   None) for _, ls, le, _, kind, _ in links]
-        spans += _scan_refs(current(), text, resolve)
+        ref_spans = _scan_refs(current(), text, resolve)
+        spans += ref_spans
+        if ref_spans and "](" in current() and _stray_brackets(current()):
+            # A "](" that opened no inline link (those are masked by now)
+            # next to a reference that may resolve and an unpaired bracket:
+            # the renderers differ in what the failed tail and the brackets
+            # around it become. The unit is kept byte for byte.
+            found.append((0, "frozen", text))
+        # The ordered links and images of the unit, from the same bracket
+        # scanner: kind, whether they resolve, and the label that decides it,
+        # in order of their opening bracket. It is compared on its own (after
+        # every other token), as link text that holds brackets can hide a
+        # changed sequence from the reference patterns below.
+        sequence = [(sp[2], sp[3], sp[4]) for sp in sorted(spans, key=lambda sp: (sp[0], -sp[1])) if sp[3] != "no"]
+        if sequence:
+            found.append((len(text) + 1, "linkseq", repr(sequence)))
         # The statuses of the links inside each link, found in one pass over
         # the spans sorted by start (bracket spans nest or stay apart), so
         # many links in one paragraph take linear time.
@@ -4313,6 +4349,16 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             # inside another one can keep that one's paragraph open.
             blocks.append(Block("footnote_def", attrs(base=base), "\n".join(lines[i:end + 1]), [], start_line,
                                 end_state))
+            if any(ancestry):
+                # Inside a list item, the whitespace of the blank lines after
+                # the definition decides in cmark-gfm whether the list is
+                # loose (the definition's end state is not modeled): those
+                # lines are kept as written when a line follows them.
+                k = end + 1
+                while k < n and not _strip_quote(lines[k], quote).strip():
+                    k += 1
+                if end + 1 < k < n:
+                    blocks[-1].attrs["after_sep"] = tuple(lines[end + 1:k])
             if (not inner and len(blocks) > 1 and blocks[-2].kind == "paragraph"
                     and blocks[-2].line + blocks[-2].raw.count("\n") == i
                     and not _md_starts_anew(lines, i, blocks[-2])):
@@ -5109,6 +5155,20 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     for block in blocks:
         if block.kind == "indented_code":
             first = block.line - 1
+            after = first + block.raw.count("\n") + 1
+            # Code whose lines start with a quote marker, right after a quoted
+            # line (also one behind list markers): markdown-it may continue
+            # the quote there. When the text after such a marker opens a
+            # fence or an HTML block for markdown-it, the lines from the code
+            # to the next blank line are kept byte for byte.
+            prev = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "",
+                          orig_lines[first - 1]) if first else ""
+            if prev.lstrip(" \t").startswith(">") and any(
+                    _fence_opener(body.lstrip(" ")) or _is_html_start(body.lstrip(" "))
+                    for body in (re.sub(r"^(?:[ \t]*>)+ ?", "", line)
+                                 for line in orig_lines[first:after] if line.lstrip(" \t").startswith(">"))
+                    if _indent_of(body) < 4):
+                md_html_run.append((first, after, None, 0))
             if (first and orig_lines[first - 1].strip() and _quote_depth(orig_lines[first - 1])[0]
                     and orig_lines[first].lstrip(" \t").startswith(">")):
                 # (So a blank line that ends that quote for markdown-it, and

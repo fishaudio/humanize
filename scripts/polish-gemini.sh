@@ -831,16 +831,10 @@ if open_ready_pipe; then
     fi
 else
     # No pipe could be made (no usable temporary directory), so the start
-    # cannot be supervised. The helper replaces this shell instead; the
-    # handled signals are ignored for the moment of the exec and caught from
-    # the helper's first statements on. When the exec fails (execfail keeps
-    # this shell running), the original is delivered below.
-    shopt -s execfail
-    trap '' INT TERM
-    exec "$PYTHON_BIN" -I -B "$SCRIPT_DIR/lib/polish_gemini.py" "${PY_ARGS[@]}"
-    trap 'on_signal 130' INT
-    trap 'on_signal 143' TERM
+    # could not be supervised. The helper is not started: this shell keeps
+    # its INT and TERM traps and delivers the original below.
     unset HUMANIZE_POLISH_STDERR_FD HUMANIZE_POLISH_SIGNALS
+    START_FAILURE="could not create the readiness pipe"
 fi
-diag "could not start $PYTHON_BIN; delivering the original"
+diag "${START_FAILURE:-could not start $PYTHON_BIN}; delivering the original"
 deliver_original "${SKIP_REASON:-missing_dependency}"

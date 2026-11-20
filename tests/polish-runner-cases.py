@@ -993,14 +993,14 @@ def supervised_start_cases():
                    "count=%d paused=%s rc=%s dest=%r %r" % (count, paused, proc.returncode, dest, err[-300:]))
 
     # R3: the readiness pipe. A signal while it is made leaves no pipe behind;
-    # when no pipe can be made, the helper replaces the wrapper with exec and
-    # the run finishes normally.
+    # when no pipe can be made, the helper is not started and the wrapper
+    # delivers the original itself.
     for label, shim_body, code, expected in (
             ("SIGTERM while the readiness pipe is made: exit 143, interrupted, no pipe left",
              'kill -TERM "$(ps -o ppid= -p $PPID | tr -d " ")"\nexec \'%s\' "$@"\n' % shutil.which("mkfifo"),
              143, interrupted),
-            ("no readiness pipe can be made: the helper replaces the wrapper and the run finishes",
-             "exit 1\n", 0, [OUTCOME_PREFIX + "skipped reason=no_api_key delivered=yes"])):
+            ("no readiness pipe can be made: the wrapper delivers the original (missing_dependency)",
+             "exit 1\n", 0, [OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"])):
         work = tempfile.mkdtemp(prefix="polish-runner-sup-")
         tmp_dir = os.path.join(work, "tmp")
         os.mkdir(tmp_dir)
@@ -1020,6 +1020,94 @@ def supervised_start_cases():
         report(label, proc.returncode == code and stdout == (payload if code == 0 else b"") and not leftovers
                and only_prefixed(err) and outcome_lines(err) == expected,
                "rc=%s out=%r leftovers=%r %r" % (proc.returncode, stdout[:40], leftovers, err[-300:]))
+
+    # R3-M3: no readiness pipe can be made. The wrapper keeps its INT and TERM
+    # traps and never starts the helper. A signal to the runner PID or to its
+    # process group while the pipe is attempted ends the run as interrupted
+    # with nothing delivered; without a signal the original is delivered
+    # (exit 0, or 3 with --strict), to stdout or to an existing file.
+    for signame, code, group, to_file, strict in (
+            (None, 0, False, True, False), (None, 3, False, True, True),
+            ("TERM", 143, False, False, False), ("INT", 130, False, False, False),
+            ("INT", 130, True, False, False), ("TERM", 143, True, True, False),
+            ("INT", 130, False, True, True)):
+        work = tempfile.mkdtemp(prefix="polish-runner-nopipe-")
+        tmp_dir = os.path.join(work, "tmp")
+        os.mkdir(tmp_dir)
+        shim = os.path.join(work, "bin")
+        os.mkdir(shim)
+        out_dir = os.path.join(work, "out")
+        os.mkdir(out_dir)
+        dest = os.path.join(out_dir, "dest.md")
+        with open(dest, "wb") as handle:
+            handle.write(b"OLD\n")
+        if signame is None:
+            shim_body = "exit 1\n"
+        else:
+            shim_body = 'kill -%s %s"$(ps -o ppid= -p $PPID | tr -d " ")"\nexit 1\n' % (
+                signame, "-- -" if group else "")
+        write_script(os.path.join(shim, "mkfifo"), "#!/bin/bash\n" + shim_body)
+        payload = b"Read the source text when no readiness pipe can be made.\n"
+        args = [RUNNER, "--input", "-"] + (["--output", dest] if to_file else []) + (["--strict"] if strict else [])
+        proc = subprocess.Popen(args,
+                                env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": sys.executable, "TMPDIR": tmp_dir,
+                                                        "PATH": shim + os.pathsep + os.environ["PATH"]}),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        stdout, err = proc.communicate(input=payload, timeout=60)
+        with open(dest, "rb") as handle:
+            dest_now = handle.read()
+        leftovers = os.listdir(tmp_dir) + [f for f in os.listdir(out_dir) if f != "dest.md"] + [
+            f for f in os.listdir("/tmp") if f.startswith("polish-gemini-ready.%d." % proc.pid)]
+        shutil.rmtree(work, ignore_errors=True)
+        if signame is None:
+            ok = (outcome_lines(err) == [OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"]
+                  and (dest_now == payload and stdout == b"" if to_file else stdout == payload)
+                  and b"could not create the readiness pipe" in err)
+            label = "no readiness pipe, no signal%s%s: original delivered, exit %d" % (
+                " (file)" if to_file else "", " (strict)" if strict else "", code)
+        else:
+            ok = outcome_lines(err) == interrupted and stdout == b"" and dest_now == b"OLD\n"
+            label = "no readiness pipe, SIG%s to the %s%s: exit %d, interrupted, nothing delivered" % (
+                signame, "process group" if group else "runner PID", " (file)" if to_file else "", code)
+        report(label, ok and proc.returncode == code and not leftovers and only_prefixed(err),
+               "rc=%s out=%r dest=%r leftovers=%r %r" % (proc.returncode, stdout[:40], dest_now, leftovers,
+                                                          err[-300:]))
+
+    # The Round 3 review's reproducer: an interpreter that signals its own PID
+    # when it is started as the helper. On the old exec path that PID was the
+    # runner's and the signal was ignored. Now the helper is never started
+    # without a readiness pipe.
+    for signame in ("INT", "TERM"):
+        work = tempfile.mkdtemp(prefix="polish-runner-nopipe-")
+        tmp_dir = os.path.join(work, "tmp")
+        os.mkdir(tmp_dir)
+        shim = os.path.join(work, "bin")
+        os.mkdir(shim)
+        marker = os.path.join(work, "helper-started")
+        write_script(os.path.join(shim, "mkfifo"), "#!/bin/bash\nexit 1\n")
+        interp = os.path.join(shim, "py")
+        write_script(interp, '#!/bin/bash\ncase "$*" in *polish_gemini.py*) : > \'%s\'; kill -%s $$ ;; esac\n'
+                             'exec \'%s\' "$@"\n' % (marker, signame, sys.executable))
+        dest = os.path.join(work, "dest.md")
+        with open(dest, "wb") as handle:
+            handle.write(b"OLD\n")
+        payload = b"Read the original document.\n"
+        proc = subprocess.Popen([RUNNER, "--input", "-", "--output", dest],
+                                env=fallback_env(work, {"HUMANIZE_POLISH_PYTHON": interp, "TMPDIR": tmp_dir,
+                                                        "PATH": shim + os.pathsep + os.environ["PATH"]}),
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                start_new_session=True)
+        stdout, err = proc.communicate(input=payload, timeout=60)
+        with open(dest, "rb") as handle:
+            dest_now = handle.read()
+        started = os.path.exists(marker)
+        shutil.rmtree(work, ignore_errors=True)
+        report("no readiness pipe, interpreter signalling SIG%s at the hand-over: helper never started, "
+               "original delivered by the wrapper" % signame,
+               not started and proc.returncode == 0 and dest_now == payload and only_prefixed(err)
+               and outcome_lines(err) == [OUTCOME_PREFIX + "skipped reason=missing_dependency delivered=yes"],
+               "started=%s rc=%s dest=%r %r" % (started, proc.returncode, dest_now, err[-300:]))
 
     # During work: the helper waits on a request that never gets an answer;
     # a signal to the runner PID is passed on, a group signal reaches both.
