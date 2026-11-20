@@ -1114,8 +1114,10 @@ for name, src, cand, reason in [
         ("pre content after a polish:on cut changed from a tab to spaces",
          '<!-- polish:off -->\nKeep.\n<!-- polish:on --> <pre>\n\tOLD\n</pre>\n',
          '<!-- polish:off -->\nKeep.\n<!-- polish:on --> <pre>\n    OLD\n</pre>\n', "region_changed"),
+        # (Rejected as a structure change since R7-M1: the indented quote
+        # marker keeps the HTML block's lines byte for byte.)
         ("HTML in a quote two columns past a list item changed", '- Parent.\n    > <div>OLD</div>\n',
-         '- Parent.\n    > <div>NEW</div>\n', "region_changed"),
+         '- Parent.\n    > <div>NEW</div>\n', None),
         ("a quote two columns past a list item removed", '- Parent.\n    > Quoted words.\n',
          '- Parent.\nQuoted words.\n', "structure")]:
     rejects(name, src, cand, reason)
@@ -4817,5 +4819,68 @@ for name, src, cand in [
          '- Parent.\n  - Child.\n    > Read the old text.\n    > More old text.\n',
          '- Parent.\n  - Child.\n    > Read the new text.\n    > More new text.\n')]:
     accepts("R7 " + name, src, cand)
+
+# Round 8 (R7-M1): the indented quote marker after a lazy line in a quoted
+# footnote definition (the line right before the marker has no marker).
+R8_KINDS = (("code span", "Before `", "Keep old text.`", None),
+            ("comment", "Before <!--", "Keep old text. -->", None),
+            ("attribute", 'Before <span title="', 'Keep old text.">', None),
+            ("link title", 'Before [text](url "', 'Keep old text.")', None),
+            ("fence", "```", "Keep old text.", "```"),
+            ("div block", "<div>", "Keep old text.", "</div>"))
+for kind, opener, body, closer in R8_KINDS:
+    for mark, label in (("", ""), ("- ", " in a bullet item"), ("1. ", " in an ordered item")):
+        inside = " " * len(mark)
+        for pad, pad_name in (("    ", "spaces"), ("\t", "a tab")):
+            for lazy in ((False, True) if closer is None else (False,)):
+                doc = "> [^n]: Note words.\nLazy words.\n" + pad + "> > " + mark + opener + "\n"
+                if lazy:
+                    doc += "An unmarked line.\n"
+                doc += "> > " + inside + body + "\n"
+                if closer:
+                    doc += "> > " + inside + closer + "\n"
+                doc += "\nRead plain text.\n"
+                where = "%s%s after %s%s" % (kind, label, pad_name, ", with a lazy line" if lazy else "")
+                rejects("R8 a %s after a lazy footnote line changed" % where, doc, doc.replace("old", "new"))
+                accepts("R8 a %s after a lazy footnote line unchanged" % where, doc, doc)
+                accepts("R8 prose after a %s after a lazy footnote line reworded" % where, doc,
+                        doc.replace("Read plain text.", "Please read the plain text."))
+R8_LAZY = "> [^n]: Note words.\nLazy words.\n    > > Before `\n> > Keep old text.`\n\nRead plain text.\n"
+for predecessor, name in (("  Lazy words.\n", "indented two spaces"),
+                          ("\tLazy words.\n", "indented with a tab"),
+                          ("Lazy words.\nAnother lazy line.\n", "two lines long")):
+    doc = R8_LAZY.replace("Lazy words.\n", predecessor)
+    rejects("R8 a code span after a lazy footnote line %s changed" % name, doc, doc.replace("old", "new"))
+
+# Round 8 (R7-M2): a quoted footnote definition that absorbs a line with fewer
+# quote markers (markdown-it may have ended the quote and read a paragraph).
+for kind, opener, body, _ in R8_KINDS[:4]:
+    for mark in ("2. ", "3. ", "2) "):
+        for pad, pad_name in (("    ", "spaces"), ("\t", "a tab")):
+            for lazy_pad, lazy_name in (("", ""), ("  ", " indented")):
+                doc = ("> [^n]: Note.\n" + lazy_pad + "Lazy words.\n" + mark + opener + "\n"
+                       + pad + "> " + body + "\n\nRead plain text.\n")
+                where = "%s after %r and %s%s" % (kind, mark.strip(), pad_name,
+                                                  ", the lazy line" + lazy_name if lazy_name else "")
+                rejects("R8 a %s after a footnote's quote ended changed" % where, doc, doc.replace("old", "new"))
+                accepts("R8 a %s after a footnote's quote ended unchanged" % where, doc, doc)
+                accepts("R8 prose after a %s after a footnote's quote ended reworded" % where, doc,
+                        doc.replace("Read plain text.", "Please read the plain text."))
+for name, src, cand in [
+        ("prose after a blank line following a quoted footnote with a lazy line reworded",
+         "> [^n]: Note words.\nLazy words.\n\nRead the old text.\n",
+         "> [^n]: Note words.\nLazy words.\n\nRead the new text.\n"),
+        ("prose after a blank line following a fence with an indented quote marker reworded",
+         "```\n    > quoted\n```\n\nRead the old text.\n",
+         "```\n    > quoted\n```\n\nRead the new text.\n")]:
+    accepts("R8 " + name, src, cand)
+# (Kept on purpose since R7-M1/M2: the lines right after such a block, up to
+# the next blank line, are frozen too.)
+for name, src in [
+        ("a line right after a quoted footnote with a lazy line reworded",
+         "> [^n]: Note words.\nLazy words.\n> Read the old text.\n"),
+        ("a paragraph right after a fence with an indented quote marker reworded",
+         "```\n    > quoted\n```\nRead the old text.\n")]:
+    rejects("R8 " + name, src, src.replace("old", "new"))
 
 sys.exit(1 if FAILED else 0)

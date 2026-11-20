@@ -5178,16 +5178,23 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         if block.kind in RAW_LINE_KINDS and block.kind != "indented_code":
             # The same for a line a block compared raw absorbed (a quoted
             # footnote definition's lazy line, for one): a quote marker with
-            # four or more columns before it, right after a quoted line, may
-            # continue markdown-it's quote there. The block and the lines
-            # after it up to the next blank line are kept byte for byte.
-            # (Also where the parse read the marker as one inside a list
-            # item: in deeper containers markdown-it may still read another
-            # quote there, so the parse's own reading does not count.)
+            # four or more columns before it may continue markdown-it's quote
+            # there. The line before it need not be quoted (a lazy line may
+            # continue the quote), and where the parse read the marker as
+            # one inside a list item, markdown-it may still read another
+            # quote in deeper containers. So any such line counts. A quoted
+            # footnote definition that absorbs a nonblank line with fewer
+            # quote markers counts too: markdown-it may have ended the quote
+            # there (reading the first line as a reference definition) and
+            # read the rest as a paragraph outside it. Either way the block
+            # and the lines after it up to the next blank line are kept byte
+            # for byte.
             first = block.line - 1
-            after = first + block.raw.count("\n") + 1
-            if any(_indented_quote_marker(orig_lines[k]) and _quoted_line(orig_lines[k - 1])
-                   for k in range(max(first, 1), min(after, n))):
+            after = min(first + block.raw.count("\n") + 1, n)
+            quote = block.attrs.get("quote", 0) if block.kind == "footnote_def" else 0
+            if (any(_indented_quote_marker(orig_lines[k]) for k in range(first, after))
+                    or (quote and any(not _md_blank(orig_lines[k]) and _quote_depth(orig_lines[k])[0] < quote
+                                      for k in range(first + 1, after)))):
                 md_quote_raw.append((first, after))
         if block.kind == "indented_code":
             first = block.line - 1
