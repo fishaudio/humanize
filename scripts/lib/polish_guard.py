@@ -521,12 +521,10 @@ def _ref_label_close(text, open_bracket):
     return None
 
 
-def _failed_tail_brackets(masked):
-    """True when ``masked`` holds a "](" and a square bracket with no
-    partner, both outside code spans, autolinks and raw HTML (backslash
-    escapes skipped)."""
+def _unpaired_bracket(masked):
+    """True when ``masked`` holds a square bracket with no partner outside
+    code spans, autolinks and raw HTML (backslash escapes skipped)."""
     depth = 0
-    stray = tail = False
     i = 0
     n = len(masked)
     while i < n:
@@ -542,14 +540,11 @@ def _failed_tail_brackets(masked):
         if ch == "[":
             depth += 1
         elif ch == "]":
-            if masked[i + 1:i + 2] == "(":
-                tail = True
             if depth == 0:
-                stray = True
-            else:
-                depth -= 1
+                return True
+            depth -= 1
         i += 1
-    return tail and (stray or depth != 0)
+    return depth != 0
 
 
 def _scan_refs(masked, original, resolve, offset=0):
@@ -1564,11 +1559,11 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt
                   None) for _, ls, le, _, kind, _ in links]
         ref_spans = _scan_refs(current(), text, resolve)
         spans += ref_spans
-        if ref_spans and _failed_tail_brackets(current()):
-            # A "](" that opened no inline link (those are masked by now)
-            # next to a reference that may resolve and an unpaired bracket:
-            # the renderers differ in what the failed tail and the brackets
-            # around it become. The unit is kept byte for byte.
+        if ref_spans and _unpaired_bracket(current()):
+            # An unpaired bracket next to a reference that may resolve: what
+            # the brackets around it become (link text, a label, a failed
+            # inline link tail) depends on details the bracket scanner does
+            # not model. The unit is kept byte for byte.
             found.append((0, "frozen", text))
         # The ordered links and images of the unit, from the same bracket
         # scanner: kind, whether they resolve, and the label that decides it,
@@ -5169,19 +5164,23 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             after = first + block.raw.count("\n") + 1
             # Code whose lines start with a quote marker, right after a quoted
             # line (also one behind list markers): markdown-it may continue
-            # the quote there. When the text after such a marker may open a
-            # fence or an HTML block for markdown-it (any indentation, so
-            # tabs need no column count), the lines from the code up to the
-            # first blank line or line without a quote marker, where
-            # markdown-it's quote and that block end, are kept byte for byte.
+            # the quote there. When the text after such a marker opens a fence
+            # or an HTML block for markdown-it (columns counted with tabs
+            # expanded), the lines from the code up to the first blank line or
+            # line without a quote marker, where markdown-it's quote and that
+            # block end, are kept byte for byte, and after them the lines
+            # indented four or more columns (code for markdown-it, possibly
+            # lazy text for cmark-gfm) up to a blank or less indented line.
             prev = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "",
                           orig_lines[first - 1]) if first else ""
             if prev.lstrip(" \t").startswith(">") and any(
-                    _fence_opener(body) or _is_html_start(body)
-                    for body in (re.sub(r"^(?:[ \t]*>)+[ \t]*", "", line)
+                    _indent_of(body) < 4 and (_fence_opener(body.lstrip(" ")) or _is_html_start(body.lstrip(" ")))
+                    for body in (re.sub(r"^(?:[ \t]*>)+ ?", "", line.expandtabs(4))
                                  for line in orig_lines[first:after] if line.lstrip(" \t").startswith(">"))):
                 end = after
                 while end < n and orig_lines[end].strip() and orig_lines[end].lstrip(" \t").startswith(">"):
+                    end += 1
+                while end < n and orig_lines[end].strip() and _indent_of(orig_lines[end].expandtabs(4)) >= 4:
                     end += 1
                 md_quote_raw.append((first, end))
             if (first and orig_lines[first - 1].strip() and _quote_depth(orig_lines[first - 1])[0]
