@@ -1034,9 +1034,12 @@ for name, src, cand in [
          "> > [a\n> b]: old\n\nRead [a b].\n", "> > [a\n> b]: new\n\nRead [a b].\n"),
         ("definition with a lazy title line at an intermediate quote depth: title changed",
          "> > [a]: old \"The\n> title\"\n", "> > [a]: old \"The\n> heading\"\n"),
-        ("code in a quote inside a nested item changed", N + "    > ```\n    > x = 1\n    > ```\n",
-         N + "    > ```\n    > x = 2\n    > ```\n")]:
+        ]:
     rejects(name, src, cand, "region_changed")
+# (Rejected as a structure change since R6-M1: the wide quote markers in the
+# fence keep its lines and the ones after it byte for byte.)
+rejects("code in a quote inside a nested item changed", N + "    > ```\n    > x = 1\n    > ```\n",
+        N + "    > ```\n    > x = 2\n    > ```\n")
 for name, src, cand in [
         ("a tab after a quote marker at another column changes the list nesting",
          "> - Parent.\n>\t- > Quoted words.\n", "> - Parent.\n >\t- > Quoted words.\n"),
@@ -1084,10 +1087,9 @@ QFENCE = "- Parent.\n  - Child.\n    > ```\n    > keep\n    > ```\n"
 # (Rejected as a structure change since R4-M1: the indented quote marker
 # continues the quote for markdown-it, so its lines are kept byte for byte.)
 rejects("indented code after a tab in a relocated quote changed", LEAF, LEAF.replace("OLD", "NEW"))
-for name, src, cand in [
-        ("the prefix bytes of a fence in a relocated quote changed", QFENCE, QFENCE.replace("    >", "\t>")),
-        ("an indented code line written with a tab instead of spaces", "Text.\n\n\tcode\n", "Text.\n\n    code\n")]:
-    rejects(name, src, cand, "region_changed")
+rejects("the prefix bytes of a fence in a relocated quote changed", QFENCE, QFENCE.replace("    >", "\t>"))
+rejects("an indented code line written with a tab instead of spaces", "Text.\n\n\tcode\n", "Text.\n\n    code\n",
+        "region_changed")
 for name, src, cand in [
         ("a tab after a list marker inside a quote: sibling made a child", "> -\tParent.\n> - Child.\n",
          "> -\tParent.\n>   - Child.\n"),
@@ -4800,6 +4802,8 @@ for kind, opener, body, closer in (("code span", "Before `", "Keep old text.`", 
                 accepts("R7 prose after a %s in a quoted footnote reworded" % where, doc,
                         doc.replace("Read plain text.", "Please read the plain text."))
 for name, src in [
+        ('a code span in a footnote behind nested list items and quotes',
+         '- > - > [^n]: Note.\n    > Before `\n    >     > > Keep old text.`\n'),
         ('a code span after a referenced quoted footnote',
          'See[^n].\n\n> [^n]: Note.\n    > > Before `\n> > Keep old text.`\n\nRead plain text.\n'),
         ('a code span after a single indented quote marker in a quoted footnote',

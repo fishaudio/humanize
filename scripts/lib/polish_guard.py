@@ -521,18 +521,13 @@ def _ref_label_close(text, open_bracket):
     return None
 
 
-def _wide_quote_markers(line):
-    """How many quote markers in the run of markers that starts ``line`` have
-    four or more columns of spaces or tabs before them: markdown-it may read
-    each as a marker where cmark-gfm reads text or code (a marker with less
-    before it is a marker to both)."""
-    run = re.match(r"(?:[ \t]*>)+", line)
-    return sum(1 for gap in re.findall(r"([ \t]*)>", run.group(0)) if len(gap.expandtabs(4)) >= 4) if run else 0
-
-
 def _indented_quote_marker(line):
-    """Whether ``line`` has such a marker (see _wide_quote_markers)."""
-    return _wide_quote_markers(line) > 0
+    """Whether a quote marker in the run of markers that starts ``line`` has
+    four or more columns of spaces or tabs before it: markdown-it may read it
+    as a marker where cmark-gfm reads text or code (a marker with less before
+    it is a marker to both)."""
+    run = re.match(r"(?:[ \t]*>)+", line)
+    return bool(run) and any(len(gap.expandtabs(4)) >= 4 for gap in re.findall(r"([ \t]*)>", run.group(0)))
 
 
 def _quoted_line(line):
@@ -5184,14 +5179,15 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             # The same for a line a block compared raw absorbed (a quoted
             # footnote definition's lazy line, for one): a quote marker with
             # four or more columns before it, right after a quoted line, may
-            # continue markdown-it's quote there, unless the parse read it as
-            # a marker itself (one inside a list item it moved, see
-            # marker_quote_col). The block and the lines after it up to the
-            # next blank line are kept byte for byte.
+            # continue markdown-it's quote there. The block and the lines
+            # after it up to the next blank line are kept byte for byte.
+            # (Also where the parse read the marker as one inside a list
+            # item: in deeper containers markdown-it may still read another
+            # quote there, so the parse's own reading does not count.)
             first = block.line - 1
             after = first + block.raw.count("\n") + 1
-            if any(_wide_quote_markers(orig_lines[k]) > len(marker_quote_col.get(k, ()))
-                   and _quoted_line(orig_lines[k - 1]) for k in range(max(first, 1), min(after, n))):
+            if any(_indented_quote_marker(orig_lines[k]) and _quoted_line(orig_lines[k - 1])
+                   for k in range(max(first, 1), min(after, n))):
                 md_quote_raw.append((first, after))
         if block.kind == "indented_code":
             first = block.line - 1
