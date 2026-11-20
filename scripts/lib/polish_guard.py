@@ -173,6 +173,8 @@ POLISH_OFF_RE = re.compile(r"<!--\s*polish:off\s*-->")
 # Either marker, split so it can be renamed to an ordinary comment of the
 # same length ("polish-on"), which is how the renderers read it.
 POLISH_MARKER_RE = re.compile(r"(<!--\s*polish):(o(?:n|ff)\s*-->)")
+# A line markdown-it may read as a setext heading underline.
+SETEXT_LIKE_RE = re.compile(r"[ \t]{0,3}(?:=+|-+)[ \t]*$")
 # ASCII punctuation that a backslash escapes in CommonMark.
 ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 AUTOLINK_RE = re.compile(
@@ -3297,6 +3299,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # (Lines of a paragraph cmark-gfm reads that markdown-it reads as
     # another kind, see ``over`` below.)
     over_line = [False] * n
+    # (Lines markdown-it reads in the paragraph of a footnote definition
+    # that cmark-gfm has ended, see the footnote definitions below.)
+    fn_line = [False] * n
     # (The first line of a paragraph markdown-it reads right before a range
     # it may read in any way, by the lazy run of that range: the paragraph
     # may continue into the range, so the two are also compared as one
@@ -3522,6 +3527,49 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                     j += 1
             end = min(j, n - 1)
             blocks.append(Block("math", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
+            if not inner and end + 1 < n:
+                # The renderers read math as Markdown: a fence or an HTML
+                # block that starts in it may run on past its last line,
+                # and its last line is text of a paragraph that a line
+                # right after it continues, where a code span, raw HTML or
+                # a link text may run on and a setext underline makes a
+                # heading, so that the lines after it may be code. The
+                # lines from there are kept byte for byte (see
+                # md_list_freeze).
+                texts = [_past_container(_strip_quote(lines[x], quote), base) for x in range(i, end + 1)]
+                runs_on = False
+                x = i + 1
+                while x <= end and not runs_on:
+                    rel = texts[x - i]
+                    fence = _is_fence_open(rel) if _indent_of(rel) < 4 else None
+                    if fence:
+                        last, _ = fence_end(x + 1, quote, depth, base, fence)
+                    elif _indent_of(rel) < 4 and _is_html_start(rel, interrupt=bool(texts[x - i - 1].strip())):
+                        last = html_end(x, quote, depth, base, rel)
+                    else:
+                        x += 1
+                        continue
+                    runs_on = last > end
+                    x = last + 1
+                if runs_on:
+                    md_list_freeze.append(i)
+                else:
+                    tail = texts
+                    for x in range(len(texts) - 1, -1, -1):
+                        if not texts[x].strip(" \t"):
+                            tail = texts[x + 1:]
+                            break
+                    para = []
+                    for x in range(end + 1, n):
+                        text = _strip_quote(lines[x], _quote_depth(lines[x])[0])
+                        if not text.strip(" \t") or (x > end + 1 and _mdit_interrupts(lines[x], quote)):
+                            break
+                        para.append(text)
+                    body = "\n".join(tail)
+                    if para and not _mdit_interrupts(lines[end + 1], quote) and (
+                            SETEXT_LIKE_RE.match(_past_container(para[0], base)) or _open_bracket(body)
+                            or _md_runs_on(body, "\n".join(para))):
+                        md_list_freeze.append(end + 1)
             i = end + 1
             continue
 
@@ -3561,16 +3609,44 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 own = [_strip_quote(lines[x], min(quote, _quote_depth(lines[x])[0])) for x in range(i, end + 1)]
                 after_def = _past_container(nbody, base)
                 if (nbody.strip() and not FOOTNOTE_DEF_RE.match(nbody.lstrip(" \t"))
-                        and (_starts_block(after_def, False) or _indent_of(after_def) >= 4)
                         and all(text.strip(" \t") for text in own)
                         and not _mdit_interrupts(nxt, quote)):
                     md_open_end = True
-                    if _md_starts_anew(lines, i, blocks[-2] if len(blocks) > 1 else None):
+                    anew = _md_starts_anew(lines, i, blocks[-2] if len(blocks) > 1 else None)
+                    if anew:
                         reading = _mdit_reading([_past_container(text, base) for text in own], 0)
                         md_open_end = not (reading and reading[-1][0] in ("definition", "code")
                                            and reading[-1][2] == len(own))
-                    if md_open_end:
+                    # (A paragraph cmark-gfm starts there continues markdown-
+                    # it's: a code span, raw HTML, emphasis or a link text
+                    # left open in the definition may run on into it, and a
+                    # setext underline there ends markdown-it's paragraph as
+                    # a heading, so that the lines after it may be its code.)
+                    body = "\n".join([cbody[fm.end():]] + own[1:])
+                    para = []
+                    for k in range(end + 1, n):
+                        text = _strip_quote(lines[k], _quote_depth(lines[k])[0])
+                        if not text.strip(" \t") or (k > end + 1 and _mdit_interrupts(lines[k], quote)):
+                            break
+                        para.append(text)
+                    if md_open_end and (_starts_block(after_def, False) or _indent_of(after_def) >= 4
+                                        or SETEXT_LIKE_RE.match(after_def)
+                                        or any(ch in "*_~" for ch in body) or _open_bracket(body)
+                                        or _md_runs_on(body, "\n".join(para))):
                         md_list_freeze.append(end + 1)
+                    elif md_open_end and not anew:
+                        # (A paragraph cmark-gfm starts there continues the
+                        # paragraph markdown-it reads from before the
+                        # definition, whose code spans may pair over the
+                        # lines before: those lines are read otherwise by
+                        # markdown-it, see _mask_code. Where markdown-it's
+                        # paragraph starts with the definition and nothing
+                        # in it runs on, it reads them as cmark-gfm does.)
+                        k = end + 1
+                        while k < n and _strip_quote(lines[k], _quote_depth(lines[k])[0]).strip(" \t") and (
+                                k == end + 1 or not _mdit_interrupts(lines[k], quote)):
+                            fn_line[k] = True
+                            k += 1
             i = end + 1
             continue
 
@@ -5411,7 +5487,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         # byte for byte, read as another kind inside cmark-gfm's paragraph,
         # read as raw HTML or code, or continuing a paragraph over blocks
         # cmark-gfm reads there: see md_lazy_run.)
-        _md_lines[:] = [md_kept[k] is not None or raw_line[k] or run_line[k] or over_line[k] for k in range(n)]
+        _md_lines[:] = [md_kept[k] is not None or raw_line[k] or run_line[k] or over_line[k] or fn_line[k]
+                        for k in range(n)]
     return blocks
 
 
@@ -5496,22 +5573,70 @@ def prose_block_count(text):
                 if b.kind not in RAW_KINDS and any(u.strip() for u in b.units)])
 
 
+def _md_runs_on(body, after):
+    """Whether a code span, raw HTML, an autolink, math or a link tail that
+    opens in ``body`` runs on into ``after`` when markdown-it reads them as
+    one paragraph (in any reading)."""
+    cut = len(body)
+    for _, constructs in _inline_readings(body + "\n" + after, None):
+        if any(start < cut < end for _, start, end, _ in constructs):
+            return True
+    return False
+
+
+def _open_bracket(text):
+    """Whether ``text`` leaves a "[" open (not closed by a later "]";
+    backslash escapes skipped)."""
+    depth = 0
+    x = 0
+    while x < len(text):
+        if text[x] == "\\":
+            x += 1
+        elif text[x] == "[":
+            depth += 1
+        elif text[x] == "]" and depth:
+            depth -= 1
+        x += 1
+    return depth > 0
+
+
 def _md_starts_anew(lines, k, prev_block):
     """Whether markdown-it reads line ``k`` with no paragraph open, as far as
     the lines before it tell: it is the first line, the line before it is
-    blank, or raw HTML of types 1 to 5 (such as a marker) ends on that line
-    in the block before it (``prev_block``)."""
+    blank, raw HTML of types 1 to 5 (such as a marker) ends on that line in
+    the block before it (``prev_block``), or line ``k`` opens a quote or a
+    list item that ends a paragraph markdown-it may have open there (one at
+    the deepest quote depth of the lines since the last blank line)."""
     if k == 0:
         return True
     prev = _strip_quote(lines[k - 1], _quote_depth(lines[k - 1])[0])
     if not prev.strip(" \t"):
         return True
-    if prev_block is None or prev_block.kind != "html" or prev_block.line + prev_block.raw.count("\n") != k:
-        return False
-    head = prev_block.raw.split("\n")[0]
-    head = _strip_quote(head, _quote_depth(head)[0]).lstrip(" ")
-    marker = _html_end_marker(head)
-    return marker is not None and bool(marker.search(prev))
+    if prev_block is not None and prev_block.kind == "html" and prev_block.line + prev_block.raw.count("\n") == k:
+        head = prev_block.raw.split("\n")[0]
+        head = _strip_quote(head, _quote_depth(head)[0]).lstrip(" ")
+        marker = _html_end_marker(head)
+        if marker is not None and marker.search(prev):
+            return True
+    level = 0
+    for x in range(k - 1, -1, -1):
+        depth, body = _quote_depth(lines[x])
+        if not body.strip(" \t"):
+            break
+        level = max(level, depth)
+    return _mdit_interrupts(lines[k], level)
+
+
+# Container markers at the start of a footnote definition's first line,
+# which may be a list item's or a quote's first line.
+_FIRST_LINE_MARKERS_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*")
+
+
+def _footnote_label_line(line):
+    """The first line of a footnote definition from its label on, past the
+    quote and list markers in front of it (None when no label is there)."""
+    rest = line[_FIRST_LINE_MARKERS_RE.match(line).end():]
+    return rest if FOOTNOTE_DEF_RE.match(rest) else None
 
 
 def _footnote_content(block_lines, quote, base):
@@ -5520,21 +5645,30 @@ def _footnote_content(block_lines, quote, base):
     follows the label; a line indented four columns past the definition's
     container is content from there; any other line is a lazy line or blank.
     The column is None where the content is not the end of the line as
-    written (past an expanded tab)."""
+    written (past an expanded tab), on a lazy line that is not plain text,
+    and on a first line without a label after its container markers."""
     out = []
     for k, line in enumerate(block_lines):
         depth = _quote_depth(line)[0]
         body = _strip_quote(line, min(depth, quote))
         if k == 0:
-            cbody = _past_container(body, base)
-            fm = FOOTNOTE_DEF_RE.match(cbody)
-            text = cbody[fm.end():].lstrip(" \t") if fm else cbody
+            labelled = _footnote_label_line(line)
+            if labelled is None:
+                out.append((None, line))
+                continue
+            text = labelled[FOOTNOTE_DEF_RE.match(labelled).end():].lstrip(" \t")
         elif not body.strip():
             text = ""
         elif depth >= quote and _indent_of(_expand_indent(body)) - base >= 4:
             text = _past_container(body, base + 4)
         else:
             text = body.lstrip(" \t")
+            if not _plain_text_line(text):
+                # (A lazy line continues the paragraph as text, but read
+                # again inside the content it could start a block or end
+                # the paragraph, such as an underline: not placed.)
+                out.append((None, text))
+                continue
         out.append((len(line) - len(text) if line.endswith(text) else None, text))
     return out
 
@@ -5542,6 +5676,34 @@ def _footnote_content(block_lines, quote, base):
 # Footnote definitions read inside each other for markers (see _mask_code);
 # deeper ones are read conservatively.
 FOOTNOTE_MASK_DEPTH = 8
+
+
+def _marker_masks(text):
+    """``text`` (inline content, its lines joined) masked for markers as
+    two texts of the same length (see _mask_code). In the first, the one to
+    find polish:off markers in, NUL characters cover code spans in every
+    reading of the text and a backslash-escaped "<". In the second, the one
+    to find polish:on markers in, they cover code spans in any reading, TeX
+    math, inline link destinations and titles, raw HTML that holds a marker
+    without being one (an attribute value), and an escaped "<": a comment
+    in those is no comment to a renderer, or not one to both."""
+    every = None
+    esc = [False] * len(text)
+    hidden = [False] * len(text)
+    for _, constructs in _inline_readings(text, None):
+        code = [False] * len(text)
+        for kind, start, end, value in constructs:
+            if kind == "code":
+                code[start:end] = [True] * (end - start)
+            elif kind in ("math", "linktail") or (kind == "html" and not POLISH_MARKER_RE.fullmatch(value)):
+                hidden[start:end] = [True] * (end - start)
+            elif kind == "escape" and value.endswith("<"):
+                esc[end - 1] = True
+        every = code if every is None else [a and b for a, b in zip(every, code)]
+        hidden = [a or b for a, b in zip(hidden, code)]
+    off = "".join("\0" if ch != "\n" and (every[x] or esc[x]) else ch for x, ch in enumerate(text))
+    on = "".join("\0" if ch != "\n" and (hidden[x] or esc[x]) else ch for x, ch in enumerate(text))
+    return off, on
 
 
 def _mask_code(text, segments=False, _depth=0):
@@ -5564,8 +5726,9 @@ def _mask_code(text, segments=False, _depth=0):
     tab, or more than ``FOOTNOTE_MASK_DEPTH`` definitions deep) are read the
     same conservative way: a polish:off marker in them counts and a
     polish:on marker does not, as does one in a definition's label and in a
-    reference definition, front matter or math. In a table row kept whole,
-    code is read both ways (cells first, and the row as paragraph text).
+    reference definition, front matter or math. In a table, code is read
+    both ways (cells first, and the rows with the paragraph right before
+    them as paragraph text). Inline text is masked by _marker_masks.
     """
     lines = text.split("\n")
     for_off = list(lines)
@@ -5598,53 +5761,72 @@ def _mask_code(text, segments=False, _depth=0):
                 # there and a polish:on marker does not.)
                 for k in range(first, last + 1):
                     for_on[k] = "\0" * len(lines[k])
-            elif block.kind == "table_raw":
-                tables.append((first, last))
-            elif block.kind not in RAW_KINDS:
+            elif block.kind in ("table_row", "table_raw", "table_sep"):
+                # (The rows of one table, with the paragraph right before
+                # it, which markdown-it reads as one paragraph.)
+                if tables and tables[-1][2] == first - 1:
+                    tables[-1][2] = last
+                else:
+                    lead = first
+                    if before is not None and before.kind == "paragraph":
+                        b_first = before.line - 1
+                        if min(b_first + before.raw.count("\n"), len(lines) - 1) == first - 1:
+                            lead = b_first
+                    tables.append([lead, first, last])
+            elif block.kind not in RAW_KINDS and block.kind != "list_item":
+                # (A list item's own blocks are read as such.)
                 chunks.append((first, last))
     for first, last in chunks:
-        chunk = "\n".join(for_off[first:last + 1])
-        chars = list(chunk)
-        for kind, start, end, _ in _scan_inline(chunk):
-            if kind == "code":
-                for k in range(start, end):
-                    if chars[k] != "\n":
-                        chars[k] = "\0"
-        for_off[first:last + 1] = for_on[first:last + 1] = "".join(chars).split("\n")
-    for first, last in tables:
-        # A table row with raw HTML (or text only cmark-gfm reads as a
-        # table): cmark-gfm splits each row into cells at unescaped pipes
-        # before it reads code spans, markdown-it reads the lines as one
-        # paragraph. A polish:on marker counts outside code in both
-        # readings, a polish:off marker outside code in either.
-        joined = "\n".join(lines[first:last + 1])
-        md_code = [False] * len(joined)
-        for kind, start, end, _ in _scan_inline(joined):
-            if kind == "code":
-                for x in range(start, end):
-                    md_code[x] = True
-        cm_code = [False] * len(joined)
-        cell = 0
-        x = 0
-        while x <= len(joined):
-            if x == len(joined) or joined[x] in "|\n":
-                for kind, start, end, _ in _scan_inline(joined[cell:x]):
-                    if kind == "code":
-                        for y in range(cell + start, cell + end):
-                            cm_code[y] = True
-                cell = x + 1
-            elif joined[x] == "\\":
+        cm_off, cm_on = (part.split("\n") for part in _marker_masks("\n".join(for_off[first:last + 1])))
+        for_off[first:last + 1] = cm_off
+        for_on[first:last + 1] = cm_on
+        if not any(md_lines[first:last + 1]):
+            continue
+        # markdown-it reads some of these lines as another kind, so the
+        # paragraph text between them is a paragraph of its own to it,
+        # whose code spans pair on their own: a polish:off marker counts
+        # outside code in either reading, a polish:on marker outside code
+        # in both.
+        k = first
+        while k <= last:
+            if md_lines[k]:
+                k += 1
+                continue
+            a = k
+            while k <= last and not md_lines[k]:
+                k += 1
+            md_off, md_on = (part.split("\n") for part in _marker_masks("\n".join(lines[a:k])))
+            for y in range(a, k):
+                for_off[y] = "".join(c if c != "\0" else m for c, m in zip(cm_off[y - first], md_off[y - a]))
+                for_on[y] = "".join(c if m != "\0" else "\0" for c, m in zip(cm_on[y - first], md_on[y - a]))
+    for lead, first, last in tables:
+        # A table: cmark-gfm splits each row into cells at unescaped pipes
+        # before it reads code spans, markdown-it reads the rows as one
+        # paragraph with the paragraph right before them. A polish:on
+        # marker counts outside code in both readings, a polish:off marker
+        # outside code in either.
+        md_off, md_on = (part.split("\n") for part in _marker_masks("\n".join(lines[lead:last + 1])))
+        cm_off, cm_on = for_off[lead:first], for_on[lead:first]
+        for row in lines[first:last + 1]:
+            row_off, row_on = list(row), list(row)
+            cell = x = 0
+            while x <= len(row):
+                if x == len(row) or row[x] == "|":
+                    row_off[cell:x], row_on[cell:x] = _marker_masks(row[cell:x])
+                    cell = x + 1
+                elif row[x] == "\\":
+                    x += 1
                 x += 1
-            x += 1
-        off = "".join("\0" if md_code[x] and cm_code[x] and ch != "\n" else ch for x, ch in enumerate(joined))
-        on = "".join("\0" if (md_code[x] or cm_code[x]) and ch != "\n" else ch for x, ch in enumerate(joined))
-        for_off[first:last + 1] = off.split("\n")
-        for_on[first:last + 1] = on.split("\n")
+            cm_off.append("".join(row_off))
+            cm_on.append("".join(row_on))
+        for y in range(lead, last + 1):
+            for_off[y] = "".join(c if c != "\0" else m for c, m in zip(cm_off[y - lead], md_off[y - lead]))
+            for_on[y] = "".join(c if m != "\0" else "\0" for c, m in zip(cm_on[y - lead], md_on[y - lead]))
     for first, last, quote, base, anew in footnotes:
         block_lines = lines[first:last + 1]
         content = _footnote_content(block_lines, quote, base)
         inner_off = inner_on = None
-        if _depth < FOOTNOTE_MASK_DEPTH:
+        if _depth < FOOTNOTE_MASK_DEPTH and all(col is not None for col, _ in content):
             inner_off, inner_on = (part.split("\n") for part in
                                    _mask_code("\n".join(t for _, t in content), _depth=_depth + 1))
         # markdown-it's reading of the same lines up to the first blank
@@ -5656,6 +5838,7 @@ def _mask_code(text, segments=False, _depth=0):
         # definition's lines are indented code to it.
         view = [_past_container(_strip_quote(line, min(quote, _quote_depth(line)[0])), base)
                 for line in block_lines]
+        view[0] = _footnote_label_line(block_lines[0]) or view[0]
         stop = next((k for k, t in enumerate(view) if not t.strip(" \t")), len(view))
         md_off = ["\0" * len(line) for line in block_lines]
         md_on = list(md_off)
@@ -5669,20 +5852,15 @@ def _mask_code(text, segments=False, _depth=0):
             if r[0] not in ("paragraph", "heading"):
                 continue
             texts = [view[k].lstrip(" \t") for k in range(r[1], r[2])]
-            joined = "\n".join(texts)
-            chars = list(joined)
-            for kind, start, end, _ in _scan_inline(joined):
-                if kind == "code":
-                    for x in range(start, end):
-                        if chars[x] != "\n":
-                            chars[x] = "\0"
-            for k, text_k, part in zip(range(r[1], r[2]), texts, "".join(chars).split("\n")):
+            part_off, part_on = (part.split("\n") for part in _marker_masks("\n".join(texts)))
+            for k, text_k, p_off, p_on in zip(range(r[1], r[2]), texts, part_off, part_on):
                 line = block_lines[k]
                 if line.endswith(text_k):
-                    md_off[k] = md_on[k] = line[:len(line) - len(text_k)] + part
+                    md_off[k] = line[:len(line) - len(text_k)] + p_off
+                    md_on[k] = line[:len(line) - len(text_k)] + p_on
         for k, (col, _) in enumerate(content):
             line = lines[first + k]
-            if col is None or inner_off is None:
+            if inner_off is None:
                 for_off[first + k] = line
                 for_on[first + k] = "\0" * len(line)
                 continue
