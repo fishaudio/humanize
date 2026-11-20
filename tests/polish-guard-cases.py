@@ -28,7 +28,97 @@ def report(name, ok, detail=""):
         FAILED.append(name)
 
 
+# Rewrites inside a list markdown-it opens right after a definition (a list
+# item numbered other than 1, which cmark-gfm reads as paragraph text), or in
+# the lines of a paragraph that markdown-it reads outside the definition's
+# quote or list item. The guard once compared these lines as prose through a
+# line-by-line model of markdown-it's reading; the review rounds kept finding
+# combinations that model missed, so these lines are now kept byte for byte up
+# to a blank line followed by a line at the left margin (see docs/usage.md).
+# The cases below were accepted before that change and must now be rejected.
+KEPT_AFTER_DEFINITION = {
+    'R3 prose after an empty list item below a definition reworded',
+    'R3 the text of a list item after a definition reworded',
+    'R3 prose after an HTML block in a quote reworded',
+    'R3 prose after an indented lazy line that holds no definition reworded',
+    'R3 a heading after inline HTML in list item text reworded',
+    'R3 a heading in a list item after a definition reworded',
+    'R3 a nested list item after a quoted definition markdown-it closed reworded',
+    'R3 a list item after a quote markdown-it closed reworded',
+    'R3 a quoted heading after a definition markdown-it closed reworded',
+    'R3 an inline link next to a definition both renderers take after a closed item changed',
+    'R3 a later paragraph in a list item markdown-it closed reworded',
+    'R3 a heading in a list item markdown-it closed reworded',
+    'R3 the next list item after one markdown-it closed reworded',
+    'R3 a list item after a quote markdown-it closed, with an indented paragraph, reworded',
+    'R3 prose after a closed quoted fence after a closed item reworded',
+    'R3 a heading after an HTML block in a quote markdown-it reopened reworded',
+    'R3 an indented paragraph in a list item both renderers open after definitions reworded',
+    'R3 a heading after an HTML block that ends with its list item reworded',
+    'R3 prose with an escaped backtick before a list item markdown-it continues reworded',
+    'R3 prose with a bracket in a closed comment before a list item markdown-it continues reworded',
+    'R3 prose with a bracket in a closed attribute before a list item markdown-it continues reworded',
+    'R3 prose with a backtick in a closed comment before a list item markdown-it continues reworded',
+    'R3 emphasis markdown-it reads across a list item reworded with its words',
+    'R3 prose markdown-it reads outside the list item reworded',
+    'R3 prose before the quote markdown-it reopens reworded',
+    'R3 prose markdown-it reads outside the list item rewrapped',
+    'R3 prose around a link markdown-it splits reworded',
+    'R3 prose before a heading markdown-it reads across a list item reworded',
+    'R3 prose in a nested list after a definition and a lazy underline reworded',
+    'R3 prose in a list item only markdown-it opens reworded',
+    'R3 the indentation of a prose line markdown-it continues changed',
+    'R3 prose above an underline markdown-it reads as text reworded',
+    'R3 a blank line added before a heading after a lazy paragraph',
+    'R3 prose in list items only markdown-it opens reworded',
+    'R3 prose around a code span over a lazy underline reworded',
+    'R3 emphasis moved with its words over a numbered line markdown-it keeps in the item',
+    'R3 prose before an underline after a definition reworded',
+    'R3 prose of a heading markdown-it reads over a heading item reworded',
+    'R3 prose after an unknown range reworded',
+    'R3 prose after the underline of a lazy run reworded',
+    'R3 prose under an underline in a surviving outer list item reworded',
+    'R3 an indented continuation after prose under a lazy underline reworded',
+    'R3 a paragraph in a list item only markdown-it opens rewrapped lazily',
+    'R3 prose after a definition after the underline of a lazy run reworded',
+    'R3 prose after a fence that leaves a list item only markdown-it opens, outside the outer item',
+    'R3 a paragraph after a quoted paragraph in a list item only markdown-it opens reworded',
+    'R3 a paragraph after a lazy underline reworded in its outer list item',
+    'R3 prose after an HTML comment closed on its line in a list item only markdown-it opens',
+    'R3 prose after a pre block closed on its line in a list item only markdown-it opens',
+    'R3 prose after a script block closed on its line in a list item only markdown-it opens',
+    'R3 prose in a quoted paragraph before a fence in a list item only markdown-it opens reworded',
+    'R3 a quote marker indented one more column inside an outer list item, after a lazy line',
+    'R3 a quote marker indented one more column inside an outer list item, before a definition',
+    'R3 a quote marker indented one column on a fence line kept in a list item only markdown-it opens',
+    'R3 a quote marker indented one column on an HTML line kept in a list item only markdown-it opens',
+    'R3 whitespace added to a blank line after text markdown-it continues lazily over a fence-like line',
+    'R3 whitespace added to a blank line after indented code markdown-it reads after a closed fence',
+    'R3 prose rewrapped before a fence kept in a list item only markdown-it opens',
+    'R3 definition-like prose in a quote rewrapped in a list item only markdown-it opens',
+    'R3 a quote marker indented one more column inside an outer list item after a lazy run',
+    'R3 a thematic break indented one more column after a lazy run in a nested list',
+    'R3 prose after a lazy underline reworded in the surviving outer list item',
+    'R3 prose rewrapped after a nested quote ends a fence in a list item only markdown-it opens',
+    'R3 a list marker indented one column less after a lazy run in an outer list',
+    'R3 prose reworded after a quoted definition with its title on the next lazy line',
+    'R3 prose rewrapped after a quoted definition with a title over two lazy lines',
+    'R3 prose rewrapped after a title-like paragraph in a deeper quote',
+    'R3 prose reworded in a list item only markdown-it opens before an underline',
+    'R3 prose reworded in a list item after an item that starts with a quote, in a list only markdown-it opens',
+    'R3 prose reworded at the end of a long quoted paragraph that starts with a reference link',
+    'R3 prose reworded in a quote markdown-it opens where a list item only it opens ends',
+    'R3 prose reworded in a list item after an item that starts with a quote, after a paragraph',
+    'R3 prose reworded in a long lazy paragraph after a complete quoted definition',
+    'R3 prose reworded in a later list item after an item that starts with a definition',
+    'R3 prose reworded in a quote before a quote markdown-it opens inside an outer list item',
+}
+
+
 def accepts(name, source, candidate):
+    if name in KEPT_AFTER_DEFINITION:
+        rejects(name + " (now kept byte for byte)", source, candidate)
+        return
     try:
         g.check_document(source, candidate)
         report(name, True)
@@ -3527,5 +3617,64 @@ for name, src, cand in [
          '[docs]: /guide\n2. # Step\n   Some prose.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
          '[docs]: /guide\n2. # Step\n   Some prose.\n3. > Read the quoted notes.\n   > Continue with care.\n4. Further notes.\n')]:
     accepts("R3 " + name, src, cand)
+
+# (Re-review of e159fd5: the walk of a list item only markdown-it opens
+# reads on into the next item at a list marker short of the item's column;
+# a fence or HTML block in the item's quote is kept byte for byte; a quote
+# markdown-it opens where an item ends is measured from the column of the
+# list item around it; at the cap, an unclosed label or a label followed
+# by a colon may still make a definition; and after a complete definition
+# only a title may continue it.)
+OPEN_TITLE = ('[docs]: /guide\n2.\n   > [a]: /url "Title\n' + '   > note\n' * 63
+              + '   > end"\n   Continue with care.\n')
+OPEN_LABEL = ('[docs]: /guide\n2.\n   > [abc\n' + '   > note\n' * 63 + '   > def]: /url\n   Continue with care.\n')
+LAZY_PROSE = ('[docs]: /guide\n2.\n   > [a]: /url\n' + '   Read the next step carefully.\n' * 63
+              + '   Continue with care.\n')
+for name, src, cand in [
+        ('a list item indented into a later item that starts with a quote, after an item that starts with a definition',
+         '[docs]: /guide\n2. [a]: /url\n   A paragraph.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
+         '[docs]: /guide\n2. [a]: /url\n   A paragraph.\n3. > Read the quoted notes.\n   > Continue with care.\n   4. More notes.\n'),
+        ('indented code changed in a quote markdown-it opens inside an outer list item where an item ends',
+         '- [docs]: /guide\n  2. Read the notes.\n     > Read the quoted notes.\n    >     echo old\n',
+         '- [docs]: /guide\n  2. Read the notes.\n     > Read the quoted notes.\n    >     echo new\n'),
+        ('code changed in a fence inside the quote of a list item only markdown-it opens',
+         '[docs]: /guide\n2. > ~~~\n   > echo old\n   > ~~~\n',
+         '[docs]: /guide\n2. > ~~~\n   > echo new\n   > ~~~\n'),
+        ('text changed in an HTML block inside the quote of a list item only markdown-it opens',
+         '[docs]: /guide\n2. > <div>\n   > old text\n   > </div>\n',
+         '[docs]: /guide\n2. > <div>\n   > new text\n   > </div>\n')]:
+    rejects("R3 " + name, src, cand)
+rejects("R3 a paragraph after a quoted title still open at the walk's cap moved out of a list item only markdown-it opens",
+        OPEN_TITLE, OPEN_TITLE.replace("   Continue with care.", "  Continue with care."))
+rejects("R3 a paragraph after a quoted label still open at the walk's cap moved out of a list item only markdown-it opens",
+        OPEN_LABEL, OPEN_LABEL.replace("   Continue with care.", "  Continue with care."))
+accepts("R3 prose reworded in a long lazy paragraph after a complete quoted definition",
+        LAZY_PROSE, LAZY_PROSE.replace("Continue with care.", "Continue with caution."))
+for name, src, cand in [
+        ('prose reworded in a later list item after an item that starts with a definition',
+         '[docs]: /guide\n2. [a]: /url\n   A paragraph.\n3. > Read the quoted notes.\n   > Continue with care.\n4. More notes.\n',
+         '[docs]: /guide\n2. [a]: /url\n   A paragraph.\n3. > Read the quoted notes.\n   > Continue with care.\n4. Further notes.\n'),
+        ('prose reworded in a quote before a quote markdown-it opens inside an outer list item',
+         '- [docs]: /guide\n  2. Read the notes.\n     > Read the quoted notes.\n    >     echo old\n',
+         '- [docs]: /guide\n  2. Read the notes.\n     > Read these quoted notes.\n    >     echo old\n')]:
+    accepts("R3 " + name, src, cand)
+
+# (Older edits found by fresh fuzz seeds, accepted since fbf4735 or earlier,
+# in lists markdown-it opens or lines it reads outside their containers
+# after a definition: now kept byte for byte.)
+for src, cand in [
+        ('1. [docs]: /guide\n   2. # guide*\n   3. # Read *the\n   ===\n   4. Read **bold** words\n   ===\n',
+         '1. [docs]: /guide\n   2. # guide*\n   3. # Read *the\n   ===\n   4. Read **bold** words\n  ===\n'),
+        ('> - > [docs]: /guide\n>    Read `old\n      ===\nmore `x` words\n',
+         '> - > [docs]: /guide\n>    Read `old\n>       ===\nmore `x` words\n'),
+        ('>   See <file:///a`b> and `echo old` now.\n>\n> - > [docs]: /guide\n> Read the guide\n> 2. # Notes\n>  ===\n>     echo old\n>     [ref]: old\n>   Read the notes.\n>\n> ```\n> old\n> ```\n',
+         '>   See <file:///a`b> and `echo old` now.\n>\n> - > [docs]: /guide\n> Read the guide\n> 2. # Notes\n>  ===\n>     echo old\n>     [ref]: old\n"   Read the notes.\n>\n> ```\n> old\n> ```\n'),
+        ('- 1. [docs]: /guide\n   Read the guide.\n  2. The notes explain everything.\n      ```\n  ===\n> > [docs]: /guide\nRead the guide\n2. # Notes\n    ===\nold "title"\n  old "title"\n[ref]:\n\n    old code\n',
+         '- 1. [docs]: /guide\n   Read the guide.\n  2. The notes explain everything.\n      ```\n  ===\n> > [docs]: /guide\nRead the guide\n2. # Notes\n    ===\nold "title"\n  old "title"\n[ref]:\n\n   old code\n'),
+        ('- [docs]: /guide\n  2.  Text\n    [ref]: old\n      ```\nSee [a](javascript:go(`x`)) and `open` then `close`.\nplain words\n\n    old code\n',
+         '- [docs]: /guide\n  2.  Text\n    [ref]: old\n      ```\nSee [a](javascript:go(`x`)) and `open` then `close`.\nplain words\n\n    old  code\n'),
+        ('1. > > > [docs]: /guide\n   > Read the guide\n   > 2. # Notes\n   >  ===\n   >     ```\n   >     Read the notes.\n   >   Continue with care.\n\n   > See [ref].\n',
+         '1. > > > [docs]: /guide\n   > Read the guide\n   > 2. # Notes\n   >  ===\n   >     ```\n   >     Read the notes.\n   \\   Continue with care.\n\n   > See [ref].\n')]:
+    rejects("R3 an older fuzz find after a definition kept byte for byte: " + repr(src[:40]), src, cand)
 
 sys.exit(1 if FAILED else 0)
