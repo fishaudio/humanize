@@ -5447,7 +5447,7 @@ def prose_block_count(text):
                 if b.kind not in RAW_KINDS and any(u.strip() for u in b.units)])
 
 
-def _mask_code(text, segments=False):
+def _mask_code(text, segments=False, footnotes=False):
     """``text`` with code blanked out (same length), so markers in code are text.
 
     Fenced and indented code blocks come from the block parser, so fences
@@ -5455,7 +5455,8 @@ def _mask_code(text, segments=False):
     one block (or one segment line), because a code span cannot cross a block
     boundary; a stray backtick elsewhere cannot hide a real marker. The blocks
     are read as the renderers read them, with the markers as ordinary
-    comments (renamed, same length).
+    comments (renamed, same length). With ``footnotes``, footnote definitions
+    are blanked out whole (their code is not read here).
     """
     lines = text.split("\n")
     masked = list(lines)
@@ -5468,7 +5469,7 @@ def _mask_code(text, segments=False):
                 continue
             first = block.line - 1
             last = min(first + block.raw.count("\n"), len(lines) - 1)
-            if block.kind in ("fence", "indented_code"):
+            if block.kind in ("fence", "indented_code") or (footnotes and block.kind == "footnote_def"):
                 for k in range(first, last + 1):
                     masked[k] = " " * len(lines[k])
             elif block.kind not in RAW_KINDS:
@@ -5483,13 +5484,17 @@ def _mask_code(text, segments=False):
     return "\n".join(masked)
 
 
-def protected_slices(text, segments=False):
+def protected_slices(text, segments=False, footnotes=False):
     """Exact source slices covered by polish:off regions, in order.
 
     A region runs from a polish:off marker to the next polish:on marker, or to
-    the end of the text when it is never closed. Markers inside code are text.
+    the end of the text when it is never closed. Markers inside code are text;
+    with ``footnotes``, so are markers inside footnote definitions.
     """
-    masked = _mask_code(text, segments)
+    if not POLISH_OFF_RE.search(text):
+        # (Masking only hides markers: no marker, no region.)
+        return []
+    masked = _mask_code(text, segments, footnotes)
     slices = []
     pos = 0
     while True:
@@ -5504,16 +5509,22 @@ def protected_slices(text, segments=False):
 
 
 def check_regions(source, candidate, segments=False):
-    """Reject any change to text inside polish:off regions, including whitespace."""
-    src = protected_slices(source, segments)
-    cand = protected_slices(candidate, segments)
-    if src != cand:
-        if len(src) != len(cand):
-            detail = "the number of polish:off regions changed from %d to %d" % (len(src), len(cand))
-        else:
-            idx = next(k for k in range(len(src)) if src[k] != cand[k])
-            detail = "polish:off region %d changed" % (idx + 1)
-        raise GuardReject("region_changed", detail)
+    """Reject any change to text inside polish:off regions, including whitespace.
+
+    Code inside a footnote definition is not read here, so a marker inside a
+    footnote definition is read both ways, as a marker and as text: the
+    regions must stay the same under both readings."""
+    both = not segments and ("[^" in source or "[^" in candidate)
+    for footnotes in ((False, True) if both else (False,)):
+        src = protected_slices(source, segments, footnotes)
+        cand = protected_slices(candidate, segments, footnotes)
+        if src != cand:
+            if len(src) != len(cand):
+                detail = "the number of polish:off regions changed from %d to %d" % (len(src), len(cand))
+            else:
+                idx = next(k for k in range(len(src)) if src[k] != cand[k])
+                detail = "polish:off region %d changed" % (idx + 1)
+            raise GuardReject("region_changed", detail)
 
 
 def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=DOC_RATIO_BOUNDS):
@@ -5538,8 +5549,16 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
         # polish:on marker, the line a marker starts, a list item opened
         # inside a region), so the rest is compared as they read it, with the
         # markers renamed to ordinary comments of the same length.
-        source = POLISH_MARKER_RE.sub(r"\1-\2", source)
-        candidate = POLISH_MARKER_RE.sub(r"\1-\2", candidate)
+        # (With a separator that no comment in either text has there, so the
+        # renaming can be undone: a literal "polish-off" comment in code
+        # stays different from a renamed marker.)
+        both = source + "\n" + candidate
+        sep = next((ch for ch in "-_.=+~^" if not re.search(
+            r"<!--\s*polish" + re.escape(ch) + r"o(?:n|ff)\s*-->", both)), None)
+        if sep is None:
+            raise GuardReject("structure", "comments that look like renamed polish markers are not supported")
+        source = POLISH_MARKER_RE.sub(lambda m: m.group(1) + sep + m.group(2), source)
+        candidate = POLISH_MARKER_RE.sub(lambda m: m.group(1) + sep + m.group(2), candidate)
     src_blocks = parse_blocks(source)
     cand_blocks = parse_blocks(candidate)
     total_src, total_cand = _compare_blocks(src_blocks, cand_blocks, block_ratio)

@@ -3862,4 +3862,37 @@ for name, src, cand in [
          "Read new prose.\n")]:
     accepts("R3 " + name, src, cand)
 
+# (0bd3e72 re-review: renamed markers must stay different from literal
+# look-alike comments, and a marker inside a footnote definition is read both
+# as a marker and as text.)
+for name, src, cand in [
+        ("a literal marker in a code span changed to its renamed form",
+         "Use `<!-- polish:off -->` to freeze the text.\n", "Use `<!-- polish-off -->` to freeze the text.\n"),
+        ("a renamed-looking comment in a code span changed to a marker",
+         "Use `<!-- polish-on -->` to freeze the text.\n", "Use `<!-- polish:on -->` to freeze the text.\n"),
+        ("a literal marker in a fence changed to its renamed form",
+         "```\n<!-- polish:on -->\n```\n", "```\n<!-- polish-on -->\n```\n"),
+        ("a protected sentence after a marker in footnote code",
+         "See[^1].\n\n<!-- polish:off -->\n[^1]: Use `<!-- polish:on -->` in the example.\n\nKeep old wording.\n"
+         "<!-- polish:on -->\n",
+         "See[^1].\n\n<!-- polish:off -->\n[^1]: Use `<!-- polish:on -->` in the example.\n\nKeep new wording.\n"
+         "<!-- polish:on -->\n"),
+        ("a protected sentence after a marker in a fence in a footnote",
+         "See[^1].\n\n<!-- polish:off -->\n[^1]: Example:\n\n    ```\n    <!-- polish:on -->\n    ```\n\n"
+         "Keep old wording.\n<!-- polish:on -->\n",
+         "See[^1].\n\n<!-- polish:off -->\n[^1]: Example:\n\n    ```\n    <!-- polish:on -->\n    ```\n\n"
+         "Keep new wording.\n<!-- polish:on -->\n"),
+        ("a protected sentence after a marker in footnote code, region never closed",
+         "See[^1].\n\n<!-- polish:off -->\n[^1]: Use `<!-- polish:on -->` in the example.\n\nKeep old wording.\n",
+         "See[^1].\n\n<!-- polish:off -->\n[^1]: Use `<!-- polish:on -->` in the example.\n\nKeep new wording.\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("prose after a region inside a footnote definition reworded",
+         "See[^1].\n\n[^1]: Note <!-- polish:off -->keep<!-- polish:on --> old text.\n\nMore old text.\n",
+         "See[^1].\n\n[^1]: Note <!-- polish:off -->keep<!-- polish:on --> old text.\n\nMore new text.\n"),
+        ("prose next to a literal renamed-looking comment and a region reworded",
+         "Use `<!-- polish-off -->` and <!-- polish:off -->keep<!-- polish:on --> old text.\n",
+         "Use `<!-- polish-off -->` and <!-- polish:off -->keep<!-- polish:on --> new text.\n")]:
+    accepts("R3 " + name, src, cand)
+
 sys.exit(1 if FAILED else 0)
