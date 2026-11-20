@@ -108,11 +108,12 @@ def child(mode, work):
             "--base-url", "http://127.0.0.1:9/api/v1", "--template-dir", TEMPLATES,
             "--project-root", work, "--timeout", "30"]
     target = os.path.join(work, "output.md")
-    if mode.startswith("quote_list_") or mode.startswith("quote_lazy_"):
-        # R4-M1, R5-M1: a reply that changes the code, HTML or link title
-        # markdown-it reads after an indented quote marker (in a list item,
-        # or on a lazy line without a marker) is rejected, and the original
-        # is delivered (in place with --strict: exit 3).
+    if mode.startswith(("quote_list_", "quote_lazy_", "quote_fn_")):
+        # R4-M1, R5-M1, R6-M1: a reply that changes the code, HTML or link
+        # title markdown-it reads after an indented quote marker (in a list
+        # item, on a lazy line without a marker, or absorbed by a quoted
+        # footnote definition) is rejected, and the original is delivered (in
+        # place with --strict: exit 3).
         doc = QUOTE_RUNNER_DOCS[mode[:-len("_strict")] if mode.endswith("_strict") else mode]
         with open(source, "w") as fh:
             fh.write(doc)
@@ -280,6 +281,12 @@ QUOTE_RUNNER_DOCS = {
     "quote_lazy_comment": ">\n    > Before <!--\nKeep old text. -->\n\nRead plain text.\n",
     "quote_lazy_attribute": '>\n    > Before <span title="\nKeep old text.">\n\nRead plain text.\n',
     "quote_lazy_title": '>\n    > Before [text](url "\nKeep old text.")\n\nRead plain text.\n',
+    "quote_fn_code": "> [^n]: Note.\n    > > Before `\n> > Keep old text.`\n\nRead plain text.\n",
+    "quote_fn_comment": "> [^n]: Note.\n    > > Before <!--\n> > Keep old text. -->\n\nRead plain text.\n",
+    "quote_fn_attribute": '> [^n]: Note.\n    > > Before <span title="\n> > Keep old text.">\n\nRead plain text.\n',
+    "quote_fn_title": '> [^n]: Note.\n    > > Before [text](url "\n> > Keep old text.")\n\nRead plain text.\n',
+    "quote_fn_fence": "> [^n]: Note.\n    > > ```\n> > Keep old text.\n> > ```\n\nRead plain text.\n",
+    "quote_fn_div": "> [^n]: Note.\n    > > <div>\n> > Keep old text.\n> > </div>\n\nRead plain text.\n",
 }
 
 
@@ -291,7 +298,7 @@ def quote_list_cases():
             r = run_child(mode + ("_strict" if strict else ""))
             delivered = r["input"] if strict else r["output"]
             report("%s %s after an indented quote marker changed%s: rejected, original delivered, exit %d"
-                   % ("R4-M1" if "_list_" in mode else "R5-M1", mode.split("_", 2)[2],
+                   % ({"list": "R4-M1", "lazy": "R5-M1", "fn": "R6-M1"}[mode.split("_")[1]], mode.split("_", 2)[2],
                       " (strict, in place)" if strict else "", 3 if strict else 0),
                    r["rc"] == (3 if strict else 0) and delivered == doc and not r["leftovers"]
                    and r["outcomes"] == [OUTCOME_PREFIX + "rejected reason=structure delivered=yes"],

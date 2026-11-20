@@ -1709,7 +1709,10 @@ for name, src, cand in [
          'See[^1].\n\n[^1]: ```\n    ```\n\nRead prose.\n',
          'See[^1].\n\n[^1]: ```\n    ```\n\nSee prose.\n')]:
     accepts("R3 " + name, src, cand)
-accepts("R3 prose after a lazy quote-marker-like line ends a quoted nested footnote reworded",
+# (Rejected on purpose since R6-M1: the indented "    >" after the quoted
+# footnote line may continue markdown-it's quote, so the lines up to the next
+# blank line are kept byte for byte.)
+rejects("R3 prose after a lazy quote-marker-like line ends a quoted nested footnote reworded",
         "See[^1][^2].\n\n> [^1]: [^2]: note\n    >\n    [ref]: /url\n>     ---\nRead prose.\n",
         "See[^1][^2].\n\n> [^1]: [^2]: note\n    >\n    [ref]: /url\n>     ---\nSee prose.\n")
 NESTED = "[^z]: x\n"
@@ -4771,5 +4774,44 @@ rejects("R6 a paragraph right after the quote an indented quote marker continued
 accepts("R6 prose after indented code inside a quote reworded",
         'See[^1].\n\n> [^1]: note\n>\n>     Body.\nRead old prose.\n',
         'See[^1].\n\n> [^1]: note\n>\n>     Body.\nRead new prose.\n')
+
+# Round 7 (R6-M1): the same indented quote marker inside a block compared raw
+# (here a quoted footnote definition that absorbed it as a lazy line).
+for kind, opener, body, closer in (("code span", "Before `", "Keep old text.`", None),
+                                   ("comment", "Before <!--", "Keep old text. -->", None),
+                                   ("attribute", 'Before <span title="', 'Keep old text.">', None),
+                                   ("link title", 'Before [text](url "', 'Keep old text.")', None),
+                                   ("fence", "```", "Keep old text.", "```"),
+                                   ("div block", "<div>", "Keep old text.", "</div>")):
+    for mark, label in (("", ""), ("- ", " in a bullet item"), ("1. ", " in an ordered item")):
+        inside = " " * len(mark)
+        for pad, pad_name in (("    ", "spaces"), ("\t", "a tab")):
+            for lazy in ((False, True) if closer is None else (False,)):
+                doc = "> [^n]: Note.\n" + pad + "> > " + mark + opener + "\n"
+                if lazy:
+                    doc += "An unmarked line.\n"
+                doc += "> > " + inside + body + "\n"
+                if closer:
+                    doc += "> > " + inside + closer + "\n"
+                doc += "\nRead plain text.\n"
+                where = "%s%s after %s%s" % (kind, label, pad_name, ", with a lazy line" if lazy else "")
+                rejects("R7 a %s in a quoted footnote changed" % where, doc, doc.replace("old", "new"))
+                accepts("R7 a %s in a quoted footnote unchanged" % where, doc, doc)
+                accepts("R7 prose after a %s in a quoted footnote reworded" % where, doc,
+                        doc.replace("Read plain text.", "Please read the plain text."))
+for name, src in [
+        ('a code span after a referenced quoted footnote',
+         'See[^n].\n\n> [^n]: Note.\n    > > Before `\n> > Keep old text.`\n\nRead plain text.\n'),
+        ('a code span after a single indented quote marker in a quoted footnote',
+         '> [^n]: Note.\n    > Before `\n> Keep old text.`\n\nRead plain text.\n')]:
+    rejects("R7 " + name + " changed", src, src.replace("old", "new"))
+for name, src, cand in [
+        ('a fence in a quote inside a nested list item reworded after a blank line',
+         '- Parent.\n  - Child.\n    > ```\n    > keep\n    > ```\n\nRead old text.\n',
+         '- Parent.\n  - Child.\n    > ```\n    > keep\n    > ```\n\nRead new text.\n'),
+        ('prose in a quote inside a nested list item reworded',
+         '- Parent.\n  - Child.\n    > Read the old text.\n    > More old text.\n',
+         '- Parent.\n  - Child.\n    > Read the new text.\n    > More new text.\n')]:
+    accepts("R7 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)
