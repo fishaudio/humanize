@@ -4227,4 +4227,43 @@ for name, src, cand in [
          'Intro.\n\n$$\nx `a` y\n$$\nc` old.\n')]:
     accepts("R3 " + name, src, cand)
 
+for name, src, cand in [
+        ('a protected sentence after an opener in a quoted table right after a table',
+         '| Name | Value |\n| --- | --- |\n| one | `example |\n> | Name | Value |\n> | --- | --- |\n> | `a | `<!-- polish:off -->` |\n\nRead old prose.\n',
+         '| Name | Value |\n| --- | --- |\n| one | `example |\n> | Name | Value |\n> | --- | --- |\n> | `a | `<!-- polish:off -->` |\n\nRead new prose.\n'),
+        ('a protected sentence after an opener in a table in the next list item',
+         '- | Name | Value |\n  | --- | --- |\n  | one | `example |\n- | Name | Value |\n  | --- | --- |\n  | `a | `<!-- polish:off -->` |\n\nRead old prose.\n',
+         '- | Name | Value |\n  | --- | --- |\n  | one | `example |\n- | Name | Value |\n  | --- | --- |\n  | `a | `<!-- polish:off -->` |\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in image alt text',
+         '<!-- polish:off -->\n\n![Diagram <!-- polish:on -->](diagram.svg)\n\nRead old prose.\n',
+         '<!-- polish:off -->\n\n![Diagram <!-- polish:on -->](diagram.svg)\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in reference image alt text',
+         '<!-- polish:off -->\n\n![Diagram <!-- polish:on -->][d]\n\n[d]: /d.svg\n\nRead old prose.\n',
+         '<!-- polish:off -->\n\n![Diagram <!-- polish:on -->][d]\n\n[d]: /d.svg\n\nRead new prose.\n'),
+        ('emphasis from display math into the next line moved',
+         '$$\nx*y\n$$\nThe value* is approximate.\n',
+         '$$\nx*y\n$$\nThe value *is approximate.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose after a closer in a quoted table right after a table reworded',
+         'Start <!-- polish:off -->keep.\n\n| Name | Value |\n| --- | --- |\n| one | `example |\n> | Name | Value |\n> | --- | --- |\n> | two | <!-- polish:on -->` |\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n| Name | Value |\n| --- | --- |\n| one | `example |\n> | Name | Value |\n> | --- | --- |\n> | two | <!-- polish:on -->` |\n\nRead new prose.\n'),
+        ('prose after a closer in link text reworded (image control)',
+         '<!-- polish:off -->\n\n[Diagram <!-- polish:on -->](diagram.svg)\n\nRead old prose.\n',
+         '<!-- polish:off -->\n\n[Diagram <!-- polish:on -->](diagram.svg)\n\nRead new prose.\n'),
+        ('prose after a closer right after an image reworded',
+         '<!-- polish:off -->\n\n![Diagram](diagram.svg) <!-- polish:on -->\n\nRead old prose.\n',
+         '<!-- polish:off -->\n\n![Diagram](diagram.svg) <!-- polish:on -->\n\nRead new prose.\n'),
+        ('emphasis right after display math with a star reworded',
+         '$$\nx*y\n$$\nNext *old* text.\n',
+         '$$\nx*y\n$$\nNext *new* text.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("4000 display math blocks in one paragraph", "$$x$$\n" * 4000 + "Ordinary prose.\n"),
+                  ("4000 footnote definitions in a row", "See[^1].\n\n" + "".join("[^%d]: Note %d.\n" % (k, k) for k in range(4000))),
+                  ("2000 footnote definitions on list item lines", "See[^1].\n\n" + "".join("- [^%d]: Note %d.\n" % (k, k) for k in range(2000)))):
+    started = time.process_time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
+           "%.2fs" % (time.process_time() - started))
+
 sys.exit(1 if FAILED else 0)

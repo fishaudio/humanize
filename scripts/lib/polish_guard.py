@@ -173,6 +173,9 @@ POLISH_OFF_RE = re.compile(r"<!--\s*polish:off\s*-->")
 # Either marker, split so it can be renamed to an ordinary comment of the
 # same length ("polish-on"), which is how the renderers read it.
 POLISH_MARKER_RE = re.compile(r"(<!--\s*polish):(o(?:n|ff)\s*-->)")
+# How many lines _md_starts_anew looks back for the quote depth of a
+# paragraph markdown-it may have open (past that, it may be open).
+MD_ANEW_LOOKBACK = 256
 # A line markdown-it may read as a setext heading underline.
 SETEXT_LIKE_RE = re.compile(r"[ \t]{0,3}(?:=+|-+)[ \t]*$")
 # ASCII punctuation that a backslash escapes in CommonMark.
@@ -3286,6 +3289,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # reads (a list item numbered other than 1 right after a definition):
     # kept byte for byte from there (see below).
     md_list_freeze = []
+    # (Display math the renderers read on into: see the math blocks.)
+    math_skip = -1
+    math_chain = None
     # (line, quote depth) where a paragraph markdown-it keeps open continues
     # lazily past the end of cmark-gfm's paragraph.
     md_lazy_from = []
@@ -3527,15 +3533,17 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                     j += 1
             end = min(j, n - 1)
             blocks.append(Block("math", attrs(), "\n".join(lines[i:end + 1]), [], start_line))
-            if not inner and end + 1 < n:
+            if not inner and end + 1 < n and i > math_skip:
                 # The renderers read math as Markdown: a fence or an HTML
                 # block that starts in it may run on past its last line,
                 # and its last line is text of a paragraph that a line
-                # right after it continues, where a code span, raw HTML or
-                # a link text may run on and a setext underline makes a
-                # heading, so that the lines after it may be code. The
-                # lines from there are kept byte for byte (see
-                # md_list_freeze).
+                # right after it continues, where a code span, raw HTML,
+                # emphasis or a link text may run on and a setext
+                # underline makes a heading, so that the lines after it may
+                # be code. The lines from there are kept byte for byte (see
+                # md_list_freeze). Math blocks right after each other are
+                # one paragraph to the renderers, read once; one inside a
+                # block that runs on is part of that block.
                 texts = [_past_container(_strip_quote(lines[x], quote), base) for x in range(i, end + 1)]
                 runs_on = False
                 x = i + 1
@@ -3551,25 +3559,35 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                         continue
                     runs_on = last > end
                     x = last + 1
+                chain = math_chain if math_chain is not None and math_chain[0] == i else None
+                math_chain = None
                 if runs_on:
-                    md_list_freeze.append(i)
+                    md_list_freeze.append(chain[1] if chain else i)
+                    math_skip = x - 1
                 else:
-                    tail = texts
-                    for x in range(len(texts) - 1, -1, -1):
-                        if not texts[x].strip(" \t"):
-                            tail = texts[x + 1:]
-                            break
-                    para = []
-                    for x in range(end + 1, n):
-                        text = _strip_quote(lines[x], _quote_depth(lines[x])[0])
-                        if not text.strip(" \t") or (x > end + 1 and _mdit_interrupts(lines[x], quote)):
-                            break
-                        para.append(text)
-                    body = "\n".join(tail)
-                    if para and not _mdit_interrupts(lines[end + 1], quote) and (
-                            SETEXT_LIKE_RE.match(_past_container(para[0], base)) or _open_bracket(body)
-                            or _md_runs_on(body, "\n".join(para))):
-                        md_list_freeze.append(end + 1)
+                    texts = (chain[2] if chain else []) + texts
+                    nxt = lines[end + 1]
+                    nrel = _past_container(_strip_quote(nxt, quote), base)
+                    continues = bool(nrel.strip(" \t")) and not _mdit_interrupts(nxt, quote)
+                    if continues and nrel.lstrip().startswith("$$"):
+                        math_chain = (end + 1, chain[1] if chain else i, texts)
+                    elif continues:
+                        tail = texts
+                        for x in range(len(texts) - 1, -1, -1):
+                            if not texts[x].strip(" \t"):
+                                tail = texts[x + 1:]
+                                break
+                        para = []
+                        for x in range(end + 1, n):
+                            text = _strip_quote(lines[x], _quote_depth(lines[x])[0])
+                            if not text.strip(" \t") or (x > end + 1 and _mdit_interrupts(lines[x], quote)):
+                                break
+                            para.append(text)
+                        body = "\n".join(tail)
+                        after = "\n".join(para)
+                        if (SETEXT_LIKE_RE.match(nrel) or _open_bracket(body) or _md_runs_on(body, after)
+                                or _md_emphasis_runs_on(body, after)):
+                            md_list_freeze.append(end + 1)
             i = end + 1
             continue
 
@@ -5584,6 +5602,19 @@ def _md_runs_on(body, after):
     return False
 
 
+def _md_emphasis_runs_on(body, after):
+    """Whether emphasis or strikethrough pairs a delimiter in ``body`` with
+    one in ``after`` when they are read as one paragraph (either reading)."""
+    text = body + "\n" + after
+    cut = len(body)
+    for gfm in (True, False):
+        spans = []
+        _pair_delimiters(_delimiter_runs(text, text, gfm), spans, {}, gfm)
+        if any(a < cut < b for a, b, _ in spans):
+            return True
+    return False
+
+
 def _open_bracket(text):
     """Whether ``text`` leaves a "[" open (not closed by a later "]";
     backslash escapes skipped)."""
@@ -5618,12 +5649,21 @@ def _md_starts_anew(lines, k, prev_block):
         marker = _html_end_marker(head)
         if marker is not None and marker.search(prev):
             return True
+    own, own_body = _quote_depth(lines[k])
+    marked = bool(re.match(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", own_body))
     level = 0
-    for x in range(k - 1, -1, -1):
+    for x in range(k - 1, max(-1, k - 1 - MD_ANEW_LOOKBACK), -1):
         depth, body = _quote_depth(lines[x])
         if not body.strip(" \t"):
             break
         level = max(level, depth)
+        if level > own or (level == own and not marked):
+            # (The deeper lines further back no longer change the answer.)
+            break
+    else:
+        if k - 1 - MD_ANEW_LOOKBACK >= 0:
+            # (Too far to look back: a paragraph may be open.)
+            return False
     return _mdit_interrupts(lines[k], level)
 
 
@@ -5678,6 +5718,45 @@ def _footnote_content(block_lines, quote, base):
 FOOTNOTE_MASK_DEPTH = 8
 
 
+def _image_texts(text):
+    """(start, end) of each "![...]" in ``text`` with its closing bracket,
+    outside code spans and raw HTML of the first reading (backslash escapes
+    skipped): text that is an image's alt text where a link follows."""
+    skip = {}
+    for kind, start, end, _ in _inline_constructs(text):
+        if kind in ("code", "html", "autolink"):
+            skip[start] = end
+    out = []
+    x = 0
+    while x < len(text):
+        if x in skip:
+            x = skip[x]
+            continue
+        if text[x] == "\\":
+            x += 2
+            continue
+        if text.startswith("![", x):
+            depth = 0
+            y = x + 1
+            while y < len(text):
+                if y in skip:
+                    y = skip[y]
+                    continue
+                if text[y] == "\\":
+                    y += 2
+                    continue
+                if text[y] == "[":
+                    depth += 1
+                elif text[y] == "]":
+                    depth -= 1
+                    if not depth:
+                        out.append((x, y + 1))
+                        break
+                y += 1
+        x += 1
+    return out
+
+
 def _marker_masks(text):
     """``text`` (inline content, its lines joined) masked for markers as
     two texts of the same length (see _mask_code). In the first, the one to
@@ -5690,6 +5769,10 @@ def _marker_masks(text):
     every = None
     esc = [False] * len(text)
     hidden = [False] * len(text)
+    for start, end in _image_texts(text):
+        # (Image text is alt text: cmark-gfm escapes a comment there and
+        # markdown-it drops it.)
+        hidden[start:end] = [True] * (end - start)
     for _, constructs in _inline_readings(text, None):
         code = [False] * len(text)
         for kind, start, end, value in constructs:
@@ -5764,11 +5847,16 @@ def _mask_code(text, segments=False, _depth=0):
             elif block.kind in ("table_row", "table_raw", "table_sep"):
                 # (The rows of one table, with the paragraph right before
                 # it, which markdown-it reads as one paragraph.)
-                if tables and tables[-1][2] == first - 1:
+                if (tables and tables[-1][2] == first - 1 and before is not None
+                        and before.kind in ("table_row", "table_raw", "table_sep")
+                        and before.attrs.get("quote") == block.attrs.get("quote")
+                        and before.attrs.get("container") == block.attrs.get("container")):
                     tables[-1][2] = last
                 else:
                     lead = first
-                    if before is not None and before.kind == "paragraph":
+                    if (before is not None and before.kind == "paragraph"
+                            and before.attrs.get("quote") == block.attrs.get("quote")
+                            and before.attrs.get("container") == block.attrs.get("container")):
                         b_first = before.line - 1
                         if min(b_first + before.raw.count("\n"), len(lines) - 1) == first - 1:
                             lead = b_first
