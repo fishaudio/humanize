@@ -747,9 +747,15 @@ rejects("blank line added after a quoted list item inside a quote", "> - > Quote
         "> - > Quoted.\n>\n> - Next item.\n", "structure")
 rejects("blank line removed before the first list item", "Para.\n\n- item one here\n",
         "Para.\n- item one here\n", "structure")
-accepts("prose after a standalone region's polish:on stays editable",
+# (A line that starts with the polish:on marker is an HTML block line to the
+# renderers, so the text after the marker there is raw HTML; text after a
+# marker that follows other text on its line is paragraph text.)
+rejects("text after a polish:on marker that starts its line (raw HTML to the renderers)",
         "Intro.\n\n<!-- polish:off -->\nKeep.\n<!-- polish:on --> Read carefully.\n",
         "Intro.\n\n<!-- polish:off -->\nKeep.\n<!-- polish:on --> Read with care.\n")
+accepts("prose after a polish:on marker that follows other text on its line stays editable",
+        "Intro.\n\n<!-- polish:off -->\nKeep.\nAlso keep. <!-- polish:on --> Read carefully.\n",
+        "Intro.\n\n<!-- polish:off -->\nKeep.\nAlso keep. <!-- polish:on --> Read with care.\n")
 rejects("the closing line of a standalone region before its marker is protected",
         "Intro.\n\n<!-- polish:off -->\nKeep.\nAlso keep. <!-- polish:on --> Read carefully.\n",
         "Intro.\n\n<!-- polish:off -->\nKeep.\nAlso held. <!-- polish:on --> Read carefully.\n", "region_changed")
@@ -1404,11 +1410,18 @@ rejects("R3 emphasis moved across five references with one possible label",
         "<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n",
         "Read [*guide][ref] and [guide*][ref] and [*guide*][ref] and [*guide*][ref] and [*guide*][ref].\n\n"
         "<!-- polish:off -->\n[ref]: /url\n<!-- polish:on -->\n")
+# (Front matter definitions only possibly count. Definitions inside a
+# polish:off region are read as the renderers read them, as definitions.)
 rejects("R3 emphasis inside references with more than four possible labels",
+        "---\n[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n---\n\n"
+        "Read [*a*][r1] [*b*][r2] [*c*][r3] [*d*][r4] [*e*][r5].\n",
+        "---\n[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n---\n\n"
+        "See [*a*][r1] [*b*][r2] [*c*][r3] [*d*][r4] [*e*][r5].\n", "inline_markup")
+accepts("R3 emphasis inside references defined in a polish:off region reworded",
         "Read [*a*][r1] [*b*][r2] [*c*][r3] [*d*][r4] [*e*][r5].\n\n<!-- polish:off -->\n"
         "[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n<!-- polish:on -->\n",
         "See [*a*][r1] [*b*][r2] [*c*][r3] [*d*][r4] [*e*][r5].\n\n<!-- polish:off -->\n"
-        "[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n<!-- polish:on -->\n", "inline_markup")
+        "[r1]: /1\n[r2]: /2\n[r3]: /3\n[r4]: /4\n[r5]: /5\n<!-- polish:on -->\n")
 
 # cmark-gfm block rules found with a cmark-gfm reference fuzz: an HTML block
 # ends where its blockquote or list item ends; raw text inside a list item is
@@ -3801,6 +3814,52 @@ for name, src, cand in [
                  for x in range(2000)),
          "".join("<!-- polish:off -->\n```\ncode %d\n```\n<!-- polish:on -->\n%s the notes %d.\n\n"
                  % (x, "Review" if x == 5 else "Read", x) for x in range(2000)))]:
+    accepts("R3 " + name, src, cand)
+
+# (Polish markers as the renderers read them: plain HTML comments. Edits a
+# marker placement fuzz found, accepted at 4464ffb and earlier.)
+for name, src, cand in [
+        ("indented code after a polish:on line that ends no region",
+         "Intro text.\n\n<!-- polish:off -->\n<!-- polish:on --> Read old text.\n<!-- polish:on -->\n"
+         "    old code\n    old code\n",
+         "Intro text.\n\n<!-- polish:off -->\n<!-- polish:on --> Read old text.\n<!-- polish:on -->\n"
+         "    old code\n    new code\n"),
+        ("indented code after a polish:on line with text after the marker",
+         "Intro text.\n\n<!-- polish:off -->\nold\"\n<!-- polish:on --> Read old text.\n    old code\n",
+         "Intro text.\n\n<!-- polish:off -->\nold\"\n<!-- polish:on --> Read old text.\n   old code\n"),
+        ("a fence markdown-it opens after a polish:on line inside a lazy HTML block cmark-gfm opens",
+         "Intro text.\n\n<!-- polish:off -->\n- old item\n<span>\n    old code\n[r]: /old \"title\n"
+         "<!-- polish:on -->\n~~~\n\nProse after old.\n",
+         "Intro text.\n\n<!-- polish:off -->\n- old item\n<span>\n    old code\n[r]: /old \"title\n"
+         "<!-- polish:on -->\n~~~\n\nProse after new.\n")]:
+    rejects("R3 " + name, src, cand)
+
+# (4464ffb re-review: with polish markers, the regions are compared byte for
+# byte and the rest as the renderers read it, the markers being plain HTML
+# comments to them.)
+for name, src, cand in [
+        ("text in an HTML block markdown-it reads across a quoted polish:on marker",
+         "> <!-- polish:off -->\n> [docs]: /guide\n> <span>\n> <!-- polish:on -->\n> Read old notes.\n> </span>\n",
+         "> <!-- polish:off -->\n> [docs]: /guide\n> <span>\n> <!-- polish:on -->\n> Read new notes.\n> </span>\n"),
+        ("code in a code span across a polish:on marker",
+         "<!-- polish:off -->\nRead this example:\n    ```text\n    <!-- polish:on -->\n   echo old\n    ```\n",
+         "<!-- polish:off -->\nRead this example:\n    ```text\n    <!-- polish:on -->\n   echo new\n    ```\n"),
+        ("indented code after a quoted polish:on line with text after the marker",
+         "> <!-- polish:off -->\n> <div>Keep.</div>\n>\n> <!-- polish:on --> Continue here.\n>     echo old\n",
+         "> <!-- polish:off -->\n> <div>Keep.</div>\n>\n> <!-- polish:on --> Continue here.\n>     echo new\n"),
+        ("a paragraph moved out of a list item opened inside a region",
+         "<!-- polish:off -->\n- Notes.\n  <!-- polish:on -->\n  More text.\n",
+         "<!-- polish:off -->\n- Notes.\n  <!-- polish:on -->\nMore text.\n")]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ("prose after a region whose marker line is paragraph text with indented tildes",
+         "<!-- polish:off -->\nNotes.\n    ~~~\n    <!-- polish:on --> Done.\n    ~~~\n\nRead old prose.\n",
+         "<!-- polish:off -->\nNotes.\n    ~~~\n    <!-- polish:on --> Done.\n    ~~~\n\nRead new prose.\n"),
+        ("prose after list items whose fences end with the items, around a polish:on marker",
+         "<!-- polish:off -->\n- ```text\n  Keep this example.\n- <!-- polish:on -->\n  ```\n  Keep another example.\n\n"
+         "Read old prose.\n",
+         "<!-- polish:off -->\n- ```text\n  Keep this example.\n- <!-- polish:on -->\n  ```\n  Keep another example.\n\n"
+         "Read new prose.\n")]:
     accepts("R3 " + name, src, cand)
 
 sys.exit(1 if FAILED else 0)

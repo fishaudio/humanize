@@ -170,6 +170,9 @@ ESCAPE_HOLD = "\ue000"
 # A fence opener or closer on a line, after any quote or list-marker prefix.
 FENCE_LINE_RE = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)?(`{3,}|~{3,})(.*)$")
 POLISH_OFF_RE = re.compile(r"<!--\s*polish:off\s*-->")
+# Either marker, split so it can be renamed to an ordinary comment of the
+# same length ("polish-on"), which is how the renderers read it.
+POLISH_MARKER_RE = re.compile(r"(<!--\s*polish):(o(?:n|ff)\s*-->)")
 # ASCII punctuation that a backslash escapes in CommonMark.
 ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
 AUTOLINK_RE = re.compile(
@@ -5450,7 +5453,9 @@ def _mask_code(text, segments=False):
     Fenced and indented code blocks come from the block parser, so fences
     behind several list markers count too. Code spans are matched only inside
     one block (or one segment line), because a code span cannot cross a block
-    boundary; a stray backtick elsewhere cannot hide a real marker.
+    boundary; a stray backtick elsewhere cannot hide a real marker. The blocks
+    are read as the renderers read them, with the markers as ordinary
+    comments (renamed, same length).
     """
     lines = text.split("\n")
     masked = list(lines)
@@ -5458,7 +5463,7 @@ def _mask_code(text, segments=False):
         chunks = [(k, k) for k in range(len(lines))]
     else:
         chunks = []
-        for block in parse_blocks(text):
+        for block in parse_blocks(POLISH_MARKER_RE.sub(r"\1-\2", text)):
             if block.kind == "quote":
                 continue
             first = block.line - 1
@@ -5526,6 +5531,15 @@ def check_document(source, candidate, block_ratio=BLOCK_RATIO_BOUNDS, doc_ratio=
         source = source.replace("\r\n", "\n")
         candidate = candidate.replace("\r\n", "\n")
     check_regions(source, candidate)
+    if POLISH_MARKER_RE.search(source) or POLISH_MARKER_RE.search(candidate):
+        # The regions are byte-identical now. To the renderers the markers
+        # are plain HTML comments, and a region's boundary cannot change how
+        # they read the lines around it (a fence or HTML block running past a
+        # polish:on marker, the line a marker starts, a list item opened
+        # inside a region), so the rest is compared as they read it, with the
+        # markers renamed to ordinary comments of the same length.
+        source = POLISH_MARKER_RE.sub(r"\1-\2", source)
+        candidate = POLISH_MARKER_RE.sub(r"\1-\2", candidate)
     src_blocks = parse_blocks(source)
     cand_blocks = parse_blocks(candidate)
     total_src, total_cand = _compare_blocks(src_blocks, cand_blocks, block_ratio)
