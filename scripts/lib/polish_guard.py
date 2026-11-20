@@ -176,6 +176,8 @@ POLISH_MARKER_RE = re.compile(r"(<!--\s*polish):(o(?:n|ff)\s*-->)")
 # How many lines _md_starts_anew looks back for the quote depth of a
 # paragraph markdown-it may have open (past that, it may be open).
 MD_ANEW_LOOKBACK = 256
+# A line that starts with a list marker (past its indentation).
+LIST_MARKER_START_RE = re.compile(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
 # A line markdown-it may read as a setext heading underline.
 SETEXT_LIKE_RE = re.compile(r"[ \t]{0,3}(?:=+|-+)[ \t]*$")
 # ASCII punctuation that a backslash escapes in CommonMark.
@@ -3256,28 +3258,34 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         # the lazy lines after it, the lines from there are kept too (see
         # md_list_freeze).
         raw_rows = set()
-        if not has_html:
-            before = []
-            if blocks and blocks[-1].kind == "paragraph" and \
-                    blocks[-1].line + blocks[-1].raw.count("\n") == i:
-                before = [_strip_quote(lines[x], quote) for x in range(blocks[-1].line - 1, i)]
-            lazy = []
-            if not inner and j < n and lines[j].strip() and not _mdit_interrupts(lines[j], quote):
-                x = j
-                while x < n and lines[x].strip() and not _mdit_interrupts(lines[x], quote):
-                    lazy.append(_strip_quote(lines[x], _quote_depth(lines[x])[0]))
-                    x += 1
-            row_texts = [_strip_quote(lines[i], quote), _strip_quote(lines[i + 1], quote)] + \
-                [_strip_quote(lines[r], quote) for r in rows[1:]]
-            touched = _md_table_crosses(before, row_texts, lazy)
-            if touched:
-                b = len(before)
-                if min(touched) < b and not inner:
-                    md_list_freeze.append(blocks[-1].line - 1)
-                if max(touched) >= b + len(row_texts) and not inner:
-                    md_list_freeze.append(j)
-                raw_rows = {rows[0]} if b in touched else set()
-                raw_rows.update(rows[t] for t in range(1, len(rows)) if b + 1 + t in touched)
+        sep_raw = False
+        before = []
+        if blocks and blocks[-1].kind == "paragraph" and \
+                blocks[-1].line + blocks[-1].raw.count("\n") == i:
+            before = [_strip_quote(lines[x], quote) for x in range(blocks[-1].line - 1, i)]
+        lazy = []
+        if not inner and j < n and lines[j].strip() and not _mdit_interrupts(lines[j], quote):
+            x = j
+            while x < n and lines[x].strip() and not _mdit_interrupts(lines[x], quote):
+                text = _strip_quote(lines[x], _quote_depth(lines[x])[0])
+                if depth > 0 and _indent_of(text) < base and LIST_MARKER_START_RE.match(text):
+                    # (A list item of the table's list, or of one around
+                    # it, ends the item's paragraph to markdown-it.)
+                    break
+                lazy.append(text)
+                x += 1
+        row_texts = [_strip_quote(lines[i], quote), _strip_quote(lines[i + 1], quote)] + \
+            [_strip_quote(lines[r], quote) for r in rows[1:]]
+        touched = _md_table_crosses(before, row_texts, lazy)
+        if touched:
+            b = len(before)
+            if min(touched) < b and not inner:
+                md_list_freeze.append(blocks[-1].line - 1)
+            if max(touched) >= b + len(row_texts) and not inner:
+                md_list_freeze.append(j)
+            raw_rows = {rows[0]} if b in touched else set()
+            raw_rows.update(rows[t] for t in range(1, len(rows)) if b + 1 + t in touched)
+            sep_raw = b + 1 in touched
         for idx, r in enumerate(rows):
             row_body = _strip_quote(lines[r], quote)
             cells = _split_cells(row_body)
@@ -3293,7 +3301,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             if idx == 0:
                 sep = _strip_quote(lines[i + 1], quote)
                 sep_norm = re.sub(r"[ \t]", "", sep).strip("|")
-                blocks.append(Block("table_sep", attrs(), sep_norm, [], i + 2))
+                # (A delimiter row inside a code span markdown-it reads
+                # there is kept as written.)
+                blocks.append(Block("table_sep", attrs(), sep if sep_raw else sep_norm, [], i + 2))
         return j
 
     # Paragraph lines that head a table and are read with the paragraph's
@@ -3628,7 +3638,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                             para.append(text)
                         body = "\n".join(tail)
                         after = "\n".join(para)
-                        if (SETEXT_LIKE_RE.match(nrel) or _open_bracket(body) or _md_runs_on(body, after)
+                        if (SETEXT_LIKE_RE.match(nrel) or _md_open_bracket(body) or _md_runs_on(body, after)
                                 or _md_emphasis_runs_on(body, after)):
                             md_list_freeze.append(end + 1)
             i = end + 1
@@ -3647,6 +3657,25 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             # inside another one can keep that one's paragraph open.
             blocks.append(Block("footnote_def", attrs(base=base), "\n".join(lines[i:end + 1]), [], start_line,
                                 end_state))
+            if (not inner and len(blocks) > 1 and blocks[-2].kind == "paragraph"
+                    and blocks[-2].line + blocks[-2].raw.count("\n") == i
+                    and not _md_starts_anew(lines, i, blocks[-2])):
+                # (The definition ends cmark-gfm's paragraph right before
+                # it, which markdown-it continues into the definition: where
+                # a code span, raw HTML, emphasis or a link text opened in
+                # that paragraph runs on into it, the lines from the
+                # paragraph on are kept byte for byte.)
+                prev = [_strip_quote(lines[x], _quote_depth(lines[x])[0]) for x in range(blocks[-2].line - 1, i)]
+                after = []
+                for x in range(i, n):
+                    text = _strip_quote(lines[x], _quote_depth(lines[x])[0])
+                    if not text.strip(" \t") or (x > i and _mdit_interrupts(lines[x], quote)):
+                        break
+                    after.append(text)
+                prev_text, after_text = "\n".join(prev), "\n".join(after)
+                if (_md_open_bracket(prev_text) or _md_runs_on(prev_text, after_text)
+                        or _md_emphasis_runs_on(prev_text, after_text)):
+                    md_list_freeze.append(blocks[-2].line - 1)
             # markdown-it has no footnotes: it reads the definition as a
             # paragraph (or a reference definition) and its lazy and
             # indented lines as paragraph text. A line right after it that
@@ -3692,7 +3721,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                         para.append(text)
                     if md_open_end and (_starts_block(after_def, False) or _indent_of(after_def) >= 4
                                         or SETEXT_LIKE_RE.match(after_def)
-                                        or any(ch in "*_~" for ch in body) or _open_bracket(body)
+                                        or any(ch in "*_~" for ch in body) or _md_open_bracket(body)
                                         or _md_runs_on(body, "\n".join(para))):
                         md_list_freeze.append(end + 1)
                     elif md_open_end and not anew:
@@ -5647,27 +5676,88 @@ def _md_runs_on(body, after):
     return False
 
 
+def _renderer_constructs(text):
+    """The constructs of ``text`` (first reading) as the renderers read
+    them: TeX math is text to both, so the code spans, raw HTML, links and
+    escapes inside it count, and its delimiters are read as text."""
+    work = text
+    for _ in range(64):
+        constructs = _inline_constructs(work)
+        maths = [c for c in constructs if c[0] == "math"]
+        if not maths:
+            return constructs
+        chars = list(work)
+        for _, start, end, value in maths:
+            lead = 2 if value.startswith(("\\(", "\\[", "$$")) else 1
+            trail = 2 if value.endswith(("\\)", "\\]", "$$")) else 1
+            for x in list(range(start, start + lead)) + list(range(end - trail, end)):
+                chars[x] = " "
+        work = "".join(chars)
+    return [c for c in _inline_constructs(work) if c[0] != "math"]
+
+
 def _delimiter_text(text):
-    """``text`` with backslash escapes, code spans, raw HTML, autolinks,
-    link tails and math blanked out (same length), for _delimiter_runs:
-    delimiters there do not pair."""
+    """``text`` with backslash escapes, code spans, raw HTML, autolinks and
+    link tails blanked out (same length; TeX math is text to the
+    renderers), for _delimiter_runs and bracket scans: delimiters and
+    brackets there do not count."""
     chars = list(text)
-    for kind, start, end, _ in _inline_constructs(text):
+    for kind, start, end, _ in _renderer_constructs(text):
         for x in range(start, end):
             if chars[x] != "\n":
                 chars[x] = " "
     return "".join(chars)
 
 
+def _paired_spans(text, masked, labels, gfm):
+    """Emphasis spans (start, end) of ``text`` with delimiter runs found in
+    ``masked``; runs inside a link or image text (``labels``, (start, end)
+    of the text between the brackets) pair only with each other, innermost
+    first, as in emphasis_structure."""
+    runs = _delimiter_runs(text, masked, gfm, frozenset(end for _, end in labels))
+    bounds = sorted(set(labels), key=lambda lb: (lb[0], -lb[1]))
+    groups = {lb: [] for lb in bounds}
+    outside = []
+    open_labels = []
+    li = 0
+    for run in runs:
+        while li < len(bounds) and bounds[li][0] <= run["pos"]:
+            open_labels.append(bounds[li])
+            li += 1
+        while open_labels and open_labels[-1][1] <= run["pos"]:
+            open_labels.pop()
+        holder = None
+        for lb in reversed(open_labels):
+            if lb[0] <= run["pos"] < lb[1]:
+                holder = lb
+                break
+        (groups[holder] if holder is not None else outside).append(run)
+    spans = []
+    for lb in sorted(bounds, key=lambda lb: lb[1] - lb[0]):
+        _pair_delimiters(groups[lb], spans, {}, gfm)
+    _pair_delimiters(outside, spans, {}, gfm)
+    return [(a, b) for a, b, _ in spans]
+
+
 def _emphasis_spans(text):
     """The emphasis and strikethrough spans (start, end) of ``text`` read as
-    one paragraph, in both readings."""
+    one paragraph, in both readings, with the text of an inline link or
+    image read on its own, and that of a bracket pair that may be a
+    reference both ways."""
     masked = _delimiter_text(text)
+    tails = {start for kind, start, _, _ in _renderer_constructs(text) if kind == "linktail"}
+    links, maybe = [], []
+    stack = []
+    for x, ch in enumerate(masked):
+        if ch == "[":
+            stack.append(x)
+        elif ch == "]" and stack:
+            o = stack.pop()
+            (links if x + 1 in tails else maybe).append((o + 1, x))
     out = []
-    for gfm in (True, False):
-        spans = []
-        _pair_delimiters(_delimiter_runs(text, masked, gfm), spans, {}, gfm)
-        out.extend((a, b) for a, b, _ in spans)
+    for labels in ((links, links + maybe) if maybe else (links,)):
+        for gfm in (True, False):
+            out.extend(_paired_spans(text, masked, labels, gfm))
     return out
 
 
@@ -5690,6 +5780,7 @@ def _md_table_crosses(before, rows, after):
     cuts = []
     starts = []
     touched = set()
+    open_from = None
     pos = 0
     for k, line in enumerate(lines):
         starts.append(pos)
@@ -5699,10 +5790,11 @@ def _md_table_crosses(before, rows, after):
             for x, ch in enumerate(line):
                 if ch == "|" and (x == 0 or line[x - 1] != "\\"):
                     cuts.append(pos + x)
-            if not touched.issuperset(range(k, len(lines))) and \
-                    any(_open_bracket(cell) for cell in _split_cells(line)):
-                touched.update(range(k, len(lines)))
+            if open_from is None and any(_md_open_bracket(cell) for cell in _split_cells(line)):
+                open_from = k
         pos += len(line) + 1
+    if open_from is not None:
+        touched.update(range(open_from, len(lines)))
     cuts.sort()
 
     def mark(a, b):
@@ -5717,6 +5809,13 @@ def _md_table_crosses(before, rows, after):
     for a, b in _emphasis_spans(text):
         mark(a, b)
     return touched
+
+
+def _md_open_bracket(text):
+    """Whether ``text`` leaves a "[" open as the renderers read it: brackets
+    in code spans, raw HTML, autolinks, link tails and escapes do not
+    count."""
+    return _open_bracket(_delimiter_text(text))
 
 
 def _open_bracket(text):
@@ -5829,29 +5928,30 @@ def _hidden_brackets(text):
     """(start, end) of each bracket pair in ``text`` whose text no renderer
     emits as written: an image's text (alt text: cmark-gfm escapes a
     comment there and markdown-it drops it) and the label of an explicit
-    reference ("[text][label]"). Brackets in code spans, raw HTML,
-    autolinks and link tails (destinations and titles) of the first
-    reading do not count, and backslash escapes are skipped; a pair that is
-    no image or reference after all is read the conservative way."""
-    skip = {}
-    for kind, start, end, _ in _inline_constructs(text):
-        if kind in ("code", "html", "autolink", "linktail", "escape"):
-            skip[start] = end
-    out = []
-    stack = []
-    x = 0
-    while x < len(text):
-        if x in skip:
-            x = skip[x]
-            continue
-        if text[x] == "[":
-            stack.append(x)
-        elif text[x] == "]" and stack:
-            o = stack.pop()
-            if o and (text[o - 1] == "]" or (text[o - 1] == "!" and skip.get(o - 2) != o)):
-                out.append((o, x + 1))
-        x += 1
-    return out
+    reference ("[text][label]"), in any reading of the text. Brackets in
+    code spans, raw HTML, autolinks, link tails (destinations and titles)
+    and escapes of that reading do not count; a pair that is no image or
+    reference after all is read the conservative way."""
+    out = set()
+    for _, constructs in _inline_readings(text, None):
+        skip = {}
+        for kind, start, end, _ in constructs:
+            if kind in ("code", "html", "autolink", "linktail", "escape"):
+                skip[start] = end
+        stack = []
+        x = 0
+        while x < len(text):
+            if x in skip:
+                x = skip[x]
+                continue
+            if text[x] == "[":
+                stack.append(x)
+            elif text[x] == "]" and stack:
+                o = stack.pop()
+                if o and (text[o - 1] == "]" or (text[o - 1] == "!" and skip.get(o - 2) != o)):
+                    out.add((o, x + 1))
+            x += 1
+    return sorted(out)
 
 
 def _marker_masks(text):

@@ -4354,4 +4354,45 @@ for name, doc in (("32000 display math blocks in one paragraph", "$$x$$\n" * 320
     report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
            "%.2fs" % (time.process_time() - started))
 
+for name, src, cand in [
+        ('a protected sentence after a closer in code markdown-it reads on from a quoted table with HTML',
+         'Start <!-- polish:off -->keep.\n\n> | Name | Value |\n> | --- | --- |\n> | <br> | `example |\nlazy <!-- polish:on -->` end.\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n> | Name | Value |\n> | --- | --- |\n> | <br> | `example |\nlazy <!-- polish:on -->` end.\n\nRead new prose.\n'),
+        ('a protected sentence after a marker in image text that markdown-it reads with a refused link inside',
+         'Start <!-- polish:off -->keep.\n\n![Opening [ in [sample](file:///tmp/sample.md "Use ] here") <!-- polish:on -->](diagram.svg)\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\n![Opening [ in [sample](file:///tmp/sample.md "Use ] here") <!-- polish:on -->](diagram.svg)\n\nRead new prose.\n'),
+        ("a delimiter row inside markdown-it's code span respaced",
+         '| Name | `Value |\n| --- | --- |\n| one | two` |\n',
+         '| Name | `Value |\n|  --- | --- |\n| one | two` |\n'),
+        ('emphasis markdown-it reads from TeX math across table cells moved',
+         '| Expression | Explanation |\n| --- | --- |\n| \\(x*y\\) | The value* is approximate. |\n',
+         '| Expression | Explanation |\n| --- | --- |\n| \\(x*y\\) | The value *is approximate. |\n'),
+        ('emphasis markdown-it reads past a link text across table rows moved',
+         '| *Name | [Value*](/guide) |\n| --- | --- |\n| The value* is approximate. | Other prose |\n',
+         '| *Name | [Value*](/guide) |\n| --- | --- |\n| The value *is approximate. | Other prose |\n'),
+        ('a protected sentence after a closer in code markdown-it reads from a paragraph into a footnote',
+         'See[^1].\n\nStart <!-- polish:off -->keep.\n\nRun `echo <!-- polish:on -->\n[^1]: done` here.\n\nRead old prose.\n',
+         'See[^1].\n\nStart <!-- polish:off -->keep.\n\nRun `echo <!-- polish:on -->\n[^1]: done` here.\n\nRead new prose.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('a table cell after a bracket in a code span reworded',
+         '| Token | Meaning |\n| --- | --- |\n| `[` | The old opening bracket. |\n',
+         '| Token | Meaning |\n| --- | --- |\n| `[` | The new opening bracket. |\n'),
+        ('a table cell after a bracket in a link title reworded',
+         '| Link | Notes |\n| --- | --- |\n| [guide](/u "Use [ to open a label") | Read the old explanation. |\n',
+         '| Link | Notes |\n| --- | --- |\n| [guide](/u "Use [ to open a label") | Read the new explanation. |\n'),
+        ('a table cell after a star in link text reworded',
+         '| Type | Notes |\n| --- | --- |\n| [*.md files](/guide) | Read the old notes*. |\n',
+         '| Type | Notes |\n| --- | --- |\n| [*.md files](/guide) | Read the new notes*. |\n'),
+        ('prose after a closer in a paragraph right before a footnote reworded',
+         'See[^1].\n\nStart <!-- polish:off -->keep.\n\nRun <!-- polish:on --> `x`\n[^1]: done here.\n\nRead old prose.\n',
+         'See[^1].\n\nStart <!-- polish:off -->keep.\n\nRun <!-- polish:on --> `x`\n[^1]: done here.\n\nRead new prose.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("800 tables in numbered list items", "".join("%d. | Name | Value |\n%s| --- | --- |\n%s| `code` | Ordinary prose. |\n" % (k, " " * (len(str(k)) + 2), " " * (len(str(k)) + 2)) for k in range(1, 801))),
+                  ("8000 table rows after a bracket in code", "| Token | Description |\n| --- | --- |\n| `[` | An opening bracket. |\n" + "| `word` | Ordinary prose. |\n" * 8000)):
+    started = time.process_time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
+           "%.2fs" % (time.process_time() - started))
+
 sys.exit(1 if FAILED else 0)
