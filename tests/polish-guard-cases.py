@@ -4576,4 +4576,48 @@ for name, doc in (("3000 open images before 3000 links", "![" * 3000 + " text " 
     report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
            "%.2fs" % (time.process_time() - started))
 
+for name, src, cand in [
+        ('emphasis markdown-it reads past a link inside a refused image removed',
+         'Read [the ![a [setup](/setup) *diagram](file:///image.png) guide](/guide) and the value* is approximate.\n',
+         'Read [the ![a [setup](/setup) *diagram](file:///image.png) guide](/guide) and the value *is approximate.\n'),
+        ('emphasis after a link inside TeX math removed',
+         'Use \\(x [*guide](/guide) and x*y\\) and the value* is approximate.\n',
+         'Use \\(x [*guide](/guide) and x*y\\) and the value *is approximate.\n'),
+        ('the destination of a link inside link text after an image with a backtick title changed',
+         'Read [the [the ![diagram](image.png "Use ` here") guide](old "Guide") notes](/notes "Type ` here") now.\n',
+         'Read [the [the ![diagram](image.png "Use ` here") guide](new "Guide") notes](/notes "Type ` here") now.\n'),
+        ('the title of a link inside link text after an image with a backtick title changed',
+         'Read [the [the ![diagram](image.png "Use ` here") guide](old "Guide") notes](/notes "Type ` here") now.\n',
+         'Read [the [the ![diagram](image.png "Use ` here") guide](old "Guides") notes](/notes "Type ` here") now.\n'),
+        ('a protected sentence after a closer markdown-it reads in code after nested refused images',
+         'Start <!-- polish:off -->keep.\n\nRead ![overview with [the ![setup diagram](file:///setup.png "Type `") guide](/guide "Type ``")](overview.png "Type `") `sample <!-- polish:on --> more`` now.\n\nRead old prose.\n',
+         'Start <!-- polish:off -->keep.\n\nRead ![overview with [the ![setup diagram](file:///setup.png "Type `") guide](/guide "Type ``")](overview.png "Type `") `sample <!-- polish:on --> more`` now.\n\nRead new prose.\n'),
+        ('a protected sentence after an opener in code markdown-it reads as text after a stray bracket and backtick',
+         'Press [ then `<!-- polish:off -->` and a stray ` here.\n\nThe old prose.\n',
+         'Press [ then `<!-- polish:off -->` and a stray ` here.\n\nThe new prose.\n'),
+        ('emphasis markdown-it reads from a star in code after a stray bracket and backtick removed',
+         'Press [ then `*x` and the value* is ` here.\n',
+         'Press [ then `*x` and the value *is ` here.\n')]:
+    rejects("R3 " + name, src, cand)
+for name, src, cand in [
+        ('prose in code that ends before a refused image reworded',
+         'Read [the ![a [setup](/setup) diagram](file:///image.png) guide](/guide "Use ` here") then `old prose` now.\n',
+         'Read [the ![a [setup](/setup) diagram](file:///image.png) guide](/guide "Use ` here") then `new prose` now.\n'),
+        ('prose after a stray bracket, code and a stray backtick reworded',
+         'Press [ then `ls` and a stray ` here with the old prose.\n',
+         'Press [ then `ls` and a stray ` here with the new prose.\n'),
+        ('prose after a link inside TeX math reworded',
+         'Use \\(x [guide](/guide) y\\) and the old value.\n',
+         'Use \\(x [guide](/guide) y\\) and the new value.\n'),
+        ('prose after a star in code reworded',
+         'Use `*x` and the old value* here.\n',
+         'Use `*x` and the new value* here.\n')]:
+    accepts("R3 " + name, src, cand)
+for name, doc in (("2000 paragraphs with a stray bracket, code and a stray backtick", "".join("Press [ then `ls %d` and a stray ` here with *e*.\n\n" % k for k in range(2000))),
+                  ("2000 paragraphs with nested images, refused links and code", "".join("Read ![o [t ![s](file:///s.png \"T `\") g](/g \"T ``\")](o.png \"T `\") `s` *e* ``m``.\n\n" for k in range(2000)))):
+    started = time.process_time()
+    accepts("R3 " + name + " unchanged", doc, doc)
+    report("R3 " + name + " checked within two seconds", time.process_time() - started < 2.0,
+           "%.2fs" % (time.process_time() - started))
+
 sys.exit(1 if FAILED else 0)

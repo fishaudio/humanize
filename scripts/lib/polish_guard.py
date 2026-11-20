@@ -693,6 +693,435 @@ def _mdit_bad_tail(text, open_paren):
     return _mdit_bad_link(_mdit_unescape(dest))
 
 
+# markdown-it-py's inline HTML pattern (read at a position) and its autolink
+# and e-mail patterns, for _mdit_inline.
+_MDIT_HTML_ATTR = (r"(?:\s+[a-zA-Z_:][a-zA-Z0-9:._-]*"
+                   r"(?:\s*=\s*(?:[^\"'=<>`\x00-\x20]+|'[^']*'|\"[^\"]*\"))?)")
+_MDIT_HTML_RE = re.compile(
+    r"(?:<[A-Za-z][A-Za-z0-9\-]*" + _MDIT_HTML_ATTR + r"*\s*/?>|</[A-Za-z][A-Za-z0-9\-]*\s*>"
+    r"|<!---?>|<!--(?:[^-]|-[^-]|--[^>])*-->|<[?][\s\S]*?[?]>|<![A-Za-z][^>]*>"
+    r"|<!\[CDATA\[[\s\S]*?\]\]>)")
+_MDIT_AUTOLINK_RE = re.compile(r"^([a-zA-Z][a-zA-Z0-9+.\-]{1,31}):([^<>\x00-\x20]*)$")
+_MDIT_EMAIL_RE = re.compile(
+    r"^([a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*)$")
+MDIT_MAX_NESTING = 20
+_MDIT_MEMO = {}
+_MDIT_SYNTAX_RE = re.compile(r"[`<\\\[]")
+# (The characters a rule of _mdit_inline starts at, and those that also
+# matter while looking for the end of link text; the others are text.)
+_MDIT_RULE_RE = re.compile(r"[\\`\[!<]")
+_MDIT_LABEL_RE = re.compile(r"[\\`\[\]!<]")
+
+
+def _mdit_destination(s, pos, mx):
+    """markdown-it's link destination at ``pos`` (reading ``s[:mx]``):
+    (ok, end, raw text without angle brackets)."""
+    start = pos
+    if pos < len(s) and s[pos] == "<":
+        pos += 1
+        while pos < mx:
+            c = s[pos]
+            if c == "\n" or c == "<":
+                return False, 0, ""
+            if c == ">":
+                return True, pos + 1, s[start + 1:pos]
+            if c == "\\" and pos + 1 < mx:
+                pos += 2
+                continue
+            pos += 1
+        return False, 0, ""
+    level = 0
+    while pos < mx:
+        c = s[pos]
+        if c == " " or c < " " or c == "\x7f":
+            break
+        if c == "\\" and pos + 1 < mx:
+            if s[pos + 1] == " ":
+                break
+            pos += 2
+            continue
+        if c == "(":
+            level += 1
+            if level > 32:
+                return False, 0, ""
+        if c == ")":
+            if level == 0:
+                break
+            level -= 1
+        pos += 1
+    if start == pos or level != 0:
+        return False, 0, ""
+    return True, pos, s[start:pos]
+
+
+def _mdit_title_end(s, pos, mx):
+    """End of markdown-it's link title at ``pos`` (reading ``s[:mx]``), or
+    None."""
+    if pos >= mx or s[pos] not in "\"'(":
+        return None
+    marker = ")" if s[pos] == "(" else s[pos]
+    pos += 1
+    while pos < mx:
+        c = s[pos]
+        if c == marker:
+            return pos + 1
+        if c == "(" and marker == ")":
+            return None
+        if c == "\\" and pos + 1 < mx:
+            pos += 1
+        pos += 1
+    return None
+
+
+class _MditState:
+    """The state of one markdown-it inline parse (see _mdit_inline)."""
+    __slots__ = ("src", "pos", "max", "level", "cache", "ticks", "scanned", "resolves", "has_refs",
+                 "out", "base", "found")
+
+    def __init__(self, src, resolves, has_refs, base=0):
+        self.src = src
+        self.pos = 0
+        self.max = len(src)
+        self.level = 0
+        # (skipToken's cache, and the backtick rule's: the last position
+        # seen of each closer length, and whether a scan reached the end.)
+        self.cache = {}
+        self.ticks = {}
+        self.scanned = False
+        self.resolves = resolves
+        self.has_refs = has_refs
+        self.out = []
+        self.base = base
+        self.found = {}
+
+    def find(self, needle, start):
+        """``src.find(needle, start)``, remembered, so that many raw HTML
+        openers without an end take linear time."""
+        known = self.found.get(needle)
+        if known is not None and known[0] <= start and (known[1] < 0 or known[1] >= start):
+            return known[1]
+        at = self.src.find(needle, start)
+        self.found[needle] = (start, at)
+        return at
+
+
+def _mdit_space(c):
+    return c == " " or c == "\t"
+
+
+def _mdit_backtick(st, silent):
+    src = st.src
+    start = pos = st.pos
+    pos += 1
+    mx = st.max
+    while pos < mx and src[pos] == "`":
+        pos += 1
+    run = pos - start
+    if st.scanned and st.ticks.get(run, 0) <= start:
+        # A scan reached the end without a closer of this length past the
+        # last one seen: the run is text, even where an earlier look-ahead
+        # (link text) set this and a closer follows.
+        st.pos += run
+        return True
+    end = pos
+    while True:
+        close = src.find("`", end)
+        if close < 0:
+            break
+        end = close + 1
+        while end < mx and src[end] == "`":
+            end += 1
+        if end - close == run:
+            if not silent:
+                st.out.append(("code", st.base + start, st.base + end, src[pos:close]))
+            st.pos = end
+            return True
+        st.ticks[end - close] = close
+    st.scanned = True
+    st.pos += run
+    return True
+
+
+def _mdit_escape(st, silent):
+    src = st.src
+    pos = st.pos + 1
+    mx = st.max
+    if pos >= mx:
+        return False
+    if src[pos] == "\n":
+        pos += 1
+        while pos < mx and _mdit_space(src[pos]):
+            pos += 1
+        st.pos = pos
+        return True
+    if not silent and src[pos] in ESCAPABLE:
+        st.out.append(("escape", st.base + pos - 1, st.base + pos + 1, src[pos - 1:pos + 1]))
+    st.pos = pos + 1
+    return True
+
+
+def _mdit_label(st, start, no_nesting):
+    """parseLinkLabel: the end of the link text that opens at ``start``,
+    or -1."""
+    old = st.pos
+    found = False
+    st.pos = start + 1
+    level = 1
+    src = st.src
+    while st.pos < st.max:
+        marker = src[st.pos]
+        if marker == "]":
+            level -= 1
+            if level == 0:
+                found = True
+                break
+        elif marker not in "\\`[!<" and st.level < MDIT_MAX_NESTING:
+            # (Text up to the next character that matters, remembered as
+            # skipToken remembers it: past the nesting limit, skipping a
+            # character it has not seen ends the text.)
+            m = _MDIT_LABEL_RE.search(src, st.pos + 1, st.max)
+            end = m.start() if m else st.max
+            st.cache.setdefault(st.pos, end)
+            st.pos = st.cache[st.pos]
+            continue
+        prev = st.pos
+        _mdit_skip(st)
+        if marker == "[":
+            if prev == st.pos - 1:
+                level += 1
+            elif no_nesting:
+                st.pos = old
+                return -1
+    end = st.pos if found else -1
+    st.pos = old
+    return end
+
+
+def _mdit_link(st, silent, image=False):
+    src = st.src
+    old = st.pos
+    mx = st.max
+    if image:
+        if st.pos + 1 < st.max and src[st.pos + 1] != "[":
+            return False
+        label_start = st.pos + 2
+        label_end = _mdit_label(st, st.pos + 1, False)
+    else:
+        label_start = st.pos + 1
+        label_end = _mdit_label(st, st.pos, True)
+    if label_end < 0:
+        return False
+    pos = label_end + 1
+    reference = True
+    tail = None
+    if pos < mx and src[pos] == "(":
+        reference = False
+        tail = pos
+        pos += 1
+        while pos < mx and (_mdit_space(src[pos]) or src[pos] == "\n"):
+            pos += 1
+        if pos >= mx:
+            return False
+        ok, end, raw = _mdit_destination(src, pos, st.max)
+        if ok and not _mdit_bad_link(_mdit_unescape(raw)):
+            pos = end
+        start = pos
+        while pos < mx and (_mdit_space(src[pos]) or src[pos] == "\n"):
+            pos += 1
+        end = _mdit_title_end(src, pos, st.max)
+        if pos < mx and start != pos and end is not None:
+            pos = end
+            while pos < mx and (_mdit_space(src[pos]) or src[pos] == "\n"):
+                pos += 1
+        if pos >= mx or src[pos] != ")":
+            if image:
+                st.pos = old
+                return False
+            reference = True
+            tail = None
+        pos += 1
+    if reference:
+        if not st.has_refs:
+            return False
+        label = None
+        if pos < mx and src[pos] == "[":
+            start = pos + 1
+            pos = _mdit_label(st, pos, False)
+            if pos >= 0:
+                label = src[start:pos]
+                pos += 1
+            else:
+                pos = label_end + 1
+        else:
+            pos = label_end + 1
+        if not st.resolves(label or src[label_start:label_end]):
+            st.pos = old
+            return False
+    if not silent:
+        if tail is not None:
+            st.out.append(("linktail", st.base + tail, st.base + pos, src[tail:pos]))
+        if image:
+            # (Image text is parsed on its own, with fresh caches.)
+            sub = _MditState(src[label_start:label_end], st.resolves, st.has_refs, st.base + label_start)
+            _mdit_tokenize(sub)
+            st.out += sub.out
+        else:
+            st.pos = label_start
+            st.max = label_end
+            st.level += 1
+            _mdit_tokenize(st)
+            st.level -= 1
+    st.pos = pos
+    st.max = mx
+    return True
+
+
+def _mdit_angle(st, silent):
+    """markdown-it's autolink rule, then its inline HTML rule."""
+    src = st.src
+    start = pos = st.pos
+    mx = st.max
+    while True:
+        pos += 1
+        if pos >= mx or src[pos] == "<":
+            url = None
+            break
+        if src[pos] == ">":
+            url = src[start + 1:pos]
+            break
+    if url is not None and (_MDIT_AUTOLINK_RE.search(url) or _MDIT_EMAIL_RE.search(url)):
+        full = url if _MDIT_AUTOLINK_RE.search(url) else "mailto:" + url
+        if not _mdit_bad_link(full):
+            if not silent:
+                st.out.append(("autolink", st.base + start, st.base + pos + 1, src[start:pos + 1]))
+            st.pos = pos + 1
+            return True
+    if start + 2 >= mx:
+        return False
+    c = src[start + 1]
+    if c not in "!?/" and not "a" <= chr(ord(c) | 0x20) <= "z":
+        return False
+    # (Each form that runs to an end marker needs one ahead.)
+    if c == "?" and st.find("?>", start + 2) < 0:
+        return False
+    if c == "!":
+        if src.startswith("<!--", start):
+            if st.find("-->", start + 4) < 0 and not src.startswith(("<!-->", "<!--->"), start):
+                return False
+        elif src.startswith("<![CDATA[", start):
+            if st.find("]]>", start + 9) < 0:
+                return False
+        elif st.find(">", start + 2) < 0:
+            return False
+    m = _MDIT_HTML_RE.match(src, start)
+    if not m:
+        return False
+    if not silent:
+        st.out.append(("html", st.base + start, st.base + m.end(), m.group(0)))
+    st.pos = m.end()
+    return True
+
+
+def _mdit_rule(st, silent):
+    c = st.src[st.pos]
+    if c == "\\":
+        return _mdit_escape(st, silent)
+    if c == "`":
+        return _mdit_backtick(st, silent)
+    if c == "[":
+        return _mdit_link(st, silent)
+    if c == "!":
+        return _mdit_link(st, silent, True)
+    if c == "<":
+        return _mdit_angle(st, silent)
+    return False
+
+
+def _mdit_skip(st):
+    pos = st.pos
+    if pos in st.cache:
+        st.pos = st.cache[pos]
+        return
+    ok = False
+    if st.level < MDIT_MAX_NESTING:
+        st.level += 1
+        ok = _mdit_rule(st, True)
+        st.level -= 1
+    else:
+        st.pos = st.max
+    if not ok:
+        st.pos += 1
+    st.cache[pos] = st.pos
+
+
+def _mdit_tokenize(st):
+    end = st.max
+    src = st.src
+    while st.pos < end:
+        if src[st.pos] not in "\\`[!<":
+            m = _MDIT_RULE_RE.search(src, st.pos + 1, end)
+            st.pos = m.start() if m else end
+            continue
+        if st.level < MDIT_MAX_NESTING and _mdit_rule(st, False):
+            if st.pos >= end:
+                break
+            continue
+        st.pos += 1
+
+
+def _mdit_inline(text, resolve=None, reading=0, seen=None):
+    """The code spans, raw HTML, autolinks, inline link tails and backslash
+    escapes markdown-it reads in ``text`` (one inline content), as
+    _inline_constructs gives them, sorted: an emulation of markdown-it-py's
+    inline parser, reduced to the rules that decide them (escapes, code
+    spans with the backtick rule's scan cache, links and images with their
+    look-ahead over the link text and its cache, autolinks, inline HTML; the
+    others only step over text). Where that cache was set by a look-ahead
+    over link text, a later backtick run is text although a closer follows.
+    A label that may or may not resolve (``resolve``) resolves in the
+    READ_REF reading; READ_REF goes to ``seen`` where that changes the
+    parse. TeX math is text."""
+    out, met = _mdit_parse(text, resolve, reading)
+    if met and seen is not None and READ_REF not in seen:
+        if _mdit_parse(text, resolve, reading ^ READ_REF)[0] != out:
+            seen.add(READ_REF)
+    return out
+
+
+def _mdit_parse(text, resolve, reading):
+    """(constructs, whether a label that may or may not resolve was asked
+    about) for _mdit_inline, remembered by text and answers."""
+    has_refs = resolve is None or getattr(resolve, "mdit_refs", None) is not False
+    ask = getattr(resolve, "probe", resolve)
+    answers = {}
+
+    def resolves(label):
+        if label not in answers:
+            status = ask(label) if ask is not None else "maybe"
+            if status in ("yes", "md"):
+                answers[label] = (True, False)
+            elif status in ("no", "cm"):
+                answers[label] = (False, False)
+            else:
+                answers[label] = (bool(reading & READ_REF), True)
+        return answers[label][0]
+
+    entries = _MDIT_MEMO.get((text, has_refs))
+    for asked, out in entries or ():
+        # (The same answers to the labels asked give the same parse.)
+        if all(resolves(label) == value for label, value in asked):
+            return out, any(answers[label][1] for label, _ in asked)
+    st = _MditState(text, resolves, has_refs)
+    _mdit_tokenize(st)
+    out = sorted(st.out, key=lambda c: c[1])
+    if len(_MDIT_MEMO) > 4096:
+        _MDIT_MEMO.clear()
+    _MDIT_MEMO.setdefault((text, has_refs), []).append(
+        (tuple((label, value) for label, (value, _) in answers.items()), out))
+    return out, any(m for _, m in answers.values())
+
+
 def _inline_constructs(text, reading=0, seen=None, resolve=None):
     """Code spans, raw HTML, autolinks, inline link tails, TeX math and
     backslash escapes, in one left-to-right pass, as (kind, start, end,
@@ -707,8 +1136,6 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
     or a reference that resolves) deactivates the brackets open before it
     that open no image, as in CommonMark: their closing brackets start no
     link, so what looks like a destination and title after them is text.
-    markdown-it reads an image as one token, so there a link deactivates
-    only the brackets open after the nearest open image (READ_MD).
 
     Two choices depend on more than the text, and ``reading`` (bits) makes
     them; the bit of each choice met goes to ``seen``:
@@ -720,40 +1147,33 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
       code span). A reference inside link text that may resolve
       deactivates the brackets open before it only in this reading.
       ``resolve`` (see extract_tokens) decides when it can.
-    - READ_MD: markdown-it refuses a link or autolink to a "javascript:",
-      "vbscript:", "file:" or "data:" destination, which cmark-gfm takes:
-      its brackets and backticks are then text and code syntax. A link
-      inside an open image's text also makes this choice (see above).
+    - READ_MD: markdown-it's reading, from _mdit_inline (it refuses links
+      to "javascript:", "vbscript:", "file:" and "data:" destinations,
+      finds the end of link text by looking ahead, reads an image as one
+      token and keeps a backtick scan cache across that look-ahead). The
+      choice is met where it differs from this scan (outside TeX math).
 
     With READ_TEX in ``reading``, TeX math is text, as the renderers read
     it: "\\(" and "\\[" are escapes.
     """
+    if reading & READ_MD:
+        return _mdit_inline(text, resolve, reading, seen)
     out = []
     n = len(text)
     opens = []
     # (For each open bracket: [opens an image, inactive, walked]. A link
-    # deactivates the brackets open before it, so their closing brackets
-    # start no link: in cmark-gfm every one that opens no image, in
-    # markdown-it, which reads an image as one token, those down to the
-    # nearest image (READ_MD). Each walk stops where an earlier one did, so
-    # the work stays linear.)
+    # deactivates the brackets open before it that open no image, so their
+    # closing brackets start no link. Each walk stops where an earlier one
+    # did, so the work stays linear.)
     state = []
-    images = [0]
     escaped = set()
 
     def deactivate():
-        if images[0] and seen is not None:
-            seen.add(READ_MD)
         for entry in reversed(state):
-            if reading & READ_MD:
-                if entry[0] or entry[1]:
-                    break
-                entry[1] = True
-            else:
-                if entry[2]:
-                    break
-                entry[2] = True
-                entry[1] = entry[1] or not entry[0]
+            if entry[2]:
+                break
+            entry[2] = True
+            entry[1] = entry[1] or not entry[0]
     i = 0
     while i < n:
         ch = text[i]
@@ -803,11 +1223,6 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
                 m = AUTOLINK_RE.match(text, i)
                 end = m.end() if m else None
                 kind = "autolink"
-                if m and _mdit_bad_link(m.group(0)[1:-1]):
-                    if seen is not None:
-                        seen.add(READ_MD)
-                    if reading & READ_MD:
-                        end = None
             if end is not None:
                 out.append((kind, i, end, text[i:end]))
                 i = end
@@ -818,11 +1233,9 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
             image = i > 0 and text[i - 1] == "!" and i - 1 not in escaped
             opens.append(i)
             state.append([image, False, False])
-            images[0] += image
         elif ch == "]" and opens:
             start = opens.pop()
             image, inactive, _ = state.pop()
-            images[0] -= image
             if inactive:
                 # (An inactive opener: the bracket is text.)
                 i += 1
@@ -848,11 +1261,6 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
                         continue
             if i + 1 < n and text[i + 1] == "(":
                 end, _ = _link_tail(text, i + 1)
-                if end is not None and _mdit_bad_tail(text, i + 1):
-                    if seen is not None:
-                        seen.add(READ_MD)
-                    if reading & READ_MD:
-                        end = None
                 if end is not None:
                     out.append(("linktail", i + 1, end, text[i + 1:end]))
                     if not image:
@@ -872,6 +1280,16 @@ def _inline_constructs(text, reading=0, seen=None, resolve=None):
                         i = second + 1
                         continue
         i += 1
+    if seen is not None and READ_MD not in seen and _MDIT_SYNTAX_RE.search(text):
+        # markdown-it's reading is one of its own where it differs from this
+        # one outside TeX math (inside it, the readings with math as text
+        # compare).
+        math = [(s, e) for kind, s, e, _ in out if kind == "math"]
+        theirs = _mdit_inline(text, resolve, reading | READ_MD, seen)
+        if math:
+            theirs = [c for c in theirs if not any(a <= c[1] and c[2] <= b for a, b in math)]
+        if theirs != [c for c in out if c[0] != "math"]:
+            seen.add(READ_MD)
     return out
 
 
@@ -932,6 +1350,16 @@ def _ref_readings(text, resolve=None, tex=False):
             if chosen is None:
                 return status
             return "yes" if key in chosen else "no"
+
+        def probe(label):
+            # (For markdown-it's reading: a label only it asks about is not
+            # enumerated; it resolves with the others or not at all.)
+            status = resolve(label) if resolve is not None else "maybe"
+            if status in ("yes", "no") or chosen is None:
+                return status
+            return "yes" if normalize_label(label) in chosen else "no"
+        fixed.probe = probe
+        fixed.mdit_refs = getattr(resolve, "mdit_refs", None)
         return fixed
     while True:
         out = list(_inline_readings(text, make(None), tex))
@@ -1039,7 +1467,9 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt
         if kind not in ("code", "math", "escape"):
             continue
         found.append((start, kind, value))
-        if kind == "math":
+        if kind in ("math", "code"):
+            # (Text in a reading where it is no math or code span there: in
+            # markdown-it's, a code span after its backtick cache is set.)
             exposable.append((start, end))
         if kind == "escape":
             # Hide the escaped punctuation from the markup patterns but keep
@@ -1059,6 +1489,22 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt
         found.append((m.start(), "math", m.group(0)))
         _mask(chars, m.start(), m.end())
         exposable.append((m.start(), m.end()))
+
+    # The link tails of the text as read here are protected as they stand
+    # (the link scan below may miss one among nested brackets).
+    for kind, start, end, value in readings[0][1]:
+        if kind == "linktail":
+            # (Whitespace inside the parentheses at either end is syntax.)
+            found.append((start, "tail", "(" + value[1:-1].strip(" \t\n") + ")"))
+    math_spans = [(s, e) for s, e in exposable]
+    if math_spans and re.search(r"[*_~]", text) and any(
+            kind == "linktail" and any(a <= start < b for a, b in math_spans)
+            for _, constructs in readings + (tex if tex is not readings else [])
+            for kind, start, _, _ in constructs):
+        # A link inside TeX math with emphasis markers around: its text is an
+        # emphasis boundary in the readings with math as text, which the
+        # emphasis checks below do not model. The unit is kept byte for byte.
+        found.append((0, "frozen", text))
 
     for m in AUTOLINK_RE.finditer(current()):
         found.append((m.start(), "autolink", m.group(0)))
@@ -1105,7 +1551,8 @@ def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt
                     image_ends.pop()
                 if sp[2] == "link" and sp[1] <= le and (sp[0], sp[1]) != (ls, le):
                     found_inner.append((sp[3], bool(image_ends)))
-                elif sp[2] == "image" and sp[3] != "no" and sp[1] <= le:
+                elif sp[2] == "image" and sp[3] not in ("no", "cm") and sp[1] <= le:
+                    # (Not one markdown-it refuses: it is no image there.)
                     image_ends.append(sp[1])
                 nxt += 1
             inside[k] = found_inner
