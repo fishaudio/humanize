@@ -74,7 +74,7 @@ Requires [codex CLI](https://github.com/openai/codex) for review. See the full [
    ```bash
    /humanize:polish-gemini --input docs/guide.md --output docs/guide.md
    ```
-   Claude also runs it on its own for documentation, web pages, and the RLCR finalize summary. If no key is set or the result fails the local checks, the original text is kept. See [Polish With Gemini](docs/usage.md#polish-gemini).
+   Claude also runs it on its own for documentation, web pages, the RLCR finalize summary, and the Plan Understanding Quiz. If no key is set or the result fails the local checks, the original text is kept. See [Polish With Gemini](docs/usage.md#polish-gemini).
 
 7. **Monitor progress (in another terminal, not inside Claude Code)**:
    ```bash

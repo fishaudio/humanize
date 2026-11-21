@@ -4,8 +4,9 @@
 #
 # Covers the shipped prompt contract, the polish-gemini skill, the config
 # keys, the RLCR finalize call site (templates, inline fallbacks, the
-# POLISH_SCRIPT stop-hook variable, and the Bash validator), the docs, the
-# version strings, and suite registration. No network access is needed.
+# POLISH_SCRIPT stop-hook variable, and the Bash validator), the Plan
+# Understanding Quiz call site in start-rlcr-loop, the docs, the version
+# strings, and suite registration. No network access is needed.
 #
 
 set -uo pipefail
@@ -77,7 +78,7 @@ fi
 contains "skill has the default scenarios section" "$SKILL" "### Default scenarios: polish on your own, with \`--auto\`"
 contains "skill lists documentation as a default scenario" "$SKILL" "**Documentation written for people**"
 contains "skill lists web pages as a default scenario" "$SKILL" "**Web pages**"
-contains "skill names the finalize summary as the third scenario" "$SKILL" "The RLCR finalize summary is the third default scenario."
+contains "skill names the finalize summary and the quiz as default scenarios" "$SKILL" "The RLCR finalize summary and the Plan Understanding Quiz are the other two default scenarios."
 contains "skill has the explicit-only section" "$SKILL" "### Explicit request only: polish only when the user asks, without \`--auto\`"
 for item in "chat replies;" "commit messages and PR descriptions;" "code comments;" "idea drafts;" "plans."; do
     contains "skill lists '$item' as explicit-only" "$SKILL" "- $item"
@@ -87,7 +88,7 @@ for item in "plan files and translated plan variants;" "RLCR round summaries, ro
     contains "skill lists '$item' as never automatic" "$SKILL" "- $item"
 done
 DEFAULT_SECTION="$(sed -n '/^### Default scenarios/,/^### Explicit request only/p' "$SKILL")"
-if grep -qiE 'plan|round summar|idea draft' <<< "$DEFAULT_SECTION"; then
+if grep -qiE 'plan|round summar|idea draft' <<< "${DEFAULT_SECTION//Plan Understanding Quiz/}"; then
     fail "default scenarios exclude plans, round summaries and idea drafts" "none listed" "$DEFAULT_SECTION"
 else
     pass "default scenarios exclude plans, round summaries and idea drafts"
@@ -296,13 +297,81 @@ else
 fi
 
 # No command or template tells Claude to polish plans, round summaries or the goal tracker.
+START_CMD="$PROJECT_ROOT/commands/start-rlcr-loop.md"
 POLISH_MENTIONS="$(grep -rlE 'polish-gemini|POLISH_SCRIPT' "$PROJECT_ROOT/prompt-template" "$PROJECT_ROOT/commands" 2>/dev/null | sort)"
-EXPECTED_MENTIONS="$(printf '%s\n' "$PROJECT_ROOT/prompt-template/claude/finalize-phase-prompt.md" "$PROJECT_ROOT/prompt-template/claude/finalize-phase-skipped-prompt.md" | sort)"
+EXPECTED_MENTIONS="$(printf '%s\n' "$PROJECT_ROOT/prompt-template/claude/finalize-phase-prompt.md" "$PROJECT_ROOT/prompt-template/claude/finalize-phase-skipped-prompt.md" "$START_CMD" | sort)"
 if [[ "$POLISH_MENTIONS" == "$EXPECTED_MENTIONS" ]] && \
-   ! grep -hE 'POLISH_SCRIPT' "$PROJECT_ROOT"/prompt-template/claude/finalize-phase*.md | grep -vq 'FINALIZE_SUMMARY_FILE'; then
-    pass "only the finalize templates call the polish script, and only on the finalize summary"
+   ! grep -hE 'POLISH_SCRIPT' "$PROJECT_ROOT"/prompt-template/claude/finalize-phase*.md | grep -vq 'FINALIZE_SUMMARY_FILE' && \
+   ! grep -F 'polish-gemini.sh"' "$START_CMD" | grep -vq '.humanize/quiz/quiz-segments.txt'; then
+    pass "only the finalize templates and start-rlcr-loop call the polish script, on the finalize summary and the quiz text"
 else
-    fail "polish call sites" "finalize templates only" "$POLISH_MENTIONS"
+    fail "polish call sites" "finalize templates and start-rlcr-loop only" "$POLISH_MENTIONS"
+fi
+
+echo ""
+echo "--- Plan Understanding Quiz call site ---"
+
+QUIZ_AGENT="$PROJECT_ROOT/agents/plan-understanding-quiz.md"
+QUIZ_FILE_ARG='".humanize/quiz/quiz-segments.txt"'
+contains "start-rlcr-loop may run the polish script" "$START_CMD" '- "Bash(${CLAUDE_PLUGIN_ROOT}/scripts/polish-gemini.sh:*)"'
+contains "start-rlcr-loop may write the quiz segments file" "$START_CMD" '- "Write"'
+contains "start-rlcr-loop polishes the quiz text as segments, in place" "$START_CMD" \
+    "\"\${CLAUDE_PLUGIN_ROOT}/scripts/polish-gemini.sh\" --auto --format segments --input $QUIZ_FILE_ARG --output $QUIZ_FILE_ARG"
+contains "start-rlcr-loop keeps the answers out of the request" "$START_CMD" "Do not write ANSWER_1 or ANSWER_2."
+contains "start-rlcr-loop never blocks the quiz on polishing" "$START_CMD" "Polishing never blocks the quiz"
+for item in "same claims;" "same negations and caveats;" "same obligation strength;" \
+    "same language and variant (English words inside Chinese, Japanese, or Korean text kept as written);" \
+    "every gloss only explains a term already present;" "nothing added that is not a gloss;" "nothing dropped;" \
+    "the correct option is still the only correct one"; do
+    contains "start-rlcr-loop quiz checklist has '$item'" "$START_CMD" "- $item"
+done
+contains "start-rlcr-loop falls back to a whole original question" "$START_CMD" "use the original text of that question and all four of its options"
+contains "start-rlcr-loop keeps the answer letters" "$START_CMD" "so ANSWER_1 and ANSWER_2 stay as they are"
+contains "quiz agent asks for plain words" "$QUIZ_AGENT" "- Written in plain words"
+contains "quiz agent keeps each field on one line" "$QUIZ_AGENT" "Keep each field on a single line"
+
+L_PARSE="$(grep -n '^3\. \*\*Parse the result\*\*: Extract all 13 fields' "$START_CMD" | cut -d: -f1)"
+L_POLISH="$(grep -n '^### Polish the quiz text$' "$START_CMD" | cut -d: -f1)"
+L_ASK="$(grep -n '^### Ask questions and evaluate$' "$START_CMD" | cut -d: -f1)"
+if [[ -n "$L_PARSE" && -n "$L_POLISH" && -n "$L_ASK" ]] && (( L_PARSE < L_POLISH && L_POLISH < L_ASK )); then
+    pass "the quiz is polished after it is parsed and before it is asked"
+else
+    fail "quiz polish step order" "parse < polish < ask" "$L_PARSE / $L_POLISH / $L_ASK"
+fi
+
+# The segment layout in the command parses with the guard, with the IDs in order.
+QUIZ_LAYOUT="$(sed -n '/^### Polish the quiz text$/,/^### Ask questions and evaluate$/p' "$START_CMD" | \
+    sed -n 's/^ *\(\[\[[a-z0-9]*\]\]\) <\([A-Z0-9_]*\)>$/\1 Sample text for \2./p')"
+QUIZ_IDS="$(python3 -I -c 'import sys
+sys.path.insert(0, sys.argv[1])
+import polish_guard
+print(" ".join(seg_id for seg_id, _ in polish_guard.parse_segments(sys.stdin.read())))' \
+    "$PROJECT_ROOT/scripts/lib" <<< "$QUIZ_LAYOUT" 2>&1)"
+if [[ "$QUIZ_IDS" == "q1 q1a q1b q1c q1d q2 q2a q2b q2c q2d summary" ]]; then
+    pass "the quiz segment layout parses with 11 IDs in order"
+else
+    fail "quiz segment layout" "q1 q1a ... summary" "$QUIZ_IDS"
+fi
+if ! grep -q 'ANSWER' <<< "$QUIZ_LAYOUT"; then
+    pass "the quiz segment layout holds no answer field"
+else
+    fail "quiz layout without answers" "no ANSWER fields" "$QUIZ_LAYOUT"
+fi
+
+# With no API key the quiz segments file stays byte-identical.
+QUIZ_DIR="$TEST_DIR/quiz-project"
+mkdir -p "$QUIZ_DIR/.humanize/quiz"
+printf '%s\n' "$QUIZ_LAYOUT" > "$QUIZ_DIR/.humanize/quiz/quiz-segments.txt"
+cp "$QUIZ_DIR/.humanize/quiz/quiz-segments.txt" "$TEST_DIR/quiz-before.txt"
+QUIZ_ERR="$(cd "$QUIZ_DIR" && env -u OPENROUTER_API_KEY CLAUDE_PROJECT_DIR="$QUIZ_DIR" XDG_CACHE_HOME="$QUIZ_DIR/.cache" \
+    XDG_CONFIG_HOME="$TEST_DIR/xdg" HUMANIZE_POLISH_BASE_URL="http://127.0.0.1:9/api/v1" \
+    "$RUNNER" --auto --format segments --input ".humanize/quiz/quiz-segments.txt" --output ".humanize/quiz/quiz-segments.txt" 2>&1 >/dev/null)"
+QUIZ_RC=$?
+if [[ "$QUIZ_RC" == "0" ]] && cmp -s "$TEST_DIR/quiz-before.txt" "$QUIZ_DIR/.humanize/quiz/quiz-segments.txt" && \
+   [[ "$(tail -n 1 <<< "$QUIZ_ERR")" == "polish-gemini: outcome=skipped reason=no_api_key delivered=yes" ]]; then
+    pass "without an API key the quiz segments file is left byte-identical"
+else
+    fail "no key leaves the quiz segments unchanged" "exit 0, skipped no_api_key" "exit $QUIZ_RC: $QUIZ_ERR"
 fi
 
 echo ""
@@ -321,6 +390,8 @@ done
 contains "usage doc names the documentation scenario" "$USAGE_DOC" "1. **Writing documentation**"
 contains "usage doc names the web page scenario" "$USAGE_DOC" "2. **Making web pages**"
 contains "usage doc names the finalize summary scenario" "$USAGE_DOC" "3. **Writing the RLCR finalize summary**"
+contains "usage doc names the quiz scenario" "$USAGE_DOC" "4. **Asking the Plan Understanding Quiz**"
+contains "usage doc quiz section mentions polishing" "$USAGE_DOC" "the questions, options, and plan summary are also polished for readability"
 contains "usage doc explains the --auto rule" "$USAGE_DOC" "\`--auto\` marks an automatic call site."
 contains "usage doc explains API key setup" "$USAGE_DOC" "#### API key setup"
 contains "usage doc states the guard's limits" "$USAGE_DOC" "The guard cannot prove that meaning is unchanged."
@@ -343,6 +414,7 @@ FEATURE_FILES=(
     "prompt-template/gemini/polish-format-markdown.md" "prompt-template/gemini/polish-format-text.md"
     "prompt-template/gemini/polish-format-segments.md" "prompt-template/gemini/polish-format-html.md"
     "prompt-template/claude/finalize-phase-prompt.md" "prompt-template/claude/finalize-phase-skipped-prompt.md"
+    "commands/start-rlcr-loop.md" "agents/plan-understanding-quiz.md"
     "skills/polish-gemini/SKILL.md" "config/default_config.json" "hooks/loop-codex-stop-hook.sh"
     "docs/usage.md" "docs/polish-guard-rules.md" "README.md" ".claude-plugin/plugin.json" ".claude-plugin/marketplace.json"
     "tests/test-polish-gemini.sh" "tests/test-polish-gemini-guard.sh" "tests/test-polish-gemini-integration.sh"

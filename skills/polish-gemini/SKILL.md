@@ -18,7 +18,7 @@ Gemini acts only as a copy editor. The request carries no tools, so Gemini canno
 - **Documentation written for people**: README files, files under `docs/`, guides, reports, release notes, and other Markdown or text documents meant for human readers.
 - **Web pages**: `.html` files are handled automatically by the HTML adapter. Component and template files (JSX, TSX, Vue, Svelte and similar) use the manual segments procedure below.
 
-The RLCR finalize summary is the third default scenario. The finalize prompt runs it for you; you do not need this skill for it.
+The RLCR finalize summary and the Plan Understanding Quiz are the other two default scenarios. The finalize prompt and the `start-rlcr-loop` command run them for you; you do not need this skill for them.
 
 With `--auto`, the script respects `gemini_polish_enabled` in the humanize config and skips when it is `false`.
 

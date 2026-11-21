@@ -3,7 +3,9 @@ description: "Start iterative loop with Codex review"
 argument-hint: "[path/to/plan.md | --plan-file path/to/plan.md] [--max N] [--codex-model MODEL:EFFORT] [--codex-timeout SECONDS] [--track-plan-file] [--push-every-round] [--base-branch BRANCH] [--full-review-round N] [--skip-impl] [--claude-answer-codex] [--agent-teams] [--yolo] [--skip-quiz] [--privacy]"
 allowed-tools:
   - "Bash(${CLAUDE_PLUGIN_ROOT}/scripts/setup-rlcr-loop.sh:*)"
+  - "Bash(${CLAUDE_PLUGIN_ROOT}/scripts/polish-gemini.sh:*)"
   - "Read"
+  - "Write"
   - "Task"
   - "AskUserQuestion"
 ---
@@ -85,24 +87,64 @@ Before running the setup script, verify the user genuinely understands what the 
 
 3. **Parse the result**: Extract all 13 fields from the agent output (QUESTION_1, OPTION_1A through OPTION_1D, ANSWER_1, QUESTION_2, OPTION_2A through OPTION_2D, ANSWER_2, PLAN_SUMMARY). If the output is malformed (any field missing or ANSWER not A/B/C/D), warn: "Plan understanding quiz unavailable, continuing without it." and proceed to the Setup section below.
 
+### Polish the quiz text
+
+The questions, options, and summary are written for people, so polish them for readability before you ask them. Polishing never blocks the quiz: whenever a step below fails, use the agent's original fields.
+
+4. Use the Write tool to write the 11 text fields to `.humanize/quiz/quiz-segments.txt`, one line per field, with these IDs and in this order. Do not write ANSWER_1 or ANSWER_2. Keep each field on one line (replace any line break inside a field with a space):
+   ```
+   [[q1]] <QUESTION_1>
+   [[q1a]] <OPTION_1A>
+   [[q1b]] <OPTION_1B>
+   [[q1c]] <OPTION_1C>
+   [[q1d]] <OPTION_1D>
+   [[q2]] <QUESTION_2>
+   [[q2a]] <OPTION_2A>
+   [[q2b]] <OPTION_2B>
+   [[q2c]] <OPTION_2C>
+   [[q2d]] <OPTION_2D>
+   [[summary]] <PLAN_SUMMARY>
+   ```
+
+5. Run the command below. A run can take a minute or more, so run it in the background (for example with the Bash tool's `run_in_background` option) and wait for it to finish:
+   ```bash
+   "${CLAUDE_PLUGIN_ROOT}/scripts/polish-gemini.sh" --auto --format segments --input ".humanize/quiz/quiz-segments.txt" --output ".humanize/quiz/quiz-segments.txt"
+   ```
+
+6. Read the last stderr line: `polish-gemini: outcome=<...> reason=<...> delivered=<...>`.
+   - If the outcome is `polished`, read `.humanize/quiz/quiz-segments.txt` and take each field's new text from the line with its ID. Compare every segment with the original field and check:
+     - same claims;
+     - same negations and caveats;
+     - same obligation strength;
+     - same language and variant (English words inside Chinese, Japanese, or Korean text kept as written);
+     - every gloss only explains a term already present;
+     - nothing added that is not a gloss;
+     - nothing dropped;
+     - the correct option is still the only correct one, and no option now stands out from the others (for example through a gloss the others lack) in a way that gives the answer away.
+
+     If a check fails for a question or any of its options, use the original text of that question and all four of its options. If a check fails for the summary, use the original summary.
+   - For any other outcome, use the original fields. If the reason is not `disabled`, tell the user in one line that the quiz text was not polished and why.
+
+   Polishing rewords the text but never moves an option to another letter, so ANSWER_1 and ANSWER_2 stay as they are. Use the resulting text in the steps below.
+
 ### Ask questions and evaluate
 
-4. Use AskUserQuestion to present QUESTION_1 as a multiple-choice question with the 4 options (OPTION_1A through OPTION_1D). Compare the user's choice against ANSWER_1:
+7. Use AskUserQuestion to present QUESTION_1 as a multiple-choice question with the 4 options (OPTION_1A through OPTION_1D). Compare the user's choice against ANSWER_1:
    - If the user selected the correct answer, mark QUESTION_1 as **PASS**
    - Otherwise, mark as **WRONG**
 
-5. Use AskUserQuestion to present QUESTION_2 as a multiple-choice question with the 4 options (OPTION_2A through OPTION_2D). Compare the user's choice against ANSWER_2 using the same criteria.
+8. Use AskUserQuestion to present QUESTION_2 as a multiple-choice question with the 4 options (OPTION_2A through OPTION_2D). Compare the user's choice against ANSWER_2 using the same criteria.
 
 ### Decide whether to proceed
 
-6. **If both questions PASS**: Briefly acknowledge ("Your understanding of the plan looks solid. Proceeding with setup.") and continue to the Setup section below.
+9. **If both questions PASS**: Briefly acknowledge ("Your understanding of the plan looks solid. Proceeding with setup.") and continue to the Setup section below.
 
-7. **If one or both questions are WRONG**: Show the PLAN_SUMMARY to the user to help them understand what the plan does and the correct answers to the questions they missed. Then use AskUserQuestion with the question: "Would you like to proceed with the RLCR loop anyway, or stop and review the plan more carefully first?" with these choices:
-   - "Proceed with RLCR loop"
-   - "Stop and review the plan first"
+10. **If one or both questions are WRONG**: Show the PLAN_SUMMARY to the user to help them understand what the plan does and the correct answers to the questions they missed. Then use AskUserQuestion with the question: "Would you like to proceed with the RLCR loop anyway, or stop and review the plan more carefully first?" with these choices:
+    - "Proceed with RLCR loop"
+    - "Stop and review the plan first"
 
-   - If the user chooses **"Proceed with RLCR loop"**: Continue to the Setup section below.
-   - If the user chooses **"Stop and review the plan first"**: Report "Stopping. Please review the plan file and re-run start-rlcr-loop when ready." and **stop the command**.
+    - If the user chooses **"Proceed with RLCR loop"**: Continue to the Setup section below.
+    - If the user chooses **"Stop and review the plan first"**: Report "Stopping. Please review the plan file and re-run start-rlcr-loop when ready." and **stop the command**.
 
 ---
 

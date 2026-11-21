@@ -32,6 +32,8 @@ When you run `start-rlcr-loop`, an independent agent analyzes the plan and gener
 
 If you answer both correctly, the loop proceeds immediately. If you miss one or both, Humanize explains what the plan actually does and offers a choice: proceed anyway, or stop and review.
 
+The agent is asked to write in plain words, and when [Gemini polishing](#polish-gemini) is on, the questions, options, and plan summary are also polished for readability before you see them. The answers are not sent, and the options keep their letters.
+
 The quiz is advisory, not a gate. You always have the option to proceed. But that moment of friction -- the two seconds it takes to read the question and realize you do not know the answer -- is the entire point.
 
 ### Skipping the Quiz
@@ -293,11 +295,12 @@ Gemini acts only as a copy editor:
 
 #### When it runs
 
-Polishing is on by default (`gemini_polish_enabled: true`) in three scenarios, where Claude runs it with `--auto`:
+Polishing is on by default (`gemini_polish_enabled: true`) in four scenarios, where Claude runs it with `--auto`:
 
 1. **Writing documentation** for people: README files, files under `docs/`, guides, reports, release notes.
 2. **Making web pages**: `.html` files are handled by the HTML adapter. Component files (JSX, TSX, Vue, Svelte) use the skill's manual segments procedure.
 3. **Writing the RLCR finalize summary**: the finalize prompt tells Claude to polish `finalize-summary.md`. Round summaries are never polished.
+4. **Asking the Plan Understanding Quiz**: `start-rlcr-loop` writes the questions, options, and plan summary to `.humanize/quiz/quiz-segments.txt` and polishes them with `--format segments` before it asks them. The answer letters are not sent. If a polished question or option fails Claude's review, its original text is used.
 
 Everything else (chat replies, commit messages, PR descriptions, code comments, idea drafts, plans) is polished only when you ask. Plan files, round summaries, the goal tracker, review results, QA ledgers, code, and config are never polished automatically because tools parse them.
 
@@ -391,7 +394,7 @@ Each run that sends a request writes `.humanize/skill/<timestamp>-<pid>-<hex>/` 
 
 #### Privacy and cost
 
-- **Privacy**: polishing is on by default, so in the three default scenarios the document text is sent to OpenRouter and on to Google. Local copies of each run are kept under `.humanize/skill/` (gitignored). Set `gemini_polish_enabled` to `false` to stop automatic polishing.
+- **Privacy**: polishing is on by default, so in the four default scenarios the document text is sent to OpenRouter and on to Google. Local copies of each run are kept under `.humanize/skill/` (gitignored). Set `gemini_polish_enabled` to `false` to stop automatic polishing.
 - **Cost and time**: reasoning effort `xhigh` is slow and costs money, and the amount of reasoning varies from run to run. In tests on 2026-11-18, short documents (one to three paragraphs) took 12 seconds to 2 minutes and cost $0.02 to $0.14 (about 1,700 to 18,000 reasoning tokens), and a six-section document took about 2 minutes and cost about $0.15 (about 17,000 reasoning tokens). With `max_tokens` at 8,000, one request ran out of tokens before answering, which is why the default is 131,072. Lowering `gemini_polish_reasoning_effort` (for example to `high` or `medium`) reduces both time and cost.
 
 #### Environment variables

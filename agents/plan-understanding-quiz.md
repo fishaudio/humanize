@@ -40,6 +40,7 @@ Create exactly 2 multiple-choice questions that test the user's understanding of
 - A user who has carefully read and understood the plan should pick the correct answer
 - A user who just skimmed the title or blindly accepted a generated plan would likely pick wrong
 - Wrong options should be plausible (not obviously absurd) but clearly incorrect to someone who read the plan
+- Written in plain words: avoid jargon and internal shorthand, or explain a term briefly where it first appears, so the question tests understanding of the plan rather than of its vocabulary
 
 **Example good questions:**
 - "How does this plan integrate the new validation step into the startup flow?" with options covering different integration approaches
@@ -52,7 +53,7 @@ Create exactly 2 multiple-choice questions that test the user's understanding of
 
 ### Generate Plan Summary
 
-Write a 2-3 sentence summary explaining what the plan does and how, suitable for educating a user who showed gaps in understanding. Focus on the technical approach, not just the goal.
+Write a 2-3 sentence summary in plain words explaining what the plan does and how, suitable for educating a user who showed gaps in understanding. Focus on the technical approach, not just the goal.
 
 ## Output Format
 
@@ -77,6 +78,7 @@ PLAN_SUMMARY: <2-3 sentence technical summary>
 ## Important Notes
 
 - Always output all 13 fields - never skip any
+- Keep each field on a single line; the start-rlcr-loop command may send the question, option, and summary text to Gemini for a readability polish before showing it
 - ANSWER must be exactly one letter: A, B, C, or D
 - Randomize the position of the correct answer (do not always put it in A or D)
 - The plan may be written in any language - generate questions and options in the same language as the plan
