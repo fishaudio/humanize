@@ -344,7 +344,7 @@ FEATURE_FILES=(
     "prompt-template/gemini/polish-format-segments.md" "prompt-template/gemini/polish-format-html.md"
     "prompt-template/claude/finalize-phase-prompt.md" "prompt-template/claude/finalize-phase-skipped-prompt.md"
     "skills/polish-gemini/SKILL.md" "config/default_config.json" "hooks/loop-codex-stop-hook.sh"
-    "docs/usage.md" "README.md" ".claude-plugin/plugin.json" ".claude-plugin/marketplace.json"
+    "docs/usage.md" "docs/polish-guard-rules.md" "README.md" ".claude-plugin/plugin.json" ".claude-plugin/marketplace.json"
     "tests/test-polish-gemini.sh" "tests/test-polish-gemini-guard.sh" "tests/test-polish-gemini-integration.sh"
     "tests/polish-guard-cases.py" "tests/polish-runner-cases.py" "tests/mocks/openrouter-mock.py"
     "tests/manual-polish-gemini-real.sh"
