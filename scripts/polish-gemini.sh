@@ -115,8 +115,15 @@ cleanup_temps() {
         fi
     done
     TEMP_FILES=(${left[@]+"${left[@]}"})
-    IN_DELIVERY="$deferred"
-    if [[ "$deferred" != "true" && -n "$PENDING_SIGNAL" ]]; then
+    resume_signals "$deferred"
+}
+
+# resume_signals SAVED: end a stretch in which signals were only recorded by
+# restoring IN_DELIVERY to SAVED. A signal recorded meanwhile is honored now,
+# unless delivery was already under way.
+resume_signals() {
+    IN_DELIVERY="$1"
+    if [[ "$1" != "true" && -n "$PENDING_SIGNAL" ]]; then
         on_signal "$PENDING_SIGNAL"
     fi
 }
@@ -148,6 +155,8 @@ on_signal() {
 # Signals stay deferred until the process exits, so a signal at any point in
 # here still yields exactly one outcome line and exit code 130 or 143. The
 # outcome describes what was delivered; the exit code reports the interruption.
+# Early exits before delivery use it too; no signal can be pending there,
+# because cleanup_temps honors any recorded signal first.
 finish_delivery() {
     cleanup_temps
     if [[ -n "$PENDING_SIGNAL" ]]; then
@@ -235,10 +244,7 @@ make_temp() {
             break
         fi
     done
-    IN_DELIVERY="$deferred"
-    if [[ "$deferred" != "true" && -n "$PENDING_SIGNAL" ]]; then
-        on_signal "$PENDING_SIGNAL"
-    fi
+    resume_signals "$deferred"
     [[ -n "$TEMP_PATH" ]]
 }
 
@@ -309,7 +315,6 @@ is_effort() {
 # ========================================
 
 INPUT=""
-INPUT_SET=false
 OUTPUT=""
 FORMAT=""
 AUTO=false
@@ -335,7 +340,6 @@ while [[ $# -gt 0 ]]; do
         --input)
             require_value "$1" "$#"
             INPUT="$2"
-            INPUT_SET=true
             shift 2
             ;;
         --output)
@@ -388,7 +392,7 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "$INPUT_SET" != "true" || -z "$INPUT" ]]; then
+if [[ -z "$INPUT" ]]; then
     usage_error "--input is required (a file path, or - for stdin)"
 fi
 if [[ "$INPUT" != "-" ]]; then
@@ -514,7 +518,6 @@ MAX_BYTES="$(resolve_int "$CLI_MAX_BYTES" "$CFG_MAX_BYTES" "$DEFAULT_MAX_BYTES" 
 BASE_URL="${HUMANIZE_POLISH_BASE_URL:-${CFG_BASE_URL:-$DEFAULT_BASE_URL}}"
 KEY_FILE="$CFG_KEY_FILE"
 
-ENABLED=true
 case "$CFG_ENABLED" in
     ""|true) ENABLED=true ;;
     false) ENABLED=false ;;
@@ -549,16 +552,12 @@ deliver_original() {
     if [[ "$INPUT" == "-" ]]; then
         if ! make_temp "${TMPDIR:-/tmp}" "polish-gemini-in."; then
             diag "could not create a temporary file for standard input"
-            cleanup_temps
-            emit_outcome failed delivery_error no
-            exit "${PENDING_SIGNAL:-4}"
+            finish_delivery failed delivery_error no 4
         fi
         src="$TEMP_PATH"
         if ! cat > "$src"; then
             diag "could not copy standard input to a temporary file"
-            cleanup_temps
-            emit_outcome failed delivery_error no
-            exit "${PENDING_SIGNAL:-4}"
+            finish_delivery failed delivery_error no 4
         fi
     fi
 
@@ -575,9 +574,7 @@ deliver_original() {
         fi
         if [[ "$same_file" != "true" ]] && ! [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
             diag "could not read the file mode for $OUTPUT"
-            cleanup_temps
-            emit_outcome failed delivery_error no
-            exit "${PENDING_SIGNAL:-4}"
+            finish_delivery failed delivery_error no 4
         fi
     fi
 
@@ -772,10 +769,7 @@ open_ready_pipe() {
             fi
         done
     done
-    IN_DELIVERY="$deferred"
-    if [[ "$deferred" != "true" && -n "$PENDING_SIGNAL" ]]; then
-        on_signal "$PENDING_SIGNAL"
-    fi
+    resume_signals "$deferred"
     return "$opened"
 }
 
