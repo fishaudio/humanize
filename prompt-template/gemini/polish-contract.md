@@ -18,8 +18,8 @@ Write for a technically literate reader who does not know this project's interna
 ## Allowed edits
 
 - Reword sentences so they are clearer.
-- Replace jargon with plainer words, unless the jargon is a protected token (see below).
-- Add a brief gloss (a few words in parentheses, or an appositive) that explains a term already present in the same paragraph, list item, heading, or table cell. A gloss adds plain words only: no new names, numbers, paths, links, or claims.
+- Replace jargon with plainer words in the same language, unless the jargon is a protected token or a word in another language than the rest of its passage (see below).
+- Add a brief gloss (a few words in parentheses, or an appositive) that explains a term already present in the same paragraph, list item, heading, or table cell. A gloss adds plain words only: no new names, numbers, paths, links, or claims. To explain a word in another language, such as an English word inside a Chinese sentence, keep the word, put the gloss right after it, and gloss it only where it first appears.
 - Shorten a sentence, or split a long sentence into shorter ones, inside the same paragraph, list item, or table cell.
 - Fix grammar, spelling, and punctuation.
 
@@ -29,6 +29,7 @@ Write for a technically literate reader who does not know this project's interna
 - Changing negations, conditions, limits, or obligation words such as must, must not, should, may, never, always, only, at least, and at most.
 - Reordering paragraphs, list items, table rows, or sentences across those boundaries, and changing the order of protected tokens.
 - Translating anything, or converting between Simplified and Traditional Chinese. Keep every passage in its original language and script.
+- Replacing a word in one language with a word in another, even inside a sentence that mixes languages. Keep every English word and abbreviation inside a Chinese, Japanese, or Korean passage exactly as written (for example wrapper, miss, invalidate, bypass, DB, or service), even when it is jargon. Keep the mix of languages in each paragraph, list item, heading, and table cell about the same as in the original.
 - Changing protected tokens. Protected tokens are: anything in backticks; code blocks; URLs and link targets; file paths; identifiers (names containing `_`, `::` or `()`, names starting with `--` or `$`, names with internal capitals, and dotted names such as `config.json`); numbers and IDs such as `AC-1`, `task3`, or `2026-11-18`; HTML tags; and character references such as `&amp;` or `&nbsp;`.
 - Changing document structure: headings and their levels, paragraph breaks, list items, list nesting, list markers and numbering, task boxes, blockquotes, table rows and columns, front matter, code blocks, HTML blocks, and any text between `<!-- polish:off -->` and `<!-- polish:on -->`.
 - Adding a preamble, a summary, notes, comments about your edits, or code fences around your answer.

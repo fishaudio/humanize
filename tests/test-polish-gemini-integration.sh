@@ -49,6 +49,8 @@ contains "contract forbids adding or removing facts" "$CONTRACT" "Adding or remo
 contains "contract forbids changing negations and obligations" "$CONTRACT" "Changing negations, conditions, limits, or obligation words"
 contains "contract forbids translation and script conversion" "$CONTRACT" "Translating anything, or converting between Simplified and Traditional Chinese."
 contains "contract has the language rule" "$CONTRACT" "Keep every passage in its original language and script."
+contains "contract keeps English words inside CJK passages" "$CONTRACT" "Keep every English word and abbreviation inside a Chinese, Japanese, or Korean passage exactly as written"
+contains "contract keeps the language mix of each block" "$CONTRACT" "Keep the mix of languages in each paragraph, list item, heading, and table cell about the same as in the original."
 contains "contract forbids preambles" "$CONTRACT" "Adding a preamble, a summary, notes, comments about your edits, or code fences around your answer."
 contains "contract asks for the envelope only" "$CONTRACT" "Reply with exactly one block and nothing before or after it"
 contains "contract says there are no tools" "$CONTRACT" "You have no tools."

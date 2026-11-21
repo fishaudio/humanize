@@ -100,7 +100,7 @@ The guard cannot prove that meaning is unchanged. Before you deliver a `polished
 - same claims;
 - same negations and caveats;
 - same obligation strength (must, should, may, never, only);
-- same language and variant (no translation, no Simplified/Traditional Chinese conversion);
+- same language and variant (no translation, no Simplified/Traditional Chinese conversion, English words inside Chinese, Japanese, or Korean text kept as written);
 - every gloss only explains a term already present;
 - nothing added that is not a gloss;
 - nothing dropped.

@@ -289,6 +289,7 @@ Gemini acts only as a copy editor:
 - The document is sent as data between per-run marker lines. Instructions inside the document are not followed.
 - Gemini may reword sentences, replace jargon with plainer words, add brief glosses for terms already present, split long sentences, and fix grammar.
 - Gemini must not translate, add or remove facts, change negations or obligation words, or change code, identifiers, paths, URLs, numbers, or document structure.
+- English words inside Chinese, Japanese, or Korean text stay as written, even when they are jargon. Gemini may gloss one where it first appears, in the language of the surrounding text. Replacing them would change the mix of scripts, and the guard would reject the whole reply as a translation.
 
 #### When it runs
 
