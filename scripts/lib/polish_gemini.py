@@ -222,12 +222,6 @@ FORMAT_NAMES = {
     "segments": "segments",
     "html": "segments taken from an HTML page",
 }
-FORMAT_TEMPLATES = {
-    "markdown": "polish-format-markdown.md",
-    "text": "polish-format-text.md",
-    "segments": "polish-format-segments.md",
-    "html": "polish-format-html.md",
-}
 REJECTION_WORDS = ("unsupported", "not supported", "invalid", "must be one of",
                    "allowed values", "not allowed", "unknown", "enum", "expected one of",
                    "not a valid", "is not one of")
@@ -308,6 +302,13 @@ def one_line(text, limit=1000):
     if text.lstrip().startswith("outcome="):
         text = "note: " + text
     return text
+
+
+def emit_outcome(outcome, reason, delivered):
+    """Print the final outcome line on stderr."""
+    sys.stderr.write("%s outcome=%s reason=%s delivered=%s\n"
+                     % (PREFIX, outcome, reason, "yes" if delivered else "no"))
+    sys.stderr.flush()
 
 
 def _mask_signals_in_thread():
@@ -414,15 +415,19 @@ def valid_key(value):
     return bool(value) and bool(re.match(r"^[\x21-\x7e]+$", value))
 
 
-def is_effort_rejection(raw_body):
-    """True only when an HTTP 400 body explicitly rejects the effort value xhigh."""
+def _error_obj(raw_body):
+    """The "error" object of a JSON error body, or {} when there is none."""
     try:
         data = json.loads(raw_body.decode("utf-8", "replace"))
     except ValueError:
-        return False
-    if not isinstance(data, dict) or not isinstance(data.get("error"), dict):
-        return False
-    err = data["error"]
+        return {}
+    err = data.get("error") if isinstance(data, dict) else None
+    return err if isinstance(err, dict) else {}
+
+
+def is_effort_rejection(raw_body):
+    """True only when an HTTP 400 body explicitly rejects the effort value xhigh."""
+    err = _error_obj(raw_body)
     texts = []
     if isinstance(err.get("message"), str):
         texts.append(err["message"])
@@ -479,16 +484,9 @@ def classify_exception(exc):
 
 
 def api_error_message(raw_body):
-    try:
-        data = json.loads(raw_body.decode("utf-8", "replace"))
-    except ValueError:
-        return ""
-    if isinstance(data, dict) and isinstance(data.get("error"), dict):
-        msg = data["error"].get("message")
-        if isinstance(msg, str):
-            # Not truncated here: diag() redacts the key first, then truncates.
-            return msg
-    return ""
+    msg = _error_obj(raw_body).get("message")
+    # Not truncated here: diag() redacts the key first, then truncates.
+    return msg if isinstance(msg, str) else ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -621,7 +619,6 @@ class Runner(object):
         self.opts = opts
         self.key = None
         self.record = None
-        self.records_note_done = False
         self.delivered = False
         self.outcome_emitted = False
         self.temp_paths = []
@@ -630,7 +627,6 @@ class Runner(object):
         self.usage = {}
         self.started = time.time()
         self.deadline = None
-        self.candidate_raw = None
         self.format = ""
 
     # -- messages -----------------------------------------------------------
@@ -652,9 +648,7 @@ class Runner(object):
         if self.outcome_emitted:
             return
         self.outcome_emitted = True
-        sys.stderr.write("%s outcome=%s reason=%s delivered=%s\n"
-                         % (PREFIX, outcome, reason, "yes" if delivered else "no"))
-        sys.stderr.flush()
+        emit_outcome(outcome, reason, delivered)
 
     # -- entry --------------------------------------------------------------
 
@@ -787,7 +781,6 @@ class Runner(object):
         system_msg, user_msg, markers = self._build_messages(fmt, payload)
         self._open_record(fmt, len(data))
         content = self._request(system_msg, user_msg)
-        self.candidate_raw = content
         if self.record is not None:
             self.record.write_skill_file("candidate.txt", content)
         body = self._extract_envelope(content, markers)
@@ -855,7 +848,7 @@ class Runner(object):
             "OUTPUT_END": "%sOUTPUT-END-%s@@" % (MARKER_FAMILY, nonce),
         }
         values = dict(markers)
-        values["FORMAT_RULES"] = self._load_template(FORMAT_TEMPLATES[fmt]).strip()
+        values["FORMAT_RULES"] = self._load_template("polish-format-%s.md" % fmt).strip()
         values["FORMAT_NAME"] = FORMAT_NAMES[fmt]
         system_msg = self._render(self._load_template("polish-contract.md"), values)
         preamble = self._render(self._load_template("polish-request.md"), values).strip()
@@ -923,16 +916,15 @@ class Runner(object):
         thread = threading.Thread(target=worker, name="polish-request")
         thread.daemon = True
         thread.start()
-        if not _SUPERVISOR:
-            if not done.wait(remaining):
+        # Without a supervising wrapper there is nothing to poll for, so one
+        # wait covers the whole budget (_supervisor_gone() is then False).
+        poll = SUPERVISOR_POLL if _SUPERVISOR else remaining
+        end = time.monotonic() + remaining
+        while not done.wait(min(poll, max(0.0, end - time.monotonic()))):
+            if _supervisor_gone():
+                _raise_interrupt(signal.SIGTERM, None)
+            if time.monotonic() >= end:
                 return "timeout", None
-        else:
-            end = time.monotonic() + remaining
-            while not done.wait(min(SUPERVISOR_POLL, max(0.0, end - time.monotonic()))):
-                if _supervisor_gone():
-                    _raise_interrupt(signal.SIGTERM, None)
-                if time.monotonic() >= end:
-                    return "timeout", None
         if "error" in holder:
             return "error", holder["error"]
         return "ok", holder["result"]
@@ -1191,8 +1183,6 @@ class Runner(object):
             return False
 
     def _finish_record(self, outcome, reason, delivered):
-        if self.record is None:
-            return
         if outcome in ("polished", "unchanged"):
             status = "success"
         elif outcome == "failed" and reason == "timeout":
@@ -1255,7 +1245,7 @@ def _rebuild_segments(text, segments):
     for line in text.split("\n"):
         m = guard.SEGMENT_RE.match(line)
         if m and m.group(1) in new_text:
-            out.append("[[%s]] %s" % (m.group(1), new_text[m.group(1)]))
+            out.append(guard.format_segments([(m.group(1), new_text[m.group(1)])]))
         else:
             out.append(line)
     return "\n".join(out)
@@ -1266,8 +1256,7 @@ def main(argv):
         opts = parse_options(argv)
     except UsageError as exc:
         sys.stderr.write("%s %s\n" % (PREFIX, one_line(exc)))
-        sys.stderr.write("%s outcome=failed reason=usage_error delivered=no\n" % PREFIX)
-        sys.stderr.flush()
+        emit_outcome("failed", "usage_error", False)
         return _exit_code_for(_STARTUP_SIGNALS[0]) if _STARTUP_SIGNALS else EXIT_USAGE
     rc = Runner(opts).run()
     if _DEFERRED_SIGNALS and rc in (EXIT_OK, EXIT_STRICT, EXIT_DELIVERY):

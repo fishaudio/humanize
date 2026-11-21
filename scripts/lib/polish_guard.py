@@ -27,11 +27,14 @@ This module performs no I/O and uses only the Python standard library.
 """
 
 import bisect
+import collections
 import html
 import html.entities
 import html.parser
 import hashlib
+import itertools
 import re
+import string
 import unicodedata
 
 # ----------------------------------------------------------------------------
@@ -48,10 +51,6 @@ SHORT_GROWTH_CHARS = 12
 # Script shares are compared only when a block has at least this many letters.
 SCRIPT_SHARE_MIN_LETTERS = 20
 SCRIPT_SHARE_TOLERANCE = 0.25
-
-POLISH_OFF = "<!-- polish:off -->"
-POLISH_ON = "<!-- polish:on -->"
-
 
 class GuardReject(Exception):
     """Raised when a candidate fails a fidelity check."""
@@ -116,10 +115,10 @@ def char_script(ch):
 
 def script_profile(text):
     counts = {}
-    for ch in text:
+    for ch, n in collections.Counter(text).items():
         s = char_script(ch)
         if s:
-            counts[s] = counts.get(s, 0) + 1
+            counts[s] = counts.get(s, 0) + n
     return counts
 
 
@@ -148,7 +147,6 @@ def check_scripts(src_text, cand_text, where):
 # Protected tokens and inline markup
 # ----------------------------------------------------------------------------
 
-CODE_SPAN_RE = re.compile(r"(?<!`)(`+)(?!`)(.+?)(?<!`)\1(?!`)", re.S)
 # Inline math, using the Pandoc rule: "$" opens when followed by a non-space,
 # and closes when preceded by a non-space and not followed by a digit. The
 # math may continue over soft line breaks inside one prose unit. So "$2 x + y$" is math, while in "$5 or $10" the second "$" is
@@ -167,8 +165,6 @@ POLISH_ON_RE = re.compile(r"<!--\s*polish:on\s*-->")
 # Placeholder for the two characters of a backslash escape: it keeps link
 # targets and URLs that contain an escape in one piece, but is not markup.
 ESCAPE_HOLD = "\ue000"
-# A fence opener or closer on a line, after any quote or list-marker prefix.
-FENCE_LINE_RE = re.compile(r"^(?:[ \t]*>)*[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)?(`{3,}|~{3,})(.*)$")
 POLISH_OFF_RE = re.compile(r"<!--\s*polish:off\s*-->")
 # Either marker, split so it can be renamed to an ordinary comment of the
 # same length ("polish-on"), which is how the renderers read it.
@@ -176,19 +172,22 @@ POLISH_MARKER_RE = re.compile(r"(<!--\s*polish):(o(?:n|ff)\s*-->)")
 # How many lines _md_starts_anew looks back for the quote depth of a
 # paragraph markdown-it may have open (past that, it may be open).
 MD_ANEW_LOOKBACK = 256
+# A list marker: a bullet, or a number of up to nine digits and "." or ")".
+_LIST_MARKER = r"(?:[-+*]|[0-9]{1,9}[.)])"
 # A line that starts with a list marker (past its indentation).
-LIST_MARKER_START_RE = re.compile(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
+LIST_MARKER_START_RE = re.compile(r"[ \t]*" + _LIST_MARKER + r"(?:[ \t]|$)")
 # A line markdown-it may read as a setext heading underline.
 SETEXT_LIKE_RE = re.compile(r"[ \t]{0,3}(?:=+|-+)[ \t]*$")
 # How many groups of bracket pairs that may be references (by label)
 # _emphasis_spans reads each way in every combination.
 MAYBE_LABEL_GROUPS = 3
 # ASCII punctuation that a backslash escapes in CommonMark.
-ESCAPABLE = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
+ESCAPABLE = frozenset(string.punctuation)
 AUTOLINK_RE = re.compile(
     r"<(?:[A-Za-z][A-Za-z0-9+.-]{1,31}:[^\s<>]*|[^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>")
 # Inline links and images are found by _scan_links, which balances brackets
-# and parentheses to any depth up to this limit.
+# and parentheses to any depth up to this limit; the parentheses of a link
+# destination nest up to it too, in both renderers.
 LINK_NESTING_LIMIT = 32
 REF_LINK_RE = re.compile(r"(!?)\[((?:\\.|[^\[\]\\])*)\]\[((?:\\.|[^\[\]\\])*)\]")
 FOOTNOTE_REF_RE = re.compile(r"\[\^[^\]\s]+\]")
@@ -204,21 +203,22 @@ _HTML_ATTR = (r"\s+[A-Za-z_:][A-Za-z0-9_.:-]*"
               r"(?:\s*=\s*(?:[^\s\"'=<>`]+|'[^']*'|\"[^\"]*\"))?")
 HTML_OPEN_TAG = r"<[A-Za-z][A-Za-z0-9-]*(?:" + _HTML_ATTR + r")*\s*/?>"
 HTML_CLOSE_TAG = r"</[A-Za-z][A-Za-z0-9-]*\s*>"
-# Raw inline HTML that is not an element tag: comments, processing
-# instructions, declarations and CDATA sections, each through its own
-# terminator (they may span lines). They are kept byte for byte.
-HTML_OTHER_RAW = (r"<!---?>|<!--.*?-->|<\?.*?\?>|<![A-Za-z][^>]*>"
-                  r"|<!\[CDATA\[.*?\]\]>")
-HTML_STRICT_TAG_RE = re.compile(HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
 _ELEMENT_TAG_RE = re.compile(HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG, re.S)
 # A malformed tag the strict grammar refuses (written so that a long run
 # of whitespace inside it is matched one way only, in linear time).
 _LOOSE_TAG = r"</?[A-Za-z][A-Za-z0-9-]*(?:\s[^<>]*)?/?>"
-HTML_TAG_RE = re.compile(
-    HTML_OTHER_RAW + "|" + HTML_OPEN_TAG + "|" + HTML_CLOSE_TAG + "|" + _LOOSE_TAG, re.S)
 _LOOSE_TAG_RE = re.compile(_LOOSE_TAG, re.S)
-ENTITY_RE = re.compile(r"&(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});")
+# A character reference after its "&".
+_ENTITY_BODY = r"(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});"
+ENTITY_RE = re.compile("&" + _ENTITY_BODY)
 URL_RE = re.compile(r"\b(?:https?|ftp|file)://[^\s<>\"'`]+|\bwww\.[^\s<>\"'`]+")
+
+# Horizontal space between a number and its unit (also no-break and thin
+# spaces), the gap that may also hold one line end, and the units.
+_HSPACE = r"[ \t\u00a0\u2007\u2009\u200a\u202f]"
+_QTY_GAP = _HSPACE + r"*(?:\n" + _HSPACE + r"*)?"
+_UNIT = (r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
+         r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)")
 
 WORD_TOKEN_RE = re.compile(
     r"""
@@ -230,9 +230,7 @@ WORD_TOKEN_RE = re.compile(
     | (?P<var>(?<![\w$])\$\{?[A-Za-z_]\w*\}?(?:\w+(?=\(\)))?(?:\(\)|(?:\.|::)\w+)*)
     | (?P<ident>(?<!\w)(?=\w*_)(?=\w*[A-Za-z0-9])\w+)
     | (?P<qty>(?<![\w.])\d+(?:\.\d+)?
-        [ \t\u00a0\u2007\u2009\u200a\u202f]*(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?
-               |months?|years?|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz
-               |s|h|d|B|k|K|M|G|x|%)
+        """ + _QTY_GAP + _UNIT + r"""
         (?![\w%]))
     | (?P<dotted>[\w-]+(?:\.[\w-]+)+)
     | (?P<camel>(?![A-Z]+s\b)[A-Za-z0-9]*(?:[a-z][A-Z]|[A-Z]{2}[a-z])[A-Za-z0-9]*)
@@ -249,10 +247,7 @@ WORD_TOKEN_RE = re.compile(
 # time quadratic in its length.
 LONG_RUN_RE = re.compile(
     r"(?:\$\{?)?[\w@+.:/~-]{80,}(?:\}?\(\)(?:\(\)|(?:\.|::)\w+)*|\}(?:\(\)|(?:\.|::)\w+)*"
-    r"|(?<=\d)[ \t\u00a0\u2007\u2009\u200a\u202f]*"
-    r"(?:\n[ \t\u00a0\u2007\u2009\u200a\u202f]*)?"
-    r"(?:ns|us|ms|secs?|seconds?|mins?|minutes?|hrs?|hours?|days?|weeks?|months?|years?"
-    r"|[KMGTP]i?B|kB|bytes?|bits?|[KMG]bps|px|rem|em|pt|[kMG]?Hz|s|h|d|B|k|K|M|G|x|%)(?![\w%]))?",
+    r"|(?<=\d)" + _QTY_GAP + _UNIT + r"(?![\w%]))?",
     re.A)
 
 # Slash pairs that are ordinary prose rather than paths.
@@ -268,10 +263,10 @@ UNDERSCORE_EMPHASIS_RE = re.compile(r"(?<![\w\\])(_{1,2})(?=[^\s_])(?:(?!\1).)+?
 MARKUP_TOKEN_KINDS = ("tag", "rawtag", "link", "image", "reflink", "autolink", "footnote", "escape")
 
 
-def _mask(chars, start, end):
+def _mask(chars, start, end, fill=" "):
     for k in range(start, end):
         if chars[k] != "\n":
-            chars[k] = " "
+            chars[k] = fill
 
 
 def _normalize_tag(tag):
@@ -297,9 +292,6 @@ def _skip_space(text, i):
     while i < len(text) and text[i] in " \t\n":
         i += 1
     return i
-
-
-OPAQUE_RE = re.compile(AUTOLINK_RE.pattern + "|" + HTML_STRICT_TAG_RE.pattern, re.S)
 
 
 def _opaque_end(text, i):
@@ -530,13 +522,6 @@ def _indented_quote_marker(line):
     return bool(run) and any(len(gap.expandtabs(4)) >= 4 for gap in re.findall(r"([ \t]*)>", run.group(0)))
 
 
-def _quoted_line(line):
-    """Whether ``line`` starts with a quote marker, also behind list
-    markers."""
-    rest = re.sub(r"^[ \t]*(?:(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$))+", "", line)
-    return rest.lstrip(" \t").startswith(">")
-
-
 def _unpaired_bracket(masked):
     """True when ``masked`` holds a square bracket with no partner outside
     code spans, autolinks and raw HTML (backslash escapes skipped)."""
@@ -666,10 +651,12 @@ def _html_terms(text):
 
 
 def _html_end(text, i):
-    """End of the raw inline HTML that starts at ``text[i]`` (a "<"), by the
-    grammar of HTML_STRICT_TAG_RE, or None. An opener that no terminator
-    follows fails at once, so many of them do not each scan to the end of
-    the text (as the lazy patterns of HTML_STRICT_TAG_RE do)."""
+    """End of the raw inline HTML that starts at ``text[i]`` (a "<"), or
+    None: a comment, processing instruction, declaration or CDATA section,
+    each through its own terminator (they may span lines), or an element
+    tag by the CommonMark grammar (_ELEMENT_TAG_RE). An opener that no
+    terminator follows fails at once, so many of them do not each scan to
+    the end of the text (as a lazy regular expression would)."""
     if text.startswith("<!-->", i):
         return i + 5
     if text.startswith("<!--->", i):
@@ -688,9 +675,9 @@ def _html_end(text, i):
 
 
 def _iter_html(text, loose=False):
-    """(start, end) of each raw inline HTML element in ``text``, as
-    HTML_STRICT_TAG_RE (or, with ``loose``, HTML_TAG_RE) finds them, in
-    linear time."""
+    """(start, end) of each raw inline HTML element in ``text`` (see
+    _html_end; with ``loose``, also a malformed tag that grammar refuses,
+    see _LOOSE_TAG), leftmost first and without overlaps, in linear time."""
     i = text.find("<")
     while i >= 0:
         end = _html_end(text, i)
@@ -785,7 +772,7 @@ def _mdit_destination(s, pos, mx):
             continue
         if c == "(":
             level += 1
-            if level > 32:
+            if level > LINK_NESTING_LIMIT:
                 return False, 0, ""
         if c == ")":
             if level == 0:
@@ -1415,11 +1402,11 @@ def _ref_readings(text, resolve=None, tex=False):
         if len(keys) == len(known):
             return out
 
-def _scan_inline(text, resolve=None):
+def _scan_inline(text):
     """Find code spans, TeX math and backslash escapes (see
     _inline_constructs, which also reads raw HTML, autolinks and link tails
     so that no code span starts inside them)."""
-    return [c for c in _inline_constructs(text, resolve=resolve) if c[0] in ("code", "math", "escape")]
+    return [c for c in _inline_constructs(text) if c[0] in ("code", "math", "escape")]
 
 
 def extract_tokens(text, labels=None, refs=None, maybe=None, url_marks=None, alt_masks=None):
@@ -1969,23 +1956,17 @@ def _pair_delimiters(stack, spans, literal, gfm=True):
         drop(run)
 
 
-def emphasis_structure(original, masked, labels=(), gfm=True):
-    """The emphasis a prose unit renders, independent of the words inside.
-
-    Delimiter runs are paired with the CommonMark rules. Runs inside a link
-    or image label pair only with each other (innermost label first), as a
-    label is closed before the text around it. The result is the nesting of
-    the spans (em and strong with their delimiter character, and del), with
-    siblings in sorted order so emphasis can move with its words, plus the
-    delimiters that stay literal. Moving a marker away from its word,
-    regrouping markers, or swapping ``*`` and ``_`` changes the result.
-    """
+def _pair_in_labels(original, masked, labels, gfm, literal):
+    """Emphasis spans (start, end, kind) of ``original`` with delimiter runs
+    found in ``masked``. Runs inside a link or image label (``labels``,
+    (start, end) of the text between the brackets) pair only with each
+    other, innermost label first, as a label is closed before the text
+    around it. Counts the delimiters that stay literal in ``literal``."""
     runs = _delimiter_runs(original, masked, gfm, frozenset(end for _, end in labels))
-    spans = []
-    literal = {}
     # Each run belongs to the smallest label that holds it (labels nest), found
-    # in one sweep over the runs and the labels sorted by start; the labels
-    # are then paired innermost first.
+    # in one sweep over the runs (in text order) and the labels sorted by
+    # start: past the labels that end before it, the innermost one still
+    # open holds it.
     bounds = sorted(set(labels), key=lambda lb: (lb[0], -lb[1]))
     groups = {lb: [] for lb in bounds}
     outside = []
@@ -1997,15 +1978,27 @@ def emphasis_structure(original, masked, labels=(), gfm=True):
             li += 1
         while open_labels and open_labels[-1][1] <= run["pos"]:
             open_labels.pop()
-        holder = None
-        for lb in reversed(open_labels):
-            if lb[0] <= run["pos"] < lb[1]:
-                holder = lb
-                break
-        (groups[holder] if holder is not None else outside).append(run)
+        (groups[open_labels[-1]] if open_labels else outside).append(run)
+    spans = []
     for lb in sorted(bounds, key=lambda lb: lb[1] - lb[0]):
         _pair_delimiters(groups[lb], spans, literal, gfm)
     _pair_delimiters(outside, spans, literal, gfm)
+    return spans
+
+
+def emphasis_structure(original, masked, labels=(), gfm=True):
+    """The emphasis a prose unit renders, independent of the words inside.
+
+    Delimiter runs are paired with the CommonMark rules. Runs inside a link
+    or image label pair only with each other (innermost label first), as a
+    label is closed before the text around it. The result is the nesting of
+    the spans (em and strong with their delimiter character, and del), with
+    siblings in sorted order so emphasis can move with its words, plus the
+    delimiters that stay literal. Moving a marker away from its word,
+    regrouping markers, or swapping ``*`` and ``_`` changes the result.
+    """
+    literal = {}
+    spans = _pair_in_labels(original, masked, labels, gfm, literal)
 
     # Spans nest properly; build the forest and describe it without order.
     spans.sort(key=lambda sp: (sp[0], -sp[1]))
@@ -2027,16 +2020,21 @@ def emphasis_structure(original, masked, labels=(), gfm=True):
     for idx in range(len(spans) - 1, -1, -1):
         text = spans[idx][2] + "(" + ",".join(sorted(desc.pop(c) for c in children[idx])) + ")"
         if len(text) > 200:
-            text = spans[idx][2] + "#" + hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
+            text = spans[idx][2] + "#" + _digest(text, errors="strict")
         desc[idx] = text
     forest = sorted(desc[c] for c in children[None])
     return forest, sorted(literal.items())
 
 
-def _blank_out(chars, start, end, fill):
-    for k in range(start, end):
-        if chars[k] != "\n":
-            chars[k] = fill
+def _digest(text, errors="surrogatepass"):
+    """A short SHA-256 digest of ``text`` in UTF-8 (32 hex digits)."""
+    return hashlib.sha256(text.encode("utf-8", errors)).hexdigest()[:32]
+
+
+def _joined(lines):
+    """``lines`` joined with line feeds, and the offset where each line
+    starts in the result (one more past the end)."""
+    return "\n".join(lines), [0] + list(itertools.accumulate(len(line) + 1 for line in lines))
 
 
 def hard_break_count(text):
@@ -2048,12 +2046,12 @@ def hard_break_count(text):
     chars = list(text)
     for kind, start, end, _ in _scan_inline(text):
         if kind in ("code", "math"):
-            _blank_out(chars, start, end, "\x02")
+            _mask(chars, start, end, "\x02")
     for regex in (INLINE_MATH_RE, AUTOLINK_RE):
         for m in regex.finditer("".join(chars)):
-            _blank_out(chars, m.start(), m.end(), "\x02")
+            _mask(chars, m.start(), m.end(), "\x02")
     for start, end in list(_iter_html("".join(chars))):
-        _blank_out(chars, start, end, "\x02")
+        _mask(chars, start, end, "\x02")
     count = 0
     for line in "".join(chars).split("\n")[:-1]:
         body = line.rstrip(" ")
@@ -2146,6 +2144,10 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
 
     ``refs`` is the document's (definite, possible) reference labels; None
     for a segment, whose references may or may not resolve."""
+    if src == cand:
+        n = visible_length(src)
+        check_ratio(n, n, block_ratio, where)
+        return n, n
     if markup_chars:
         for ch in "<>":
             if cand.count(ch) > src.count(ch):
@@ -2213,8 +2215,9 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
         raise GuardReject("inline_markup", "%s: hard line breaks changed" % where)
     check_scripts(src_masked, cand_masked, where)
     src_len = visible_length(src)
-    check_ratio(src_len, visible_length(cand), block_ratio, where)
-    return src_len, visible_length(cand)
+    cand_len = visible_length(cand)
+    check_ratio(src_len, cand_len, block_ratio, where)
+    return src_len, cand_len
 
 
 # ----------------------------------------------------------------------------
@@ -2224,13 +2227,12 @@ def compare_prose(src, cand, where, block_ratio=BLOCK_RATIO_BOUNDS, markup_chars
 RAW_KINDS = ("frontmatter", "fence", "math", "html", "protected", "footnote_def",
              "refdef", "hr", "table_sep", "table_raw", "indented_code", "quote_raw")
 
-QUOTE_PREFIX_RE = re.compile(r"^((?:[ ]{0,3}>[ ]?)+)")
 FENCE_RE = re.compile(r"^([ \t]*)(`{3,}|~{3,})(.*)$")
 ATX_RE = re.compile(r"^[ ]{0,3}(#{1,6})(?:[ \t]+(.*?))?(?:[ \t]+#+)?[ \t]*$")
 HR_RE = re.compile(r"^[ ]{0,3}([-*_])(?:[ \t]*\1){2,}[ \t]*$")
 SETEXT_RE = re.compile(r"^[ ]{0,3}(=+|-+)[ \t]*$")
 LIST_ITEM_RE = re.compile(
-    r"^(?P<indent>[ \t]*)(?P<marker>[-+*]|[0-9]{1,9}[.)])(?:[ \t]+|$)"
+    r"^(?P<indent>[ \t]*)(?P<marker>" + _LIST_MARKER + r")(?:[ \t]+|$)"
     r"(?P<task>\[[ xX]\](?:[ \t]+|$))?(?P<rest>.*)$")
 TABLE_SEP_RE = re.compile(r"^[ \t]*\|?[ \t]*:?-{1,}:?[ \t]*(?:\|[ \t]*:?-{1,}:?[ \t]*)*\|?[ \t]*$")
 FOOTNOTE_DEF_RE = re.compile(r"^[ ]{0,3}\[\^[^\]]+\]:")
@@ -2257,8 +2259,7 @@ _TITLE = (r"(?:\"(?:\\[\s\S]|[^\"\\])*\\?\"|'(?:\\[\s\S]|[^'\\])*\\?'"
 # A title that starts and ends on one line.
 _LINE_TITLE_RE = re.compile(_TITLE.replace(r"\s\S", r"^\n").replace(r"[^\"\\]", r"[^\"\\\n]")
                             .replace(r"[^'\\]", r"[^'\\\n]").replace(r"[^()\\]", r"[^()\\\n]"))
-_ASCII_PUNCT = frozenset("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~")
-_ASCII_SPACE = frozenset(" \t\n\x0b\x0c\r")
+_ASCII_SPACE = frozenset(string.whitespace)
 
 
 LABEL_SPACE = " \t\n\r"
@@ -2268,28 +2269,27 @@ def _label_ok(label):
     """Whether cmark-gfm takes ``label`` (between the brackets) as a link
     label: at most 1000 bytes of UTF-8, not only spaces, tabs and line
     ends (a vertical tab, form feed or no-break space is text)."""
-    return bool(label.strip(LABEL_SPACE)) and len(label.encode("utf-8", "surrogatepass")) <= 1000
+    return bool(label.strip(LABEL_SPACE)) and len(label.encode("utf-8", "surrogatepass")) <= REF_LABEL_LIMIT
 
 
-def _scan_destination(text, pos, balanced=False):
+def _scan_destination(text, pos):
     """End of the link destination that starts at ``pos``, or None, as
     cmark-gfm scans one: inside angle brackets, or a bare run that ends at
     ASCII whitespace or at a closing parenthesis with none open. A backslash
-    escapes ASCII punctuation; at most 32 parentheses may be open, and
-    parentheses still open where the run ends are allowed (``balanced``
-    rejects them, as markdown-it does)."""
+    escapes ASCII punctuation; at most LINK_NESTING_LIMIT parentheses may be
+    open, and parentheses still open where the run ends are allowed."""
     if text.startswith("<", pos):
         m = _POINTY_DEST_RE.match(text, pos)
         return m.end() if m else None
     i, depth = pos, 0
     while i < len(text):
         ch = text[i]
-        if ch == "\\" and i + 1 < len(text) and text[i + 1] in _ASCII_PUNCT:
+        if ch == "\\" and i + 1 < len(text) and text[i + 1] in ESCAPABLE:
             i += 2
             continue
         if ch == "(":
             depth += 1
-            if depth > 32:
+            if depth > LINK_NESTING_LIMIT:
                 return None
         elif ch == ")":
             if depth == 0:
@@ -2298,8 +2298,6 @@ def _scan_destination(text, pos, balanced=False):
         elif ch in _ASCII_SPACE:
             break
         i += 1
-    if balanced and depth:
-        return None
     return i if i > pos else None
 
 
@@ -2360,7 +2358,7 @@ def _mdit_scan_destination(text, pos, n):
             continue
         if ch == "(":
             depth += 1
-            if depth > 32:
+            if depth > LINK_NESTING_LIMIT:
                 return None
         elif ch == ")":
             if depth == 0:
@@ -2427,7 +2425,7 @@ def _mdit_definition_end(text, pos, limit=None):
     return None
 
 
-_MDIT_LIST_START_RE = re.compile(r"(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)")
+_MDIT_LIST_START_RE = re.compile(_LIST_MARKER + r"(?:[ \t]|$)")
 _MDIT_UNDERLINE_RE = re.compile(r"(?:=+|-+)[ \t]*$")
 _MDIT_BREAK_RE = re.compile(r"(?:(?:\*[ \t]*){3,}|(?:-[ \t]*){3,}|(?:_[ \t]*){3,})$")
 
@@ -2454,64 +2452,11 @@ def _mdit_interrupts(line, level):
     rest = expanded.lstrip(" ")
     if len(expanded) - len(rest) >= 4 or not rest:
         return False
-    if depth < level and re.match(r"(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", rest):
+    if depth < level and _MDIT_LIST_START_RE.match(rest):
         return True
     return bool(ATX_RE.match(rest) or FENCE_RE.match(rest) or HR_RE.match(rest)
                 or re.match(r"(?:[-+*]|1[.)])[ \t]+\S", rest)
                 or _is_html_start(rest, interrupt=True))
-
-
-def _mdit_opens_paragraph(text):
-    """Whether the block markdown-it starts with ``text`` (measured from
-    its container's content column) is, or ends in, a paragraph that a lazy
-    line may continue: quote and list markers at its start open containers
-    whose first block counts; a blank line, an empty list item, indented
-    code, a heading, a thematic break, a fence, an HTML block or a
-    definition is none."""
-    for _ in range(32):
-        rest = _expand_indent(text)
-        ind = _indent_of(rest)
-        if not rest.strip() or ind >= 4:
-            return False
-        rest = rest[ind:]
-        if rest.startswith(">"):
-            text = rest[2:] if rest[1:2] == " " else rest[1:]
-            continue
-        if ATX_RE.match(rest) or HR_RE.match(rest) or FENCE_RE.match(rest) or _is_html_start(rest):
-            return False
-        if rest.startswith("["):
-            # (A definition, as markdown-it reads it on that line.)
-            return _mdit_reading([rest], 0)[-1][0] == "paragraph"
-        mark = re.match(r"(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)", rest)
-        if mark:
-            inner = rest[mark.end():]
-            if not inner.strip() or _indent_of(inner) > 4:
-                return False
-            text = inner.lstrip(" ")
-            continue
-        return True
-    return False
-
-
-def _line_shape(text):
-    """A coarse kind for the first line of a block (after its containers):
-    blank, quote, list item, heading, fence, thematic break, HTML or text."""
-    rest = _expand_indent(text).lstrip(" ")
-    if not rest:
-        return "blank"
-    if rest.startswith(">"):
-        return "quote"
-    if FENCE_RE.match(rest):
-        return "fence"
-    if HR_RE.match(rest):
-        return "break"
-    if re.match(r"(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", rest):
-        return "item"
-    if ATX_RE.match(rest):
-        return "heading"
-    if _is_html_start(rest):
-        return "html"
-    return "text"
 
 
 def _column_bucket(ind, cols):
@@ -2522,17 +2467,6 @@ def _column_bucket(ind, cols):
     between the others)."""
     reach = sum(1 for c in cols if c <= ind)
     return reach, (ind - cols[-1] >= 4) if reach == len(cols) else None
-
-
-def _mdit_lazy_breaks(body):
-    """Whether ``body`` (a line past its quote markers, indented less than
-    the content column of the list item whose paragraph markdown-it has
-    open) ends that paragraph: markdown-it counts the indentation from that
-    column, so a heading, fence, thematic break, quote marker or HTML block
-    that may interrupt a paragraph does so at any indentation there."""
-    rest = _expand_indent(body).lstrip(" ")
-    return bool(rest) and bool(ATX_RE.match(rest) or FENCE_RE.match(rest) or HR_RE.match(rest)
-                               or rest.startswith(">") or _is_html_start(rest, interrupt=True))
 
 
 def _mdit_ends_paragraph(line, level, base, marker_indent=None):
@@ -2554,7 +2488,7 @@ def _mdit_ends_paragraph(line, level, base, marker_indent=None):
     if ind >= base:
         return _mdit_interrupts(_past_container(body, base), 0)
     return (marker_indent is not None and ind - marker_indent < 4
-            and bool(re.match(r"(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", body[ind:])))
+            and bool(_MDIT_LIST_START_RE.match(body[ind:])))
 
 
 _LOOSE_LABEL_RE = re.compile(r"\[((?:[^\[\]\\]|\\.)*)\]:", re.S)
@@ -2593,10 +2527,7 @@ def _spanned_lines(lines, ks, resolve=None):
     the span), so rewrapping the prose around a span keeps it."""
     if not ks:
         return ()
-    text = "\n".join(lines)
-    starts = [0]
-    for line in lines:
-        starts.append(starts[-1] + len(line) + 1)
+    text, starts = _joined(lines)
     found = []
     # (Every reading, with a choice the text does not meet read as not
     # taken: see _expanded_readings.)
@@ -2658,10 +2589,7 @@ def _mdit_reading(lines, base, continuing=None, quote_lazy=frozenset(), col_line
     bodies = [_expand_indent(line).lstrip(" ") for line in lines]
     cols = [_mdit_columns(line, base) for line in col_lines]
     list_lazy = [_indent_of(line) < base for line in col_lines]
-    text = "\n".join(stripped)
-    starts = [0]
-    for line in stripped:
-        starts.append(starts[-1] + len(line) + 1)
+    text, starts = _joined(stripped)
     # The first line after each line that ends a definition's lines.
     next_end = [n] * (n + 1)
     for k in range(n - 1, -1, -1):
@@ -3027,7 +2955,7 @@ REFDEF_LABEL_RE = re.compile(r"[ ]{0,3}\[((?:\\[\s\S]|[^\[\]\\])+)\]:")
 # A line in a protected region or footnote that may be a definition: the
 # label after any quote or list markers.
 LOOSE_REFDEF_RE = re.compile(
-    r"^(?:[ \t>]|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]))*\[(?!\^)((?:\\[\s\S]|[^\[\]\\])+)\]:", re.M)
+    r"^(?:[ \t>]|" + _LIST_MARKER + r"(?=[ \t]))*\[(?!\^)((?:\\[\s\S]|[^\[\]\\])+)\]:", re.M)
 
 
 def _loose_labels(text, first_only=False):
@@ -3142,20 +3070,9 @@ def _strip_quote(line, depth):
     is measured as CommonMark measures it.
     """
     _, _, pos, col, pending = _quote_walk(line, depth)
-    out = [" " * pending]
-    k = pos
-    while k < len(line) and line[k] in " \t":
-        width = 1 if line[k] == " " else 4 - col % 4
-        out.append(" " * width)
-        col += width
-        k += 1
-    return "".join(out) + line[k:]
-
-
-def _quote_rest(line, depth):
-    """``line`` after up to ``depth`` quote markers, with its bytes unchanged
-    (the text of a prose unit keeps its exact whitespace)."""
-    return line[_quote_walk(line, depth)[2]:]
+    rest = line[pos:].lstrip(" \t")
+    k = len(line) - len(rest)
+    return " " * pending + (" " * col + line[pos:k]).expandtabs(4)[col:] + rest
 
 
 def _loose_quote_end(line, depth):
@@ -3242,7 +3159,7 @@ def _odd_blank(line):
         line = line[:-1]
     if "\r" in line:
         return True
-    rest = re.sub(r"^(?:[ \t>]|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$))*", "", line).rstrip(" \t")
+    rest = line[STRUCT_PREFIX_RE.match(line).end():].rstrip(" \t")
     return bool(rest) and (rest[0].isspace() or rest[-1].isspace())
 
 
@@ -3253,6 +3170,12 @@ def _fence_opener(text):
     if m and (m.group(2)[0] == "~" or "`" not in m.group(3)):
         return m.group(2)[0], len(m.group(2))
     return None
+
+
+def _closes_fence(text, char, length):
+    """Whether ``text`` closes a fence of ``length`` ``char`` characters: a
+    run of at least that many of them, then only spaces and tabs."""
+    return re.match(re.escape(char) + "{%d,}[ \t]*$" % length, text) is not None
 
 
 def _is_table_sep(line):
@@ -3335,7 +3258,7 @@ def _plain_text_line(text):
 
 # A content line that may start a reference definition, after any quote and
 # list markers.
-MAYBE_REFDEF_LINE_RE = re.compile(r"^[ \t>]*(?:(?:[-+*]|[0-9]{1,9}[.)])[ \t]+)*\[(?!\^)")
+MAYBE_REFDEF_LINE_RE = re.compile(r"^[ \t>]*(?:" + _LIST_MARKER + r"[ \t]+)*\[(?!\^)")
 
 
 def _lazy_stand_in(lazy):
@@ -3376,17 +3299,6 @@ def _end_state(blocks, nlines):
         if end_re is not None and not end_re.search("\n".join(raw_lines)):
             return "raw_open"
     return "closed"
-
-FENCE_CLOSE_RE = re.compile(r"^(`{3,}|~{3,})[ \t]*$")
-
-
-def _is_fence_open(text):
-    fm = FENCE_RE.match(text)
-    if not fm:
-        return None
-    if fm.group(2)[0] == "`" and "`" in fm.group(3):
-        return None
-    return fm.group(2)
 
 
 def _html_end_marker(body):
@@ -3463,10 +3375,7 @@ def _read_definitions(content, parsed_only=False, lazy=None):
     # stopped reading definitions: the ones after it only possibly count.
     unsure = False
     kept = {}
-    joined = "\n".join(parts)
-    starts = [0]
-    for part in parts:
-        starts.append(starts[-1] + len(part) + 1)
+    joined, starts = _joined(parts)
     while k < len(parts):
         if FOOTNOTE_DEF_RE.match(parts[k]) or not REFDEF_START_RE.match(parts[k]):
             break
@@ -3541,7 +3450,7 @@ def _quote_marker_cols(line, depth):
 # The structural start of a line: indentation, quote markers and list
 # markers. CommonMark treats tabs there as spaces up to the next multiple of
 # four columns.
-STRUCT_PREFIX_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*")
+STRUCT_PREFIX_RE = re.compile(r"^(?:[ \t]*(?:>|" + _LIST_MARKER + r"(?=[ \t]|$)))*[ \t]*")
 # Raw kinds whose text is a run of whole source lines.
 RAW_LINE_KINDS = ("frontmatter", "fence", "math", "html", "footnote_def", "refdef",
                   "indented_code", "table_raw")
@@ -3558,20 +3467,7 @@ def _expand_structure(line):
     """``line`` with the tabs in its structural start replaced by spaces at
     their true columns; the rest of the line keeps its bytes."""
     m = STRUCT_PREFIX_RE.match(line)
-    head = m.group(0)
-    if "\t" not in head:
-        return line
-    out = []
-    col = 0
-    for ch in head:
-        if ch == "\t":
-            width = 4 - col % 4
-            out.append(" " * width)
-            col += width
-        else:
-            out.append(ch)
-            col += 1
-    return "".join(out) + line[m.end():]
+    return m.group(0).expandtabs(4) + line[m.end():]
 
 
 def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_lines=None, _resolve=None):
@@ -3751,6 +3647,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         list item ends (fenced code has no lazy continuation lines). A
         closing fence is indented at most three columns past its container.
         Blank and whitespace-only lines inside the container are code too.
+        ``fence`` is the opener's (character, length) (see _fence_opener).
         Returns the index and whether a closing fence ends the block."""
         last = start - 1
         j = start
@@ -3770,9 +3667,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 if depth > 0 and _indent_of(kb) < base:
                     break
                 rel = _past_container(kb, base)
-                cm = FENCE_CLOSE_RE.match(rel.lstrip(" "))
-                if (cm and _indent_of(rel) < 4 and cm.group(1)[0] == fence[0]
-                        and len(cm.group(1)) >= len(fence)):
+                if _indent_of(rel) < 4 and _closes_fence(rel.lstrip(" "), *fence):
                     return j, True
             last = j
             j += 1
@@ -3942,6 +3837,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 # margin after a blank line, or to the end of the document
                 # when a fence or HTML block may run on.
                 md_list_freeze.append(start)
+            elif kq < quote:
+                # (In a quote: markdown-it's paragraph outside the quote it
+                # closed ends at a blank line; see md_quote_raw.)
+                md_quote_raw.append((start, k + 1))
             last = k
             k += 1
         # Only a parse of footnote content reads the state of a definition
@@ -4051,11 +3950,13 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # (line, end) where markdown-it's reading of a paragraph stops being
     # known before its end: a block it reads there may run on past it.
     md_unknown_from = []
-    md_item_open = []
     # The first line of each list markdown-it opens in a paragraph cmark-gfm
     # reads (a list item numbered other than 1 right after a definition):
     # kept byte for byte from there (see below).
     md_list_freeze = []
+    # (first line, line after) of the runs kept byte for byte up to the next
+    # blank line, where markdown-it may continue or close a quote (see below).
+    md_quote_raw = []
     # (Display math the renderers read on into: see the math blocks.)
     math_skip = -1
     math_chain = None
@@ -4206,8 +4107,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                         span = (b.line - 1, min(n - 1, b.line - 1 + b.raw.count("\n")))
                         for x in range(span[0], span[1] + 1):
                             raw_spans[x] = span
-            lead = re.sub(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*", "",
-                          lines[j][:on.start()])
+            lead = STRUCT_PREFIX_RE.sub("", lines[j][:on.start()])
             cover = raw_spans[j]
             e = cover[1] if cover is not None and i < cover[0] and (cover[0] < j or lead) else None
             if e is not None:
@@ -4288,7 +4188,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 k += 1
             continue
 
-        fence = _is_fence_open(cbody)
+        fence = _fence_opener(cbody)
         if fence:
             end, closed = fence_end(i + 1, quote, depth, base, fence)
             blocks.append(Block("fence", attrs(fence_closed=closed), "\n".join(lines[i:end + 1]), [],
@@ -4321,7 +4221,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 x = i + 1
                 while x <= end and not runs_on:
                     rel = texts[x - i]
-                    fence = _is_fence_open(rel) if _indent_of(rel) < 4 else None
+                    fence = _fence_opener(rel) if _indent_of(rel) < 4 else None
                     if fence:
                         last, _ = fence_end(x + 1, quote, depth, base, fence)
                     elif _indent_of(rel) < 4 and _is_html_start(rel, interrupt=bool(texts[x - i - 1].strip())):
@@ -4726,9 +4626,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         if md_read and md_read[-1][0] == "code" and md_read[-1][2] == len(content) and j < n:
             md_code_tail.append((j, quote, walk_base))
         # A list item markdown-it opens in these lines and still reads at
-        # their end: its content column decides whether it takes the lines
-        # after cmark-gfm's paragraph (see md_item_open below).
-        md_item_col = md_item_mark = md_item_line = None
+        # their end: the lines it reads after cmark-gfm's paragraph in that
+        # item are measured from its content column (see add_run below).
+        md_item_col = md_item_mark = None
         for x, r in enumerate(md_read):
             # (Also an empty list item right after a definition, where the
             # walk reads no further: markdown-it starts a block there.)
@@ -4741,7 +4641,6 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                         md_item_col is not None
                         and _indent_of(_expand_indent(col_lines[r[1]])) < md_item_col))
                     and _MDIT_LIST_START_RE.match(_expand_indent(col_lines[r[1]]).lstrip(" "))):
-                md_item_line = i + r[1]
                 body = _expand_indent(col_lines[r[1]])
                 ind = len(body) - len(body.lstrip(" "))
                 body = body[ind:]
@@ -4778,12 +4677,6 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 md_list_freeze.append(i + min(row[1], len(content)) if row is not None else j)
             elif row[1] == len(content) and j + 1 < n:
                 md_list_freeze.append(j + 1)
-        if md_item_col is not None and j < n:
-            # (With the content column of the list item around it, which
-            # markdown-it reads the lines after it in.)
-            md_item_open.append((i, j, quote, md_item_col, md_item_mark, max(
-                (c for _, c in (level_stacks[quote] if quote < len(level_stacks) else ())
-                 if c <= md_item_mark), default=0), md_item_line))
         md_unknown = next((r[1] for r in md_read if r[0] == "unknown"), None)
         if md_unknown is not None and md_unknown in quote_lazy and j < n:
             # (After markdown-it ended nested quotes there; a list item it
@@ -4823,8 +4716,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 marks["closed_by"] = defs_end
             if first in kept_titles:
                 # A title cmark-gfm keeps from the paragraph text after it.
-                marks["kept_title"] = hashlib.sha256(
-                    kept_titles[first].encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                marks["kept_title"] = _digest(kept_titles[first])
             blocks.append(Block("refdef", attrs(**marks), "\n".join(lines[i + first:i + last]), [],
                                 i + first + 1, ref))
         if defs and md_only:
@@ -5104,7 +4996,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                                                       if r[0] == "unknown"
                                                       else "\n".join(kept_lines[max(r[1], rest):r[2]]))
                                    for r in over)
-                digest = hashlib.sha256(kept.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                digest = _digest(kept)
                 kind = ("markdown_it_definition" if any(r[0] == "definition" for r in over)
                         else "markdown_it_block")
                 marks[kind] = digest
@@ -5185,43 +5077,33 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     # code and up to a blank line, and after a quoted fence that cmark-gfm
     # ended with the quote, that fence: those lines are kept byte for byte.)
     md_html_run = []
-    md_quote_raw = []
     prev_block = None
     for block in blocks:
-        if block.kind in RAW_LINE_KINDS and block.kind != "indented_code":
-            # The same for a line a block compared raw absorbed (a quoted
-            # footnote definition's lazy line, for one): a quote marker with
-            # four or more columns before it may continue markdown-it's quote
-            # there. The line before it need not be quoted (a lazy line may
-            # continue the quote), and where the parse read the marker as
-            # one inside a list item, markdown-it may still read another
-            # quote in deeper containers. So any such line counts. A quoted
-            # footnote definition that absorbs a nonblank line with fewer
-            # quote markers counts too: markdown-it may have ended the quote
-            # there (reading the first line as a reference definition) and
-            # read the rest as a paragraph outside it. Either way the block
-            # and the lines after it up to the next blank line are kept byte
-            # for byte.
+        if block.kind in RAW_LINE_KINDS:
+            # A line of a block compared raw (indented code, or a line such
+            # a block absorbed, as a quoted footnote definition does a lazy
+            # line) with a quote marker four or more columns into it: there
+            # markdown-it may continue its quote, and what it reads after the
+            # marker (a fence, an HTML block, a list item holding either, a
+            # paragraph that runs on lazily over lines without a marker, ...)
+            # is not modeled. The line before it need not be quoted (a lazy
+            # line may continue the quote), and where the parse read the
+            # marker as one inside a list item, markdown-it may still read
+            # another quote in deeper containers. So any such line counts:
+            # the block and the lines after it up to the next blank line
+            # (spaces and tabs only) are kept byte for byte (see md_kept
+            # below). (A quoted footnote definition's lazy line with fewer
+            # quote markers is recorded where the definition is read.)
             first = block.line - 1
             after = min(first + block.raw.count("\n") + 1, n)
-            quote = block.attrs.get("quote", 0) if block.kind == "footnote_def" else 0
-            if (any(_indented_quote_marker(orig_lines[k]) for k in range(first, after))
-                    or (quote and any(not _md_blank(orig_lines[k]) and _quote_depth(orig_lines[k])[0] < quote
-                                      for k in range(first + 1, after)))):
+            if any(_indented_quote_marker(orig_lines[k]) for k in range(first, after)):
                 md_quote_raw.append((first, after))
         if block.kind == "indented_code":
             first = block.line - 1
-            after = first + block.raw.count("\n") + 1
             # Code whose lines start with a quote marker, right after a quoted
             # line (also one behind list markers): markdown-it continues the
-            # quote there, and what it reads after the marker (a fence, an
-            # HTML block, a list item holding either, a paragraph that runs
-            # on lazily over lines without a marker, ...) is not modeled.
-            # The lines from the code up to the next blank line (spaces and
-            # tabs only) are kept byte for byte; see md_quote_raw below.
-            if first and _quoted_line(orig_lines[first - 1]) and any(
-                    _indented_quote_marker(line) for line in orig_lines[first:after]):
-                md_quote_raw.append((first, after))
+            # quote there (the lines themselves are kept by the trigger
+            # above).
             if (first and orig_lines[first - 1].strip() and _quote_depth(orig_lines[first - 1])[0]
                     and orig_lines[first].lstrip(" \t").startswith(">")):
                 # (So a blank line that ends that quote for markdown-it, and
@@ -5290,10 +5172,10 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 break
     raw_line = [False] * n
     # Lines kept byte for byte by the block that holds them, also inside
-    # another block or between blocks (see md_item_lines and the exit walk).
+    # another block or between blocks (see md_quote_raw and md_block_end).
     md_kept = [None] * n
     if md_quote_raw:
-        # Each such code block is kept with the lines after it up to the next
+        # Each such run is kept with the lines after it up to the next
         # blank line, quoted or not: a missing quote marker does not end
         # markdown-it's quote while its paragraph runs on lazily. (One pass:
         # the next blank line is looked up, and overlapping runs are marked
@@ -5302,7 +5184,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         for k in range(n - 1, -1, -1):
             next_blank[k] = k if _md_blank(orig_lines[k]) else next_blank[k + 1]
         marked = 0
-        for start, after in md_quote_raw:
+        for start, after in sorted(md_quote_raw):
             end = next_blank[after]
             for x in range(max(start, marked), end):
                 md_kept[x] = 0
@@ -5335,7 +5217,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         if block.kind == "list_item":
             q = block.attrs.get("quote", 0)
             body = _strip_quote(view[block.line - 1], q)
-            im = re.match(r"( *)([-+*]|[0-9]{1,9}[.)])( *)", body)
+            im = re.match(r"( *)(" + _LIST_MARKER + r")( *)", body)
             if im:
                 gap = len(im.group(3))
                 items_at[block.line - 1] = (q, len(im.group(1)) + len(im.group(2))
@@ -5345,375 +5227,6 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     for block in blocks:
         if block.kind not in ("quote", "list_item"):
             block_at.setdefault(block.line - 1, block)
-    # Which lines after such a paragraph reach the content column of the
-    # list item markdown-it still reads there (or are blank), up to the
-    # first that does not (it closes the item), as runs: structure of the
-    # block on the paragraph's first line, so a line indented into or out of
-    # that item is a structure change.
-    # The line where markdown-it closes each such item, its quote depth and
-    # the content column of the list item around it. The lines from
-    # ``start`` that a fence or an HTML block markdown-it reads in the item
-    # holds are kept byte for byte.
-    md_item_exits = []
-    # (The first line of each block cmark-gfm reads, for where an item ends
-    # relative to them.)
-    block_starts = sorted(block.line - 1 for block in blocks)
-    for x, (at, start, level, col, mark_ind, outer, item_line) in enumerate(md_item_open):
-        stop = md_item_open[x + 1][1] if x + 1 < len(md_item_open) else n
-        runs = []
-        # One flag for each block markdown-it starts there (not for the
-        # lines that continue a paragraph, lazily or not, so rewrapping
-        # prose keeps them): "in" inside the item, "underline" for a setext
-        # underline, "blank" for blank lines, and "out" where the item ends.
-        # The item is read from its first line (inside cmark-gfm's
-        # paragraph), so a paragraph, fence or HTML block open there carries
-        # over; only the lines from ``start`` are recorded, and the lines a
-        # fence or HTML block holds there are kept byte for byte.
-        para = quoted = False
-        fence = None
-        # (An open HTML block: the end marker of its kind, or "blank" for
-        # one that a blank line ends.)
-        html = None
-        # (A fence or HTML block open inside the item's quote, as above, and
-        # the lines of a paragraph that starts like a definition, read with
-        # the markdown-it walk while they last.)
-        qblock = None
-        plines = None
-        # (The quote depth ``plines`` started at: a deeper quote marker opens
-        # a quote of its own there.)
-        pdepth = 0
-
-        def blocks_before(k, first=item_line):
-            # How many of cmark-gfm's blocks start between the item's first
-            # line and line ``k`` (a line that ends the item in one version
-            # and continues its paragraph in the other moves this).
-            return bisect.bisect_left(block_starts, k) - bisect.bisect_left(block_starts, first)
-
-        def exit_sig(k, level=level, outer=outer):
-            # Where the item ends: the kind of that line, its quote depth,
-            # whether it reaches the list item around the item (or is
-            # indented code there), and where it is among cmark-gfm's
-            # blocks.
-            depth = _quote_depth(view[k])[0]
-            body = _expand_indent(_strip_quote(view[k], min(level, depth)))
-            shape = _line_shape(body)
-            return "out:%d:%s:%s:%d" % (depth, shape, "-" if shape == "blank" else
-                                        "%s,%s" % _column_bucket(_indent_of(body), (0, outer)),
-                                        blocks_before(k))
-
-        def open_block(t):
-            # The state markdown-it is in after a block starts with ``t``:
-            # whether a paragraph is open, the quoted fence or HTML block
-            # open, and the paragraph's lines if it may be a definition.
-            rest = _expand_indent(t)
-            ind = _indent_of(rest)
-            if not rest.strip() or ind >= 4:
-                return False, None, None
-            rest = rest[ind:]
-            fm = FENCE_RE.match(rest)
-            if fm and not (fm.group(2)[0] == "`" and "`" in fm.group(3)):
-                return False, ("fence", fm.group(2)[0], len(fm.group(2)), qdepth), None
-            if _is_html_start(rest):
-                marker = _html_end_marker(rest)
-                if marker is None:
-                    return False, ("html", None, qdepth), None
-                return False, (None if marker.search(rest[1:]) else ("html", marker, qdepth)), None
-            if rest.startswith("["):
-                lines_now = [rest]
-                return _mdit_reading(lines_now, 0)[-1][0] == "paragraph", None, lines_now
-            return _mdit_opens_paragraph(t), None, None
-
-        def taken(k, level=level, stop=stop):
-            # Whether the reading of a quoted paragraph that starts like a
-            # definition takes line ``k``, which has no quote markers there,
-            # as part of a block that starts earlier (a title, which may run
-            # on over the lines after it): markdown-it then reads it in the
-            # quote, and anew outside the quote otherwise. (Read with the
-            # lines markdown-it's quote takes after it: lazy lines and lines
-            # of the same quote, up to a blank line or a block start.)
-            trial = list(plines)
-            for x in range(k, min(stop, k + 65 - len(plines)) + 1):
-                if x == k + 1:
-                    # (After a complete definition, only a title may follow
-                    # it: a line that starts none starts a block of its own.)
-                    short = _mdit_reading(trial, 0)
-                    if (len(short) > 1 and short[-1][1] == len(plines) and short[-2][0] == "definition"
-                            and short[-2][2] == len(plines) and trial[-1][:1] not in ('"', "'", "(")):
-                        return False
-                if x == k + 65 - len(plines) or x == stop:
-                    # (Lines past what the walk reads: unknown, unless it
-                    # ends there.)
-                    if x < stop:
-                        return None
-                    break
-                t = relocated(x, level) if x in marker_quote_col else written[x]
-                rest = _expand_indent(_strip_quote(t, min(level, _quote_depth(t)[0])))
-                if not rest.strip():
-                    break
-                rest = rest[col:] if _indent_of(rest) >= col else rest
-                st = rest.lstrip(" ")
-                if _indent_of(rest) < 4 and st.startswith(">"):
-                    qt = re.sub(r"^(?:[ ]{0,3}>[ ]?)+", "", st)
-                    if st[:len(st) - len(qt)].count(">") > pdepth or not qt.strip():
-                        break
-                    st = qt.lstrip(" ")
-                if x > k and _mdit_interrupts(st, 0):
-                    break
-                trial.append(st)
-            here = len(plines)
-            return any(r[1] < here < r[2] for r in _mdit_reading(trial, 0))
-
-        def go_on(t, lazy=False):
-            # Whether a paragraph is still open after ``t`` continues it (a
-            # lazy line is never its setext underline).
-            if plines is not None and len(plines) < 64:
-                plines.append(t.lstrip(" "))
-                last = _mdit_reading(plines, 0)[-1]
-                return last[0] == "paragraph" and last[2] == len(plines)
-            return lazy or not (_indent_of(t) < 4 and _MDIT_UNDERLINE_RE.match(t.lstrip(" ")))
-
-        def next_item(k, body):
-            # The marker indentation and content column of the list item
-            # markdown-it opens at line ``k`` (a list marker short of the
-            # item's column, inside the list item around it), or None.
-            ind = _indent_of(body)
-            if not outer <= ind < outer + 4:
-                return None
-            mark = _MDIT_LIST_START_RE.match(body[ind:])
-            if not mark:
-                return None
-            mark = mark.group(0).rstrip(" \t")
-            rest = body[ind + len(mark):]
-            text_after = rest.lstrip(" \t")
-            gap = len(rest) - len(text_after)
-            return ind, ind + len(mark) + (gap if text_after and 1 <= gap <= 4 else 1)
-
-        k = item_line
-        unread = False
-        while k < stop:
-            record = k >= start
-            if plines is not None and len(plines) >= 64 and not unread:
-                # (A paragraph whose label is closed and not followed by a
-                # colon, or holds a bracket, starts no definition whatever
-                # follows: it stays a paragraph, which the lines after it
-                # continue. A label that is still open may close later.)
-                joined = "\n".join(plines)
-                edge = re.search(r"(?<!\\)(?:\\\\)*[][]", joined[1:])
-                if edge is not None and (joined[1 + edge.end() - 1] == "[" or not joined.startswith(":", 1 + edge.end())):
-                    plines = None
-            if plines is not None and (len(plines) >= 64 or unread):
-                # (A paragraph that starts like a definition and runs past
-                # what the markdown-it walk reads: the lines after it, up to
-                # a blank line, are kept byte for byte, wherever markdown-it
-                # reads them.)
-                if record:
-                    runs.append("long")
-                while k < stop and _strip_quote(view[k], min(level, _quote_depth(view[k])[0])).strip():
-                    if k >= start:
-                        md_kept[k] = level
-                    k += 1
-                para = quoted = unread = False
-                qblock = plines = None
-                continue
-            # (Read with the markers of the item's quotes where the parse
-            # moved them into list items, and the rest at its columns.)
-            text = relocated(k, level) if k in marker_quote_col else written[k]
-            if level and _quote_depth(view[k])[0] < level:
-                # (Fewer quote markers end the quote, and the item with it,
-                # unless the line continues a paragraph lazily. Read with
-                # the quote markers the parse moved into list items.)
-                if (para and fence is None and html is None and _quote_depth(view[k])[1].strip()
-                        and not _mdit_interrupts(view[k], level)
-                        # (Any list marker, whatever its number and also an
-                        # empty item, ends a quote there in markdown-it.)
-                        and not re.match(r"[ ]{0,3}(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)",
-                                         _expand_indent(_quote_depth(view[k])[1]))):
-                    para = go_on(_quote_depth(view[k])[1], lazy=True)
-                    k += 1
-                    continue
-                if record:
-                    if not _quote_depth(view[k])[1].strip() and (not runs or runs[-1] != "blank"):
-                        # (A blank line there ends the quote: recorded as
-                        # a blank line where the item ends, as a blank line
-                        # that keeps the markers followed by one that does
-                        # not is.)
-                        runs.append("blank")
-                    runs.append(exit_sig(k) if runs[-1:] != ["blank"]
-                                else "out:%d:blank:-:%d" % (_quote_depth(view[k])[0], blocks_before(k)))
-                md_item_exits.append((k, level, outer))
-                break
-            body = _expand_indent(_strip_quote(text, min(level, _quote_depth(text)[0])))
-            if k == item_line:
-                # (The text after the marker starts the item's first block.)
-                body = " " * col + body[col:] if len(body) > col else ""
-                if not body.strip():
-                    k += 1
-                    continue
-            ind = _indent_of(body)
-            if not body.strip():
-                if fence is not None or (html is not None and html != "blank"):
-                    # (Inside a fence, or raw HTML that runs to its end
-                    # marker.)
-                    if record:
-                        md_kept[k] = level
-                else:
-                    if record and (not runs or runs[-1] != "blank"):
-                        runs.append("blank")
-                    para = quoted = False
-                    html = qblock = plines = None
-                k += 1
-                continue
-            if fence is not None or html is not None:
-                # (A fence or HTML block in the item ends with it: its lines
-                # are never lazy.)
-                if ind < col:
-                    if record:
-                        runs.append(exit_sig(k))
-                    nxt = next_item(k, body) if _quote_depth(text)[0] <= level else None
-                    if nxt is not None:
-                        # (A list marker there starts the next item, which
-                        # the walk reads on.)
-                        mark_ind, col = nxt
-                        item_line = k
-                        para = quoted = unread = False
-                        fence = html = qblock = plines = None
-                        continue
-                    md_item_exits.append((k, level, outer))
-                    break
-                if record:
-                    md_kept[k] = level
-                inner = body[col:]
-                if html is not None:
-                    if html != "blank" and html.search(inner):
-                        html = None
-                elif _indent_of(inner) < 4 and re.match(
-                        re.escape(fence[0]) + "{%d,}[ \t]*$" % fence[1], inner.lstrip(" ")):
-                    fence = None
-                k += 1
-                continue
-            if (ind < col and plines is not None and quoted and not para and len(plines) < 64
-                    and taken(k) is None):
-                # (A line short of the item's column the walk cannot read:
-                # kept byte for byte from here, as above.)
-                unread = True
-                continue
-            if ind >= col:
-                inner = body[col:]
-                rind = _indent_of(inner)
-                stripped = inner.lstrip(" ")
-                quote_line = rind < 4 and stripped.startswith(">")
-                if (plines is not None and quoted and not para and not quote_line and len(plines) < 64
-                        and not _mdit_interrupts(inner, 1)):
-                    took = taken(k)
-                    if took is None:
-                        # (The walk cannot read that far: kept byte for byte
-                        # from here, as above.)
-                        unread = True
-                        continue
-                    if took:
-                        # (A line without quote markers that the reading of
-                        # the quote's paragraph takes, such as a definition's
-                        # title, is read in the quote.)
-                        para = go_on(inner, lazy=True)
-                        k += 1
-                        continue
-                    # (One it does not take ends the quote: markdown-it reads
-                    # it anew in the item.)
-                    quoted = para = False
-                    plines = None
-                # (What a quote line holds: only a paragraph in it continues
-                # lazily.)
-                qtext = re.sub(r"^(?:[ ]{0,3}>[ ]?)+", "", stripped) if quote_line else ""
-                qdepth = stripped[:len(stripped) - len(qtext)].count(">") if quote_line else 0
-                if quote_line and quoted and qblock is not None and qdepth < qblock[-1]:
-                    # (A line with fewer quote markers ends the quote the
-                    # fence or HTML block is in, and the block with it.)
-                    qblock = None
-                    para, qblock, plines = open_block(qtext)
-                    pdepth = qdepth
-                    if record and qblock is not None:
-                        md_kept[k] = level
-                elif quote_line and quoted:
-                    if qblock is not None:
-                        # (A line of a fence or HTML block in the quote: kept
-                        # byte for byte.)
-                        if record:
-                            md_kept[k] = level
-                        if not qtext.strip():
-                            if qblock[0] == "html" and qblock[1] is None:
-                                qblock = None
-                        elif qblock[0] == "fence":
-                            if _indent_of(_expand_indent(qtext)) < 4 and re.match(
-                                    re.escape(qblock[1]) + "{%d,}[ \t]*$" % qblock[2], qtext.lstrip(" ")):
-                                qblock = None
-                        elif qblock[1] is not None and qblock[1].search(qtext):
-                            qblock = None
-                        para = False
-                    elif ((para or plines is not None) and qtext.strip() and not _mdit_interrupts(qtext, 0)
-                          and not (plines is not None and qdepth > pdepth)):
-                        # (Also after a definition, whose title may follow,
-                        # but not in a deeper quote, which opens there.)
-                        para = go_on(qtext)
-                    else:
-                        para, qblock, plines = open_block(qtext)
-                        pdepth = qdepth
-                        if record and qblock is not None:
-                            md_kept[k] = level
-                elif para and not quoted and rind < 4 and _MDIT_UNDERLINE_RE.match(stripped) and plines is None:
-                    if record:
-                        runs.append("underline")
-                    para = False
-                elif ((para or (plines is not None and not quoted)) and not quote_line
-                      and not _mdit_interrupts(inner, 1 if quoted else 0)):
-                    para = go_on(inner, lazy=quoted)
-                else:
-                    if record:
-                        runs.append("in")
-                    fm = FENCE_RE.match(stripped)
-                    quoted = quote_line
-                    qblock = plines = None
-                    if rind < 4 and fm and not (fm.group(2)[0] == "`" and "`" in fm.group(3)):
-                        fence = (fm.group(2)[0], len(fm.group(2)))
-                        para = False
-                        if record:
-                            md_kept[k] = level
-                    elif rind < 4 and _is_html_start(stripped, interrupt=para):
-                        # (An HTML block runs to its end marker, or to a
-                        # blank line, or to the item's end.)
-                        marker = _html_end_marker(stripped)
-                        html = "blank" if marker is None else (None if marker.search(stripped[1:]) else marker)
-                        para = False
-                        if record:
-                            md_kept[k] = level
-                    else:
-                        para, qblock, plines = open_block(qtext if quote_line else inner)
-                        pdepth = qdepth
-                        if record and qblock is not None:
-                            md_kept[k] = level
-            elif not ((para or (plines is not None and quoted and len(plines) < 64 and taken(k)))
-                      and fence is None and html is None and _quote_depth(text)[0] <= level
-                      and not _mdit_lazy_breaks(body)
-                      and not _mdit_ends_paragraph(text, level, col, mark_ind)):
-                # (A lazy line short of the item's column: a block start at
-                # any indentation ends the paragraph there.)
-                if record:
-                    runs.append(exit_sig(k))
-                nxt = next_item(k, body) if _quote_depth(text)[0] <= level else None
-                if nxt is not None:
-                    # (A list marker there starts the next item, which the
-                    # walk reads on.)
-                    mark_ind, col = nxt
-                    item_line = k
-                    para = quoted = unread = False
-                    fence = html = qblock = plines = None
-                    continue
-                md_item_exits.append((k, level, outer))
-                break
-            else:
-                para = go_on(body, lazy=True)
-            k += 1
-        if at in block_at:
-            block_at[at].attrs["md_item_lines"] = tuple(runs)
     for at, shape, texts in md_shapes:
         if at in block_at:
             block_at[at].attrs["md_shape"] = shape
@@ -5796,7 +5309,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
             if fence is not None:
                 inner_text = plain_text if mdq else _strip_quote(text, open_depth)
                 if (depth_k == open_depth and _indent_of(inner_text) < 4
-                        and re.match(re.escape(fence[0]) + "{%d,}[ \t]*$" % fence[1], inner_text.lstrip(" "))):
+                        and _closes_fence(inner_text.lstrip(" "), *fence)):
                     if flip:
                         # (Read as an opening fence instead.)
                         fence = (fence[0], len(inner_text.strip()))
@@ -5810,9 +5323,9 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                     run_on = maybe_html or in_html
             else:
                 stripped = plain_text.lstrip(" ")
-                fm = FENCE_RE.match(stripped)
-                if fm and _indent_of(plain_text) < 4 and not (fm.group(2)[0] == "`" and "`" in fm.group(3)):
-                    fence = (fm.group(2)[0], len(fm.group(2)))
+                opener = _fence_opener(stripped)
+                if opener and _indent_of(plain_text) < 4:
+                    fence = opener
                     open_depth = depth_k
                     in_html, flip = maybe_html, False
                 elif _indent_of(plain_text) < 4:
@@ -5916,15 +5429,8 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 close_region(*item)
 
     drain()
-    # Where markdown-it closes a list item only it opens (see
-    # md_item_lines above), it reads the line anew outside the item, where
-    # cmark-gfm may still be inside a fence (that started in the item's
-    # lines): from a line markdown-it reads as an opening fence that
-    # cmark-gfm does not open there (or as indented code, four columns past
-    # the content column of the list item around it), what markdown-it
-    # reads as code is kept byte for byte, until both are outside fences
-    # and raw blocks again.
-    def md_block_end(m, level, col, para, inner_quote=0):
+
+    def md_block_end(m, level, col, para):
         # The end of the fence, HTML block or indented code markdown-it
         # starts at line ``m`` in a container at quote depth ``level`` whose
         # content column is ``col`` (with a paragraph open there when
@@ -5938,13 +5444,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 return ""
             if _indent_of(body) < col:
                 return None
-            if not inner_quote:
-                return body[col:]
-            # (Inside a quote that opens at the container's column.)
-            rel = body[col:]
-            if _indent_of(rel) >= 4 or _quote_depth(rel)[0] < inner_quote:
-                return None
-            return _expand_indent(_strip_quote(rel, inner_quote))
+            return body[col:]
         first = inner(m)
         if not first:
             return m
@@ -5960,12 +5460,11 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 if inner(x - 1):
                     last = x
             return last
-        fm = FENCE_RE.match(stripped)
-        if fm and not (fm.group(2)[0] == "`" and "`" in fm.group(3)):
-            close = re.compile(re.escape(fm.group(2)[0]) + "{%d,}[ \t]*$" % len(fm.group(2)))
+        fence = _fence_opener(stripped)
+        if fence:
             x = m + 1
             while x < n and inner(x) is not None:
-                if _indent_of(inner(x)) < 4 and close.match(inner(x).lstrip(" ")):
+                if _indent_of(inner(x)) < 4 and _closes_fence(inner(x).lstrip(" "), *fence):
                     return x + 1
                 x += 1
             return x
@@ -5982,59 +5481,6 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                 x += 1
             return x
         return m
-
-    # Where markdown-it closes a list item only it opens (see
-    # md_item_lines above), it reads the lines from there anew in the list
-    # item around it, where cmark-gfm may still be inside a fence that
-    # started in the item's lines: what markdown-it reads there as a fence,
-    # an HTML block or indented code (measured from that item's content
-    # column, and ending where the line leaves it) is kept byte for byte,
-    # until both read a line as other than such a block.
-    if md_item_exits:
-        cm_raw = [False] * n
-        for block in blocks:
-            if block.kind in RAW_KINDS:
-                first = block.line - 1
-                for k in range(first, min(n, first + block.raw.count("\n") + 1)):
-                    cm_raw[k] = True
-        # (A walk that reaches a line in the state an earlier walk had there
-        # reads the rest as that one did, so it stops: repeated exits are
-        # read once.)
-        walked = set()
-        for out, level, outer in md_item_exits:
-            m = out
-            mpara = False
-            while m < n and _quote_depth(written[m])[0] >= level:
-                if (m, mpara, level, outer) in walked:
-                    break
-                walked.add((m, mpara, level, outer))
-                body = _expand_indent(_strip_quote(written[m], level))
-                if body.strip() and _indent_of(body) < outer:
-                    break
-                end = md_block_end(m, level, outer, mpara)
-                if end > m:
-                    for x in range(m, end):
-                        md_kept[x] = level
-                    mpara = False
-                    m = end
-                    continue
-                rel = body[outer:]
-                if not mpara and _indent_of(rel) < 4 and rel.lstrip(" ").startswith(">"):
-                    # (A quote markdown-it opens there, at the column of the
-                    # list item around the item: what it reads in that quote
-                    # as a fence, an HTML block or indented code is kept
-                    # byte for byte too.)
-                    end = md_block_end(m, level, outer, False, inner_quote=_quote_depth(rel)[0])
-                    if end > m:
-                        for x in range(m, end):
-                            md_kept[x] = level
-                        m = end
-                        continue
-                if not cm_raw[m]:
-                    break
-                stripped = body[outer:].lstrip(" ")
-                mpara = bool(stripped) and not (ATX_RE.match(stripped) or HR_RE.match(stripped))
-                m += 1
 
     # Where markdown-it continues a paragraph lazily over the block cmark-gfm
     # starts after it (an HTML block, for example), what it reads in that
@@ -6180,7 +5626,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                                            else "%d" % _quote_depth(written[z])[0]))
                     if holder is not None:
                         holder.attrs["md_underline"] = holder.attrs.get("md_underline", ()) + (
-                            hashlib.sha256("\n".join(kept).encode("utf-8", "surrogatepass")).hexdigest()[:32],)
+                            _digest("\n".join(kept)),)
                 elif col and k < n:
                     # markdown-it reads the lines after that paragraph from
                     # the content column of the list item it is still in,
@@ -6309,11 +5755,11 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
         while x < n:
             line = src_lines[x]
             if (x > first and _md_blank(src_lines[x - 1]) and not _md_blank(line) and line[0] not in " \t>"
-                    and not re.match(r"(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", line)):
+                    and not _MDIT_LIST_START_RE.match(line)):
                 end = x
                 break
             # (The text past any quote and list markers.)
-            text = re.sub(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*", "", line)
+            text = STRUCT_PREFIX_RE.sub("", line)
             if _fence_opener(text) or (_is_html_start(text) and _html_end_marker(text) is not None):
                 runs_on = True
             x += 1
@@ -6337,8 +5783,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
                     "%s%d:%s" % ("+" if k and md_kept[k - 1] is not None else "|", depth,
                                  src_lines[k][_loose_quote_end(src_lines[k], depth):]))
         for hold, kept in kept_by.values():
-            hold.attrs["md_kept"] = hashlib.sha256(
-                "\n".join(kept).encode("utf-8", "surrogatepass")).hexdigest()[:32]
+            hold.attrs["md_kept"] = _digest("\n".join(kept))
         for block in blocks:
             if md_kept[block.line - 1] is not None:
                 # (A block markdown-it reads as code or HTML from its first
@@ -6351,8 +5796,7 @@ def parse_blocks(text, spec_blank_items=False, inner=False, _budget=None, _md_li
     if any(raw_line):
         for block in blocks:
             if raw_line[block.line - 1]:
-                block.attrs["markdown_it_raw"] = hashlib.sha256(
-                    block.raw.encode("utf-8", "surrogatepass")).hexdigest()[:32]
+                block.attrs["markdown_it_raw"] = _digest(block.raw)
                 if block.kind == "refdef" and block.ref and block.ref[2]:
                     block.ref = block.ref[:3] + (False,)
                 labels = [mdit_label_key(label) for label in _loose_labels(block.raw)]
@@ -6510,9 +5954,7 @@ def _renderer_masks(text, resolve=None):
         for kind, start, end, _ in constructs:
             if kind == "linktail":
                 tails.add(start)
-            for x in range(start, end):
-                if chars[x] != "\n":
-                    chars[x] = " "
+            _mask(chars, start, end)
         out.append(("".join(chars), tails))
     return out, unknown
 
@@ -6522,29 +5964,7 @@ def _paired_spans(text, masked, labels, gfm):
     ``masked``; runs inside a link or image text (``labels``, (start, end)
     of the text between the brackets) pair only with each other, innermost
     first, as in emphasis_structure."""
-    runs = _delimiter_runs(text, masked, gfm, frozenset(end for _, end in labels))
-    bounds = sorted(set(labels), key=lambda lb: (lb[0], -lb[1]))
-    groups = {lb: [] for lb in bounds}
-    outside = []
-    open_labels = []
-    li = 0
-    for run in runs:
-        while li < len(bounds) and bounds[li][0] <= run["pos"]:
-            open_labels.append(bounds[li])
-            li += 1
-        while open_labels and open_labels[-1][1] <= run["pos"]:
-            open_labels.pop()
-        holder = None
-        for lb in reversed(open_labels):
-            if lb[0] <= run["pos"] < lb[1]:
-                holder = lb
-                break
-        (groups[holder] if holder is not None else outside).append(run)
-    spans = []
-    for lb in sorted(bounds, key=lambda lb: lb[1] - lb[0]):
-        _pair_delimiters(groups[lb], spans, {}, gfm)
-    _pair_delimiters(outside, spans, {}, gfm)
-    return [(a, b) for a, b, _ in spans]
+    return [(a, b) for a, b, _ in _pair_in_labels(text, masked, labels, gfm, {})]
 
 
 def _emphasis_spans(text, resolve=None):
@@ -6724,7 +6144,7 @@ def _md_starts_anew(lines, k, prev_block):
     if _mdit_interrupts(lines[k], own):
         # (It ends a paragraph at its own depth, so at any depth.)
         return True
-    marked = bool(re.match(r"[ \t]*(?:[-+*]|[0-9]{1,9}[.)])(?:[ \t]|$)", own_body))
+    marked = bool(LIST_MARKER_START_RE.match(own_body))
     level = 0
     for x in range(k - 1, max(-1, k - 1 - MD_ANEW_LOOKBACK), -1):
         depth, body = _quote_depth(lines[x])
@@ -6741,15 +6161,11 @@ def _md_starts_anew(lines, k, prev_block):
     return _mdit_interrupts(lines[k], level)
 
 
-# Container markers at the start of a footnote definition's first line,
-# which may be a list item's or a quote's first line.
-_FIRST_LINE_MARKERS_RE = re.compile(r"^(?:[ \t]*(?:>|(?:[-+*]|[0-9]{1,9}[.)])(?=[ \t]|$)))*[ \t]*")
-
-
 def _footnote_label_line(line):
     """The first line of a footnote definition from its label on, past the
-    quote and list markers in front of it (None when no label is there)."""
-    rest = line[_FIRST_LINE_MARKERS_RE.match(line).end():]
+    quote and list markers in front of it (None when no label is there; the
+    line may be a list item's or a quote's first line)."""
+    rest = line[STRUCT_PREFIX_RE.match(line).end():]
     return rest if FOOTNOTE_DEF_RE.match(rest) else None
 
 
@@ -7571,7 +6987,7 @@ UNQUOTED_ESCAPES = {'"': "&quot;", "'": "&#39;", "=": "&#61;", "`": "&#96;",
 
 
 def _escape_text(text, quote="", unquoted=False):
-    out = re.sub(r"&(?!(?:[A-Za-z][A-Za-z0-9]{1,31}|#[0-9]{1,7}|#[xX][0-9A-Fa-f]{1,6});)", "&amp;", text)
+    out = re.sub("&(?!" + _ENTITY_BODY + ")", "&amp;", text)
     out = out.replace("<", "&lt;").replace(">", "&gt;")
     if quote == '"':
         out = out.replace('"', "&quot;")

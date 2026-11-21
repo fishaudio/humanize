@@ -63,7 +63,7 @@ The finalize summary is written for people, so polish it for readability after y
    - same claims;
    - same negations and caveats;
    - same obligation strength;
-   - same language and variant;
+   - same language and variant (English words inside Chinese, Japanese, or Korean text kept as written);
    - every gloss only explains a term already present;
    - nothing added that is not a gloss;
    - nothing dropped.

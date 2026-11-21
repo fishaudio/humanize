@@ -1359,7 +1359,7 @@ enter_finalize_phase() {
 ## Polish the Finalize Summary
 After writing the summary, polish it for readability. A run can take several minutes, so run it in the background and wait for it to finish:
     \"{{POLISH_SCRIPT}}\" --auto --input \"{{FINALIZE_SUMMARY_FILE}}\" --output \"{{FINALIZE_SUMMARY_FILE}}\"
-Read the final stderr line (polish-gemini: outcome=... reason=... delivered=...). If the outcome is polished, check the summary against this list: same claims; same negations and caveats; same obligation strength; same language and variant; every gloss only explains a term already present; nothing added that is not a gloss; nothing dropped. If any item fails, restore your original wording or correct it. For any other outcome the summary is unchanged; mention the reason in your report. Re-read the summary before you report completion. Do not polish round summaries, the goal tracker, plans or code."
+Read the final stderr line (polish-gemini: outcome=... reason=... delivered=...). If the outcome is polished, check the summary against this list: same claims; same negations and caveats; same obligation strength; same language and variant (English words inside Chinese, Japanese, or Korean text kept as written); every gloss only explains a term already present; nothing added that is not a gloss; nothing dropped. If any item fails, restore your original wording or correct it. For any other outcome the summary is unchanged; mention the reason in your report. Re-read the summary before you report completion. Do not polish round summaries, the goal tracker, plans or code."
 
     if [[ -n "$skip_reason" ]]; then
         local fallback="# Finalize Phase (Review Skipped)
