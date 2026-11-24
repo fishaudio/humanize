@@ -80,11 +80,11 @@ Requires [codex CLI](https://github.com/openai/codex) for review. See the full [
    /humanize:ask-gemini What are the latest best practices for X?
    ```
 
-7. **Polish human-facing docs for readability** with Gemini on OpenRouter (copy editing only; needs an OpenRouter API key):
+7. **Polish human-facing docs for readability** with Gemini (copy editing only). By default it runs through agy, the Antigravity CLI, on your Gemini subscription (Gemini 4 Neon at medium effort), so you need agy installed and signed in, not an API key. OpenRouter, billed per call, is the optional other backend:
    ```bash
    /humanize:polish-gemini --input docs/guide.md --output docs/guide.md
    ```
-   Claude also runs it on its own for documentation, web pages, the RLCR finalize summary, and the Plan Understanding Quiz. If no key is set or the result fails the local checks, the original text is kept. See [Polish With Gemini](docs/usage.md#polish-gemini).
+   Claude also runs it on its own for documentation, web pages, the RLCR finalize summary, and the Plan Understanding Quiz. If agy is missing, signed out, or out of quota, or the result fails the local checks, the original text is kept and the reason is shown; nothing falls back to OpenRouter unless you turn that on. See [Polish With Gemini](docs/usage.md#polish-gemini).
 
 8. **Monitor progress (in another terminal, not inside Claude Code)**:
    ```bash

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""polish_gemini - readability-only polish through the OpenRouter chat API.
+"""polish_gemini - readability-only polish with Gemini.
 
 Internal helper for scripts/polish-gemini.sh. The shell wrapper parses the
 public command line and the merged humanize config, then runs this module with
@@ -7,15 +7,22 @@ resolved settings. This module:
 
 1. reads the source bytes (a file or stdin);
 2. checks them (size, encoding, marker collisions, format-specific parsing);
-3. resolves the API key inside this process;
-4. sends one chat completions request with no tools, plus at most one retry
-   (effort fallback or rate limiting), under one overall deadline;
-5. verifies the candidate with polish_guard;
-6. delivers either the polished text or the exact original bytes;
-7. writes the run record and prints exactly one outcome line on stderr.
+3. gets one reply from the selected backend:
+   - agy: one headless run of the Antigravity CLI on the signed-in Gemini
+     subscription, from an empty temporary workspace, with every tool refused
+     (strict tool permission, deny rules, and a deny-all PreToolUse hook) and
+     the prompt on standard input;
+   - openrouter: one chat completions request with no tools, plus at most one
+     retry (effort fallback or rate limiting), with the API key resolved
+     inside this process;
+   both under one overall deadline. An agy failure falls back to OpenRouter
+   only when the caller asks for it;
+4. verifies the candidate with polish_guard;
+5. delivers either the polished text or the exact original bytes;
+6. writes the run record and prints exactly one outcome line on stderr.
 
 Standard library only. The API key never appears on a command line, in a run
-record, in a cache file, on stdout, or on stderr.
+record, in a cache file, on stdout, or on stderr, and agy never receives it.
 """
 
 import sys
@@ -190,8 +197,11 @@ if __name__ == "__main__":
 import email.utils  # noqa: E402
 import json  # noqa: E402
 import secrets  # noqa: E402
+import shlex  # noqa: E402
+import shutil  # noqa: E402
 import socket  # noqa: E402
 import stat  # noqa: E402
+import subprocess  # noqa: E402
 import tempfile  # noqa: E402
 import threading  # noqa: E402
 import time  # noqa: E402
@@ -209,6 +219,7 @@ PREFIX = "polish-gemini:"
 MARKER_FAMILY = "@@HUMANIZE-POLISH-"
 EFFORTS = ("xhigh", "high", "medium", "low")
 FORMATS = ("markdown", "text", "segments", "html")
+BACKENDS = ("agy", "openrouter")
 MAX_POSTS = 2
 DEFAULT_RETRY_AFTER = 2.0
 EXIT_OK = 0
@@ -225,6 +236,56 @@ FORMAT_NAMES = {
 REJECTION_WORDS = ("unsupported", "not supported", "invalid", "must be one of",
                    "allowed values", "not allowed", "unknown", "enum", "expected one of",
                    "not a valid", "is not one of")
+
+# agy (Antigravity CLI) settings for one polish run. They apply to this run
+# only and are never saved. Under "strict" every tool call needs an approval
+# that a headless run cannot give, so agy refuses it; the deny rules refuse
+# the tools that permission rules cover even before that, and an empty
+# agentMode keeps Auto mode from approving anything. useG1Credits stays off so
+# a used-up subscription quota never turns into paid AI credits.
+AGY_SETTINGS = {
+    "toolPermission": "strict",
+    "agentMode": "",
+    "allowNonWorkspaceAccess": False,
+    "trustedWorkspaces": [],
+    "useG1Credits": False,
+    "permissions": {
+        "allow": [],
+        "deny": ["command(*)", "write_file(*)", "read_file(*)", "read_url(*)", "mcp(*)"],
+    },
+}
+# Workspace hook that refuses every tool call, including the tools that
+# permission rules do not cover (web search, subagents, scheduling).
+AGY_HOOKS = {
+    "humanize-polish-no-tools": {
+        "PreToolUse": [{
+            "matcher": "*",
+            "hooks": [{
+                "type": "command",
+                "command": "printf '%s\\n' '{\"decision\":\"deny\",\"reason\":\"Polish runs allow no tools.\"}'",
+                "timeout": 10,
+            }],
+        }],
+    },
+}
+AGY_PREFACE = ("Your only task is the copy-editing request below. Do not call any tool: every tool "
+               "call in this session is refused. Answer with the output block only.\n\n")
+# Credentials agy must not see: the OpenRouter key is not its business, and a
+# Gemini API key or Application Default Credentials would bill per call
+# instead of using the signed-in subscription.
+AGY_ENV_DROP = ("OPENROUTER_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY",
+                "GOOGLE_APPLICATION_CREDENTIALS", "AGY_ADC_AUTH")
+# Seconds agy gets past its own --print-timeout before it is killed.
+AGY_KILL_GRACE = 10.0
+AGY_LABEL_RE = re.compile(r'label="([^"\n]+)"')
+AGY_HINTS = {
+    "auth": " (agy is not signed in: run agy once in a terminal and sign in with the account "
+            "that has your Gemini subscription)",
+    "quota_exhausted": " (the Gemini subscription quota is used up: wait for it to reset, lower the "
+                       "effort, or set gemini_polish_fallback_to_openrouter to true to pay per call "
+                       "on OpenRouter)",
+    "bad_model": " (run agy models to list the models agy offers, then set gemini_polish_agy_model)",
+}
 
 
 class Interrupted(BaseException):
@@ -336,8 +397,9 @@ def _write_all(fd, data):
 
 VALUE_OPTIONS = ("input", "output", "format", "model", "effort", "timeout", "max-tokens",
                  "max-bytes", "base-url", "api-key-file", "project-root", "template-dir",
-                 "skip-reason", "block-ratio", "doc-ratio", "source-label")
-FLAG_OPTIONS = ("strict",)
+                 "skip-reason", "block-ratio", "doc-ratio", "source-label", "backend",
+                 "agy-bin", "agy-model")
+FLAG_OPTIONS = ("strict", "fallback-openrouter")
 
 
 def parse_options(argv):
@@ -346,6 +408,8 @@ def parse_options(argv):
         "timeout": "900", "max-tokens": "131072", "max-bytes": "262144", "base-url": "",
         "api-key-file": "", "project-root": "", "template-dir": "", "skip-reason": "",
         "block-ratio": "", "doc-ratio": "", "source-label": "", "strict": False,
+        "backend": "openrouter", "agy-bin": "", "agy-model": "gemini-4-neon",
+        "fallback-openrouter": False,
     }
     i = 0
     while i < len(argv):
@@ -372,10 +436,15 @@ def parse_options(argv):
         raise UsageError("--effort must be one of %s" % ", ".join(EFFORTS))
     if opts["format"] and opts["format"] not in FORMATS:
         raise UsageError("--format must be one of %s" % ", ".join(FORMATS))
-    if not opts["model"] or opts["model"].endswith(":online"):
-        raise UsageError("a model ID is required and must not end in :online")
-    if not opts["base-url"]:
-        raise UsageError("--base-url is required")
+    if opts["backend"] not in BACKENDS:
+        raise UsageError("--backend must be one of %s" % ", ".join(BACKENDS))
+    if opts["backend"] == "agy" and not re.match(r"^[A-Za-z0-9._-]+$", opts["agy-model"]):
+        raise UsageError("--agy-model must be an agy model name such as gemini-4-neon")
+    if opts["backend"] == "openrouter" or opts["fallback-openrouter"]:
+        if not opts["model"] or opts["model"].endswith(":online"):
+            raise UsageError("a model ID is required and must not end in :online")
+        if not opts["base-url"]:
+            raise UsageError("--base-url is required")
     return opts
 
 
@@ -487,6 +556,36 @@ def api_error_message(raw_body):
     msg = _error_obj(raw_body).get("message")
     # Not truncated here: diag() redacts the key first, then truncates.
     return msg if isinstance(msg, str) else ""
+
+
+def classify_agy_error(text):
+    """Map an agy error message (result error plus stderr) to a reason code."""
+    t = text.lower()
+    if any(w in t for w in ("authentication", "not signed in", "sign in", "log in", "login",
+                            "unauthenticated", "oauth")):
+        return "auth"
+    if any(w in t for w in ("not recognized as a known model", "invalid model", "unknown model")):
+        return "bad_model"
+    if any(w in t for w in ("quota", "resource_exhausted", "resource exhausted", "exhausted",
+                            "spend cap", "out of credits", "prepaid", "usage limit")):
+        return "quota_exhausted"
+    if any(w in t for w in ("rate limit", "rate-limit", "too many requests", "429")):
+        return "rate_limited"
+    if any(w in t for w in ("timed out", "timeout", "deadline exceeded")):
+        return "timeout"
+    if any(w in t for w in ("network", "connection", "dial tcp", "no such host", "proxy")):
+        return "network"
+    return "agy_error"
+
+
+def agy_model_label(log_path):
+    """The last model label agy sent to its backend, read from its log, or ""."""
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as fh:
+            labels = AGY_LABEL_RE.findall(fh.read())
+    except OSError:
+        return ""
+    return labels[-1] if labels else ""
 
 
 class _NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -628,6 +727,12 @@ class Runner(object):
         self.started = time.time()
         self.deadline = None
         self.format = ""
+        self.backend_used = opts["backend"]
+        self.fallback_from = ""
+        self.model_label = ""
+        self.record_opened = False
+        self.child = None
+        self.temp_dirs = []
 
     # -- messages -----------------------------------------------------------
 
@@ -683,12 +788,32 @@ class Runner(object):
         return _exit_code_for(signum)
 
     def _cleanup_temps(self):
+        self._kill_child()
         for path in list(self.temp_paths):
             try:
                 os.unlink(path)
             except OSError:
                 pass
             self.temp_paths.remove(path)
+        for path in list(self.temp_dirs):
+            shutil.rmtree(path, ignore_errors=True)
+            self.temp_dirs.remove(path)
+
+    def _kill_child(self):
+        """Stop a running agy and everything it started (its own process group)."""
+        proc, self.child = self.child, None
+        if proc is None or proc.poll() is not None:
+            return
+        for sig, wait in ((signal.SIGTERM, AGY_KILL_GRACE), (signal.SIGKILL, 5.0)):
+            try:
+                os.killpg(proc.pid, sig)
+            except OSError:
+                return
+            try:
+                proc.wait(timeout=wait)
+                return
+            except subprocess.TimeoutExpired:
+                continue
 
     def _run(self):
         opts = self.opts
@@ -771,16 +896,7 @@ class Runner(object):
             if not spans:
                 raise Stop("skipped", "nothing_to_polish", "page has no eligible visible text")
 
-        self.key = self._resolve_key()
-        if not self.key:
-            raise Stop("skipped", "no_api_key",
-                       "set OPENROUTER_API_KEY or gemini_polish_api_key_file to enable polishing")
-        if self.key in text:
-            raise Stop("skipped", "secret_in_input", "input contains the API key; refusing to send it")
-
-        system_msg, user_msg, markers = self._build_messages(fmt, payload)
-        self._open_record(fmt, len(data))
-        content = self._request(system_msg, user_msg)
+        content, markers = self._fetch(text, fmt, len(data), payload)
         if self.record is not None:
             self.record.write_skill_file("candidate.txt", content)
         body = self._extract_envelope(content, markers)
@@ -790,6 +906,216 @@ class Runner(object):
         if bom:
             final_text = "\ufeff" + final_text
         return final_text.encode("utf-8")
+
+    # -- backends -----------------------------------------------------------
+
+    def _fetch(self, text, fmt, size, payload):
+        """Return (reply content, markers) from the selected backend."""
+        if self.opts["backend"] != "agy":
+            return self._openrouter_fetch(text, fmt, size, payload)
+        try:
+            return self._agy_fetch(fmt, size, payload)
+        except Stop as stop:
+            # A reply the guard or the tool check rejected is a content
+            # problem; paying for a second opinion would not fix it.
+            if stop.outcome == "rejected":
+                raise
+            if stop.detail:
+                self.diag(stop.detail)
+            if not self.opts["fallback-openrouter"]:
+                self.diag("not falling back to OpenRouter (gemini_polish_fallback_to_openrouter is false)")
+                raise Stop(stop.outcome, stop.reason)
+            self.key = self._resolve_key()
+            if not self.key:
+                self.diag("gemini_polish_fallback_to_openrouter is true, but no OpenRouter API key is set")
+                raise Stop(stop.outcome, stop.reason)
+            if self.key in text:
+                self.diag("not falling back to OpenRouter: the input contains the API key")
+                raise Stop(stop.outcome, stop.reason)
+            self.diag("agy failed (reason=%s); falling back to OpenRouter because "
+                      "gemini_polish_fallback_to_openrouter is true" % stop.reason)
+            self.fallback_from = "agy:%s" % stop.reason
+            self.backend_used = "openrouter"
+            self.effort_used = self.opts["effort"]
+            self.usage = {}
+            system_msg, user_msg, markers = self._build_messages(fmt, payload)
+            self._open_record(fmt, size)
+            return self._request(system_msg, user_msg), markers
+
+    def _openrouter_fetch(self, text, fmt, size, payload):
+        self.key = self._resolve_key()
+        if not self.key:
+            raise Stop("skipped", "no_api_key",
+                       "set OPENROUTER_API_KEY or gemini_polish_api_key_file to enable polishing")
+        if self.key in text:
+            raise Stop("skipped", "secret_in_input", "input contains the API key; refusing to send it")
+        system_msg, user_msg, markers = self._build_messages(fmt, payload)
+        self._open_record(fmt, size)
+        return self._request(system_msg, user_msg), markers
+
+    def _agy_fetch(self, fmt, size, payload):
+        binary = self._agy_binary()
+        if not binary:
+            raise Stop("skipped", "agy_not_found",
+                       "the agy command (Antigravity CLI) was not found; install it and sign in, "
+                       "set gemini_polish_agy_bin, or set gemini_polish_backend to openrouter")
+        system_msg, user_msg, markers = self._build_messages(fmt, payload)
+        self._open_record(fmt, size)
+        prompt = AGY_PREFACE + system_msg.strip("\n") + "\n\n" + user_msg
+        return self._agy_request(binary, prompt), markers
+
+    def _agy_binary(self):
+        configured = self.opts["agy-bin"]
+        if configured:
+            path = os.path.expanduser(configured)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+            self.diag("gemini_polish_agy_bin is not an executable file: %s" % configured)
+            return None
+        found = shutil.which("agy")
+        if found:
+            return found
+        # Claude Code hooks and other tools often run with a short PATH.
+        local = os.path.expanduser("~/.local/bin/agy")
+        if os.path.isfile(local) and os.access(local, os.X_OK):
+            return local
+        return None
+
+    def _agy_request(self, binary, prompt):
+        timeout = int(self.opts["timeout"])
+        base = tempfile.mkdtemp(prefix="humanize-polish-agy-")
+        self.temp_dirs.append(base)
+        try:
+            # agy treats its working directory as the workspace: an empty one
+            # holding only the deny-all hook.
+            workspace = os.path.join(base, "workspace")
+            os.makedirs(os.path.join(workspace, ".agents"))
+            with open(os.path.join(workspace, ".agents", "hooks.json"), "w") as fh:
+                json.dump(AGY_HOOKS, fh, indent=2)
+            if self.record is not None and not self.record.broken:
+                log_path = os.path.join(self.record.cache_dir, "agy-run.log")
+            else:
+                log_path = os.path.join(base, "agy-run.log")
+            argv = [binary, "--output-format", "stream-json",
+                    "--model", self.opts["agy-model"], "--effort", self.opts["effort"],
+                    "--disable-slash-commands", "--sandbox",
+                    "--settings", json.dumps(AGY_SETTINGS, separators=(",", ":")),
+                    "--print-timeout", "%ds" % timeout, "--log-file", log_path]
+            env = dict((k, v) for k, v in os.environ.items() if k not in AGY_ENV_DROP)
+            if self.record is not None:
+                self.record.write_cache_file(
+                    "gemini-run.cmd",
+                    "# polish-gemini agy run (the prompt goes to standard input)\n"
+                    "# Timestamp: %s\n# Timeout: %s seconds\n# Working directory: %s\n\n%s\n\n"
+                    "# Standard input (%d characters):\n\n%s"
+                    % (_iso(time.time()), timeout, workspace, " ".join(shlex.quote(a) for a in argv),
+                       len(prompt), prompt))
+            self.diag("running agy (model=%s effort=%s)" % (self.opts["agy-model"], self.opts["effort"]))
+            rc, out, err = self._run_agy(argv, workspace, env, prompt.encode("utf-8"), timeout)
+            self.model_label = agy_model_label(log_path)
+            return self._agy_accept(rc, out, err, timeout)
+        finally:
+            self._kill_child()
+            shutil.rmtree(base, ignore_errors=True)
+            if base in self.temp_dirs:
+                self.temp_dirs.remove(base)
+
+    def _run_agy(self, argv, workspace, env, stdin_bytes, timeout):
+        try:
+            proc = subprocess.Popen(argv, cwd=workspace, env=env, stdin=subprocess.PIPE,
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    close_fds=True, start_new_session=True)
+        except OSError as exc:
+            raise Stop("skipped", "agy_not_found", "cannot start agy: %s" % (exc.strerror or exc))
+        self.child = proc
+        self.deadline = time.monotonic() + timeout + AGY_KILL_GRACE
+        first = True
+        while True:
+            remaining = self.deadline - time.monotonic()
+            if remaining <= 0:
+                self._kill_child()
+                raise Stop("failed", "timeout", "agy did not finish within %s seconds" % timeout)
+            # Without a supervising wrapper there is nothing to poll for, so one
+            # wait covers the whole budget.
+            wait = min(SUPERVISOR_POLL, remaining) if _SUPERVISOR else remaining
+            try:
+                out, err = proc.communicate(input=stdin_bytes if first else None, timeout=wait)
+                break
+            except subprocess.TimeoutExpired:
+                first = False
+                if _supervisor_gone():
+                    _raise_interrupt(signal.SIGTERM, None)
+        self.child = None
+        return proc.returncode, out.decode("utf-8", "replace"), err.decode("utf-8", "replace")
+
+    def _agy_accept(self, rc, out, err, timeout):
+        events = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(event, dict):
+                events.append(event)
+        if self.record is not None:
+            kept = [e for e in events if not (e.get("event") == "step_update" and isinstance(
+                e.get("step_update"), dict) and e["step_update"].get("step_type") == "agent_response")]
+            self.record.write_cache_file(
+                "gemini-run.out",
+                "# agy exit status: %s\n# stderr:\n%s\n\n%s\n" % (
+                    rc, err.strip(), "\n".join(json.dumps(e, ensure_ascii=False) for e in kept)))
+        init = None
+        result = None
+        tools = []
+        for event in events:
+            kind = event.get("event")
+            if kind == "init" and isinstance(event.get("init"), dict) and init is None:
+                init = event["init"]
+            elif kind == "result" and isinstance(event.get("result"), dict):
+                result = event["result"]
+            elif kind == "step_update" and isinstance(event.get("step_update"), dict):
+                step = event["step_update"]
+                if step.get("step_type") == "tool":
+                    tools.append(str(step.get("tool_name") or "unknown tool"))
+        stderr_line = one_line(err.strip(), 300)
+        if result is None:
+            if rc != 0:
+                reason = classify_agy_error(err)
+                raise Stop("failed", reason, "agy exited with status %s: %s%s"
+                           % (rc, stderr_line, AGY_HINTS.get(reason, "")))
+            raise Stop("failed", "bad_json", "agy printed no result event")
+        usage = result.get("usage")
+        if isinstance(usage, dict):
+            self.usage = {
+                "prompt_tokens": usage.get("input_tokens"),
+                "completion_tokens": usage.get("output_tokens"),
+                "completion_tokens_details": {"reasoning_tokens": usage.get("thinking_tokens")},
+                "cost": "subscription",
+            }
+        if result.get("finished_reason") == "print_timeout":
+            raise Stop("failed", "timeout", "agy did not finish within %s seconds" % timeout)
+        if result.get("status") != "SUCCESS" or rc != 0:
+            message = result.get("error") if isinstance(result.get("error"), str) else ""
+            reason = classify_agy_error("%s\n%s" % (message, err))
+            raise Stop("failed", reason, "agy reported an error (exit status %s): %s%s"
+                       % (rc, one_line(message or err.strip(), 300), AGY_HINTS.get(reason, "")))
+        if init is None or init.get("permission_mode") != "strict":
+            raise Stop("failed", "agy_lockdown",
+                       "agy did not confirm the strict tool permission mode (got %r); the reply is not used"
+                       % (init or {}).get("permission_mode"))
+        denied = result.get("denied_actions")
+        if isinstance(denied, list):
+            tools.extend(str(d.get("action")) for d in denied if isinstance(d, dict) and d.get("action"))
+        if tools:
+            raise Stop("rejected", "tool_call", "agy tried to use tools (%s); the reply is not used"
+                       % ", ".join(sorted(set(tools))))
+        response = result.get("response")
+        if not isinstance(response, str) or not response.strip():
+            raise Stop("failed", "empty_response", "agy returned no text")
+        return response.replace("\r\n", "\n")
 
     def _resolve_key(self):
         env_key = os.environ.get("OPENROUTER_API_KEY", "")
@@ -860,7 +1186,14 @@ class Runner(object):
         return re.sub(r"\{\{([A-Z_]+)\}\}",
                       lambda m: values.get(m.group(1), m.group(0)), template)
 
+    def _model_for(self, backend):
+        return self.opts["agy-model"] if backend == "agy" else self.opts["model"]
+
     def _open_record(self, fmt, size):
+        # Once per run, also when an agy failure falls back to OpenRouter.
+        if self.record_opened:
+            return
+        self.record_opened = True
         root = self.opts["project-root"]
         if not root:
             self.diag("records=unavailable (no project root)")
@@ -877,9 +1210,10 @@ class Runner(object):
         self.record.write_input(
             "# Polish Gemini Input\n\n## Question\n\nPolish %s (%d bytes, %s)\n\n"
             "## Configuration\n\n- Model: %s\n- Effort: %s\n- Timeout: %ss\n- Max tokens: %s\n"
-            "- Backend: openrouter\n- Mode: polish\n- Timestamp: %s\n- Tool: gemini\n"
-            % (label, size, fmt, self.opts["model"], self.opts["effort"], self.opts["timeout"],
-               self.opts["max-tokens"], time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(self.started))))
+            "- Backend: %s\n- Mode: polish\n- Timestamp: %s\n- Tool: gemini\n"
+            % (label, size, fmt, self._model_for(self.backend_used), self.opts["effort"],
+               self.opts["timeout"], self.opts["max-tokens"], self.backend_used,
+               time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(self.started))))
         ext = {"markdown": ".md", "text": ".txt", "segments": ".txt", "html": ".html"}[fmt]
         self.record.write_skill_file("source" + ext, self.source_bytes)
 
@@ -1201,8 +1535,15 @@ class Runner(object):
         fields = [
             ("tool", "gemini"),
             ("mode", "polish"),
-            ("backend", "openrouter"),
-            ("model", self.opts["model"]),
+            ("backend", self.backend_used),
+            ("model", self._model_for(self.backend_used)),
+        ]
+        if self.backend_used == "agy":
+            # The model and effort agy reports it actually used, from its log.
+            fields.append(("model_label", self.model_label or "unknown"))
+        if self.fallback_from:
+            fields.append(("fallback_from", self.fallback_from))
+        fields += [
             ("effort", self.effort_used),
             ("effort_used", self.effort_used),
             ("status", status),

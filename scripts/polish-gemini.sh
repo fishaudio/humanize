@@ -2,13 +2,16 @@
 #
 # polish-gemini.sh - Readability-only polish of human-facing text with Gemini
 #
-# Sends a document to a Gemini model on OpenRouter with a fixed copy-editing
-# contract and no tools, checks the reply with a deterministic fidelity guard,
-# and delivers either the polished text or the exact original bytes.
+# Sends a document to a Gemini model with a fixed copy-editing contract, checks
+# the reply with a deterministic fidelity guard, and delivers either the
+# polished text or the exact original bytes. The default backend is agy (the
+# Antigravity CLI on the signed-in Gemini subscription, run with every tool
+# refused); OpenRouter (pay per call, no tools) is the other backend.
 #
 # Usage:
 #   polish-gemini.sh --input <file|-> [--output <file>]
 #                    [--format markdown|text|segments|html] [--auto]
+#                    [--backend agy|openrouter]
 #                    [--model MODEL] [--effort xhigh|high|medium|low]
 #                    [--timeout SECONDS] [--max-tokens N] [--max-bytes N]
 #                    [--strict]
@@ -27,9 +30,9 @@
 #   143  interrupted by SIGTERM
 #
 # This wrapper parses arguments and the merged humanize config, then hands off
-# to scripts/lib/polish_gemini.py (Python 3 standard library). The API key is
-# read inside Python from OPENROUTER_API_KEY or the configured key file; it is
-# never passed on a command line.
+# to scripts/lib/polish_gemini.py (Python 3 standard library). The OpenRouter
+# API key is read inside Python from OPENROUTER_API_KEY or the configured key
+# file; it is never passed on a command line and never reaches agy.
 #
 
 # No "set -e": every failure path must still print the outcome line.
@@ -51,8 +54,10 @@ ORIG_UMASK="$(umask)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 PLUGIN_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DEFAULT_MODEL="google/gemini-4-hydrogen"
-DEFAULT_EFFORT="xhigh"
+DEFAULT_BACKEND="agy"
+DEFAULT_AGY_MODEL="gemini-4-neon"
+DEFAULT_MODEL="google/gemini-4-neon"
+DEFAULT_EFFORT="medium"
 DEFAULT_TIMEOUT=900
 DEFAULT_MAX_TOKENS=131072
 DEFAULT_MAX_BYTES=262144
@@ -271,10 +276,14 @@ OPTIONS:
                        extension (.html/.htm -> html, .md -> markdown, else text).
   --auto               Automatic call site: skip when gemini_polish_enabled is false
                        or the config cannot be loaded.
-  --model <id>         OpenRouter model ID (default: google/gemini-4-hydrogen)
-  --effort <level>     Reasoning effort: xhigh, high, medium or low (default: xhigh)
+  --backend <name>     agy (default: the Antigravity CLI on your signed-in Gemini
+                       subscription) or openrouter (pay per call, needs an API key)
+  --model <id>         Model of the selected backend: an agy model name
+                       (default: gemini-4-neon) or an OpenRouter model ID
+                       (default: google/gemini-4-neon)
+  --effort <level>     Reasoning effort: xhigh, high, medium or low (default: medium)
   --timeout <seconds>  Overall deadline for the request (default: 900)
-  --max-tokens <n>     Completion budget, reasoning included (default: 131072)
+  --max-tokens <n>     OpenRouter completion budget, reasoning included (default: 131072)
   --max-bytes <n>      Largest input to send (default: 262144)
   --strict             Exit 3 instead of 0 when the original had to be delivered
   -h, --help           Show this help
@@ -288,14 +297,24 @@ EXIT CODES:
   0 delivered, 3 original delivered under --strict, 1 usage error,
   4 delivery failed, 130/143 interrupted.
 
-API KEY:
-  OPENROUTER_API_KEY, or the file named by the gemini_polish_api_key_file
-  config key (a raw key or one OPENROUTER_API_KEY=value line, mode 600).
+BACKENDS:
+  agy needs the agy command (found on PATH or in ~/.local/bin, or set
+  gemini_polish_agy_bin) signed in with the account that has your Gemini
+  subscription. It runs from an empty temporary folder with every tool refused,
+  and gets the document on standard input. When agy is missing, signed out, out
+  of quota or fails, the original is kept; set
+  gemini_polish_fallback_to_openrouter to true to try OpenRouter instead.
+
+  openrouter needs OPENROUTER_API_KEY, or the file named by the
+  gemini_polish_api_key_file config key (a raw key or one
+  OPENROUTER_API_KEY=value line, mode 600).
 
 CONFIG KEYS:
-  gemini_polish_enabled, gemini_polish_model, gemini_polish_reasoning_effort,
-  gemini_polish_max_tokens, gemini_polish_timeout, gemini_polish_max_bytes,
-  gemini_polish_api_key_file, gemini_polish_base_url
+  gemini_polish_enabled, gemini_polish_backend, gemini_polish_agy_model,
+  gemini_polish_agy_bin, gemini_polish_fallback_to_openrouter,
+  gemini_polish_model, gemini_polish_reasoning_effort, gemini_polish_max_tokens,
+  gemini_polish_timeout, gemini_polish_max_bytes, gemini_polish_api_key_file,
+  gemini_polish_base_url
 HELP_EOF
 }
 
@@ -310,6 +329,13 @@ is_effort() {
     return 1
 }
 
+is_backend() {
+    case "$1" in
+        agy|openrouter) return 0 ;;
+    esac
+    return 1
+}
+
 # ========================================
 # Parse Arguments
 # ========================================
@@ -319,6 +345,7 @@ OUTPUT=""
 FORMAT=""
 AUTO=false
 STRICT=false
+CLI_BACKEND=""
 CLI_MODEL=""
 CLI_EFFORT=""
 CLI_TIMEOUT=""
@@ -360,6 +387,11 @@ while [[ $# -gt 0 ]]; do
         --strict)
             STRICT=true
             shift
+            ;;
+        --backend)
+            require_value "$1" "$#"
+            CLI_BACKEND="$2"
+            shift 2
             ;;
         --model)
             require_value "$1" "$#"
@@ -408,6 +440,9 @@ if [[ -n "$FORMAT" ]]; then
         markdown|text|segments|html) ;;
         *) usage_error "--format must be markdown, text, segments or html, got: $FORMAT" ;;
     esac
+fi
+if [[ -n "$CLI_BACKEND" ]] && ! is_backend "$CLI_BACKEND"; then
+    usage_error "--backend must be agy or openrouter, got: $CLI_BACKEND"
 fi
 if [[ -n "$CLI_EFFORT" ]] && ! is_effort "$CLI_EFFORT"; then
     usage_error "--effort must be xhigh, high, medium or low, got: $CLI_EFFORT"
@@ -468,6 +503,10 @@ CFG_TIMEOUT="$(config_value gemini_polish_timeout)"
 CFG_MAX_BYTES="$(config_value gemini_polish_max_bytes)"
 CFG_KEY_FILE="$(config_value gemini_polish_api_key_file)"
 CFG_BASE_URL="$(config_value gemini_polish_base_url)"
+CFG_BACKEND="$(config_value gemini_polish_backend)"
+CFG_AGY_MODEL="$(config_value gemini_polish_agy_model)"
+CFG_AGY_BIN="$(config_value gemini_polish_agy_bin)"
+CFG_FALLBACK="$(config_value gemini_polish_fallback_to_openrouter)"
 
 if [[ "$CONFIG_OK" != "true" && "$AUTO" != "true" ]]; then
     diag "config could not be loaded; using built-in defaults"
@@ -490,7 +529,64 @@ resolve_int() {
     fi
 }
 
-MODEL="${CLI_MODEL:-${CFG_MODEL:-$DEFAULT_MODEL}}"
+# Backend: --backend, then HUMANIZE_POLISH_BACKEND, then a valid config value.
+if [[ -n "$CLI_BACKEND" ]]; then
+    BACKEND="$CLI_BACKEND"
+elif [[ -n "${HUMANIZE_POLISH_BACKEND:-}" ]]; then
+    if is_backend "$HUMANIZE_POLISH_BACKEND"; then
+        BACKEND="$HUMANIZE_POLISH_BACKEND"
+    else
+        diag "ignoring invalid HUMANIZE_POLISH_BACKEND: $HUMANIZE_POLISH_BACKEND"
+        BACKEND="$DEFAULT_BACKEND"
+    fi
+elif [[ -n "$CFG_BACKEND" ]]; then
+    if is_backend "$CFG_BACKEND"; then
+        BACKEND="$CFG_BACKEND"
+    else
+        diag "ignoring invalid gemini_polish_backend in config: $CFG_BACKEND"
+        BACKEND="$DEFAULT_BACKEND"
+    fi
+else
+    BACKEND="$DEFAULT_BACKEND"
+fi
+
+# --model names the model of the selected backend.
+OR_CLI_MODEL=""
+AGY_CLI_MODEL=""
+if [[ "$BACKEND" == "agy" ]]; then
+    AGY_CLI_MODEL="$CLI_MODEL"
+else
+    OR_CLI_MODEL="$CLI_MODEL"
+fi
+
+if [[ -n "$AGY_CLI_MODEL" ]]; then
+    if [[ ! "$AGY_CLI_MODEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        usage_error "agy model names use letters, digits, dot, underscore and hyphen, got: $AGY_CLI_MODEL"
+    fi
+    AGY_MODEL="$AGY_CLI_MODEL"
+elif [[ -n "$CFG_AGY_MODEL" ]]; then
+    if [[ "$CFG_AGY_MODEL" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        AGY_MODEL="$CFG_AGY_MODEL"
+    else
+        diag "ignoring invalid gemini_polish_agy_model in config: $CFG_AGY_MODEL"
+        AGY_MODEL="$DEFAULT_AGY_MODEL"
+    fi
+else
+    AGY_MODEL="$DEFAULT_AGY_MODEL"
+fi
+
+AGY_BIN="${HUMANIZE_POLISH_AGY_BIN:-$CFG_AGY_BIN}"
+
+case "$CFG_FALLBACK" in
+    ""|false) FALLBACK=false ;;
+    true) FALLBACK=true ;;
+    *)
+        diag "ignoring invalid gemini_polish_fallback_to_openrouter in config: $CFG_FALLBACK"
+        FALLBACK=false
+        ;;
+esac
+
+MODEL="${OR_CLI_MODEL:-${CFG_MODEL:-$DEFAULT_MODEL}}"
 if [[ ! "$MODEL" =~ ^[A-Za-z0-9._:/-]+$ ]]; then
     usage_error "model ID contains invalid characters: $MODEL"
 fi
@@ -633,6 +729,8 @@ fi
 
 PY_ARGS=(
     --input "$INPUT"
+    --backend "$BACKEND"
+    --agy-model "$AGY_MODEL"
     --model "$MODEL"
     --effort "$EFFORT"
     --timeout "$TIMEOUT"
@@ -649,6 +747,8 @@ PY_ARGS=(
 [[ -n "${HUMANIZE_POLISH_BLOCK_RATIO:-}" ]] && PY_ARGS+=(--block-ratio "$HUMANIZE_POLISH_BLOCK_RATIO")
 [[ -n "${HUMANIZE_POLISH_DOC_RATIO:-}" ]] && PY_ARGS+=(--doc-ratio "$HUMANIZE_POLISH_DOC_RATIO")
 [[ "$STRICT" == "true" ]] && PY_ARGS+=(--strict)
+[[ -n "$AGY_BIN" ]] && PY_ARGS+=(--agy-bin "$AGY_BIN")
+[[ "$FALLBACK" == "true" ]] && PY_ARGS+=(--fallback-openrouter)
 
 cleanup_temps
 if [[ ! -r "$SCRIPT_DIR/lib/polish_gemini.py" || ! -r "$SCRIPT_DIR/lib/polish_guard.py" ]]; then

@@ -49,6 +49,10 @@ export CLAUDE_PROJECT_DIR="$PROJ"
 export XDG_CACHE_HOME="$TEST_DIR/cache"
 export XDG_CONFIG_HOME="$TEST_DIR/xdg"
 unset HUMANIZE_CONFIG OPENROUTER_API_KEY HUMANIZE_POLISH_PYTHON HUMANIZE_POLISH_BLOCK_RATIO HUMANIZE_POLISH_DOC_RATIO
+# This suite covers the OpenRouter backend; tests/test-polish-gemini-agy.sh
+# covers agy, the default backend.
+export HUMANIZE_POLISH_BACKEND=openrouter
+unset HUMANIZE_POLISH_AGY_BIN
 # Any accidental non-loopback request fails fast instead of reaching the network.
 export HTTPS_PROXY="http://127.0.0.1:9" HTTP_PROXY="http://127.0.0.1:9"
 export https_proxy="$HTTPS_PROXY" http_proxy="$HTTP_PROXY"
@@ -320,13 +324,13 @@ if [[ "$(req_json 1 '.method')" == "POST" && "$(req_json 1 '.path')" == "/api/v1
 else
     fail "request method and path" "POST /api/v1/chat/completions" "$(req_json 1 '.method') $(req_json 1 '.path')"
 fi
-if [[ "$(req_json 1 '.body.model')" == "google/gemini-4-hydrogen" ]] && \
-   [[ "$(req_json 1 '.body.reasoning.effort')" == "xhigh" ]] && \
+if [[ "$(req_json 1 '.body.model')" == "google/gemini-4-neon" ]] && \
+   [[ "$(req_json 1 '.body.reasoning.effort')" == "medium" ]] && \
    [[ "$(req_json 1 '.body.reasoning.exclude')" == "true" ]] && \
    [[ "$(req_json 1 '.body.max_tokens')" == "131072" ]]; then
-    pass "body has the default model, reasoning effort xhigh, exclude=true and max_tokens"
+    pass "body has the default model, reasoning effort medium, exclude=true and max_tokens"
 else
-    fail "request body defaults" "hydrogen/xhigh/true/131072" "$(req_json 1 '.body | {model, reasoning, max_tokens}')"
+    fail "request body defaults" "neon/medium/true/131072" "$(req_json 1 '.body | {model, reasoning, max_tokens}')"
 fi
 if [[ "$(req_json 1 '.body | has("tools") or has("tool_choice") or has("plugins")')" == "false" ]]; then
     pass "body has no tools, tool_choice or plugins"
@@ -395,7 +399,7 @@ echo "--- Reasoning effort fallback ---"
 
 EFFORT_REJECT='{"status":400,"json":{"error":{"code":400,"message":"Invalid value for reasoning.effort: xhigh is not supported. Allowed values: low, medium, high"}}}'
 set_scenario "[$EFFORT_REJECT, {\"replace\":[[\"is dense with jargon\",\"uses a lot of jargon\"]]}]"
-run_polish --input "$DOC"
+run_polish --input "$DOC" --effort xhigh
 assert_outcome "xhigh rejected then high accepted gives polished" polished ok yes 0
 if [[ "$(req_count)" == "2" && "$(req_json 1 '.body.reasoning.effort')" == "xhigh" && \
       "$(req_json 2 '.body.reasoning.effort')" == "high" ]]; then
@@ -412,7 +416,7 @@ fi
 if grep -q "retrying once with high" "$ERR"; then pass "effort fallback prints a diagnostic"; else fail "effort fallback diagnostic" "message" "$(cat "$ERR")"; fi
 
 set_scenario "[$EFFORT_REJECT]"
-run_polish --input "$DOC"
+run_polish --input "$DOC" --effort xhigh
 assert_outcome "both efforts rejected fails as api_error" failed api_error yes 0
 if [[ "$(req_count)" == "2" ]]; then pass "no more than two requests are sent"; else fail "no more than two requests" "2" "$(req_count)"; fi
 
@@ -878,7 +882,7 @@ else
 fi
 META="$RECORD/metadata.md"
 meta_ok=true
-for kv in "tool: gemini" "mode: polish" "backend: openrouter" "model: google/gemini-4-hydrogen" "effort_used: xhigh" \
+for kv in "tool: gemini" "mode: polish" "backend: openrouter" "model: google/gemini-4-neon" "effort_used: medium" \
           "status: success" "outcome: polished" "reason: ok" "prompt_tokens: 1200" "completion_tokens: 900" \
           "reasoning_tokens: 700" "cost: 0.00855"; do
     grep -qx "$kv" "$META" || { meta_ok=false; echo "  missing: $kv"; }

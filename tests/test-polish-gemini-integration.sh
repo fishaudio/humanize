@@ -94,8 +94,11 @@ else
     pass "default scenarios exclude plans, round summaries and idea drafts"
 fi
 contains "skill states the --auto rule" "$SKILL" "With \`--auto\`, the script respects \`gemini_polish_enabled\`"
-contains "skill states the once-per-deliverable rule" "$SKILL" "Polish each finished deliverable once, not after every intermediate edit."
-contains "skill states the cost notice" "$SKILL" "one run takes minutes and costs money"
+contains "skill states the once-per-deliverable rule" "$SKILL" "polish each finished deliverable once, not after every intermediate edit."
+contains "skill states that agy costs nothing per call" "$SKILL" "uses the user's Gemini subscription quota and costs nothing per call"
+contains "skill states that OpenRouter costs money" "$SKILL" "On the OpenRouter backend every run costs money."
+contains "skill names agy as the default backend" "$SKILL" "\`gemini_polish_backend\` is \`agy\` by default"
+contains "skill says there is no fallback unless asked" "$SKILL" "It never falls back to OpenRouter unless \`gemini_polish_fallback_to_openrouter\` is \`true\`."
 for item in "same claims;" "same negations and caveats;" "same obligation strength" "same language and variant" \
             "every gloss only explains a term already present;" "nothing added that is not a gloss;" "nothing dropped."; do
     contains "skill review checklist has '$item'" "$SKILL" "- $item"
@@ -123,8 +126,12 @@ check_default() {
     if [[ "$got" == "$expected" ]]; then pass "default $key is $expected"; else fail "default $key" "$expected" "$got"; fi
 }
 check_default gemini_polish_enabled 'true'
-check_default gemini_polish_model '"google/gemini-4-hydrogen"'
-check_default gemini_polish_reasoning_effort '"xhigh"'
+check_default gemini_polish_backend '"agy"'
+check_default gemini_polish_agy_model '"gemini-4-neon"'
+check_default gemini_polish_agy_bin '""'
+check_default gemini_polish_fallback_to_openrouter 'false'
+check_default gemini_polish_model '"google/gemini-4-neon"'
+check_default gemini_polish_reasoning_effort '"medium"'
 check_default gemini_polish_max_tokens '131072'
 check_default gemini_polish_timeout '900'
 check_default gemini_polish_max_bytes '262144'
@@ -282,11 +289,11 @@ else
     fail "Bash validator allows the polish command" "exit 0 in Finalize Phase" "exit $VALIDATOR_RC: $VALIDATOR_OUT"
 fi
 
-# With no API key the finalize summary stays byte-identical.
+# On the OpenRouter backend with no API key the finalize summary stays byte-identical.
 printf '# Finalize Summary\n\nAll 14 acceptance criteria were met and tests pass.\n' > "$LOOP1/finalize-summary.md"
 cp "$LOOP1/finalize-summary.md" "$TEST_DIR/summary-before.md"
 NOKEY_ERR="$(cd "$REPO1" && env -u OPENROUTER_API_KEY CLAUDE_PROJECT_DIR="$REPO1" XDG_CACHE_HOME="$REPO1/.cache" \
-    XDG_CONFIG_HOME="$TEST_DIR/xdg" HUMANIZE_POLISH_BASE_URL="http://127.0.0.1:9/api/v1" \
+    XDG_CONFIG_HOME="$TEST_DIR/xdg" HUMANIZE_POLISH_BASE_URL="http://127.0.0.1:9/api/v1" HUMANIZE_POLISH_BACKEND=openrouter \
     "$RUNNER" --auto --input "$LOOP1/finalize-summary.md" --output "$LOOP1/finalize-summary.md" 2>&1 >/dev/null)"
 NOKEY_RC=$?
 if [[ "$NOKEY_RC" == "0" ]] && cmp -s "$TEST_DIR/summary-before.md" "$LOOP1/finalize-summary.md" && \
@@ -363,15 +370,17 @@ QUIZ_DIR="$TEST_DIR/quiz-project"
 mkdir -p "$QUIZ_DIR/.humanize/quiz"
 printf '%s\n' "$QUIZ_LAYOUT" > "$QUIZ_DIR/.humanize/quiz/quiz-segments.txt"
 cp "$QUIZ_DIR/.humanize/quiz/quiz-segments.txt" "$TEST_DIR/quiz-before.txt"
-QUIZ_ERR="$(cd "$QUIZ_DIR" && env -u OPENROUTER_API_KEY CLAUDE_PROJECT_DIR="$QUIZ_DIR" XDG_CACHE_HOME="$QUIZ_DIR/.cache" \
-    XDG_CONFIG_HOME="$TEST_DIR/xdg" HUMANIZE_POLISH_BASE_URL="http://127.0.0.1:9/api/v1" \
+# On the default agy backend, with agy missing, the quiz file stays byte-identical.
+QUIZ_ERR="$(cd "$QUIZ_DIR" && env -u OPENROUTER_API_KEY -u HUMANIZE_POLISH_BACKEND CLAUDE_PROJECT_DIR="$QUIZ_DIR" \
+    XDG_CACHE_HOME="$QUIZ_DIR/.cache" XDG_CONFIG_HOME="$TEST_DIR/xdg" HUMANIZE_POLISH_BASE_URL="http://127.0.0.1:9/api/v1" \
+    HUMANIZE_POLISH_AGY_BIN="$TEST_DIR/no-such-agy" \
     "$RUNNER" --auto --format segments --input ".humanize/quiz/quiz-segments.txt" --output ".humanize/quiz/quiz-segments.txt" 2>&1 >/dev/null)"
 QUIZ_RC=$?
 if [[ "$QUIZ_RC" == "0" ]] && cmp -s "$TEST_DIR/quiz-before.txt" "$QUIZ_DIR/.humanize/quiz/quiz-segments.txt" && \
-   [[ "$(tail -n 1 <<< "$QUIZ_ERR")" == "polish-gemini: outcome=skipped reason=no_api_key delivered=yes" ]]; then
-    pass "without an API key the quiz segments file is left byte-identical"
+   [[ "$(tail -n 1 <<< "$QUIZ_ERR")" == "polish-gemini: outcome=skipped reason=agy_not_found delivered=yes" ]]; then
+    pass "without agy the quiz segments file is left byte-identical"
 else
-    fail "no key leaves the quiz segments unchanged" "exit 0, skipped no_api_key" "exit $QUIZ_RC: $QUIZ_ERR"
+    fail "no agy leaves the quiz segments unchanged" "exit 0, skipped agy_not_found" "exit $QUIZ_RC: $QUIZ_ERR"
 fi
 
 echo ""
@@ -395,7 +404,12 @@ contains "usage doc quiz section mentions polishing" "$USAGE_DOC" "the questions
 contains "usage doc explains the --auto rule" "$USAGE_DOC" "\`--auto\` marks an automatic call site."
 contains "usage doc explains API key setup" "$USAGE_DOC" "#### API key setup"
 contains "usage doc states the guard's limits" "$USAGE_DOC" "The guard cannot prove that meaning is unchanged."
-contains "usage doc has the privacy note" "$USAGE_DOC" "the document text is sent to OpenRouter and on to Google"
+contains "usage doc has the privacy note" "$USAGE_DOC" "the document text is sent to Google: through agy on the default backend, or to OpenRouter and on to Google"
+contains "usage doc has the backends section" "$USAGE_DOC" "#### Backends"
+contains "usage doc explains the agy lockdown" "$USAGE_DOC" "puts a \`PreToolUse\` hook in that folder that denies every tool call"
+contains "usage doc says agy never falls back on its own" "$USAGE_DOC" "No agy failure falls back to OpenRouter on its own"
+contains "usage doc lists the agy failure reasons" "$USAGE_DOC" "| \`quota_exhausted\` | The subscription quota is used up |"
+contains "README says agy needs no API key" "$README" "so you need agy installed and signed in, not an API key"
 contains "usage doc has the cost note" "$USAGE_DOC" "Lowering \`gemini_polish_reasoning_effort\`"
 contains "README Quick Start has the polish entry" "$README" "/humanize:polish-gemini --input docs/guide.md --output docs/guide.md"
 
@@ -418,6 +432,7 @@ FEATURE_FILES=(
     "skills/polish-gemini/SKILL.md" "config/default_config.json" "hooks/loop-codex-stop-hook.sh"
     "docs/usage.md" "docs/polish-guard-rules.md" "README.md" ".claude-plugin/plugin.json" ".claude-plugin/marketplace.json"
     "tests/test-polish-gemini.sh" "tests/test-polish-gemini-guard.sh" "tests/test-polish-gemini-integration.sh"
+    "tests/test-polish-gemini-agy.sh" "tests/mocks/agy-mock.py"
     "tests/polish-guard-cases.py" "tests/polish-runner-cases.py" "tests/mocks/openrouter-mock.py"
     "tests/manual-polish-gemini-real.sh"
     "tests/run-all-tests.sh"
@@ -437,7 +452,7 @@ if [[ -z "$CJK_HITS" ]]; then pass "no file added or changed by this feature con
 echo ""
 echo "--- Suite registration ---"
 
-for suite in test-polish-gemini.sh test-polish-gemini-guard.sh test-polish-gemini-integration.sh; do
+for suite in test-polish-gemini.sh test-polish-gemini-agy.sh test-polish-gemini-guard.sh test-polish-gemini-integration.sh; do
     if grep -Fq "\"$suite\"" "$SCRIPT_DIR/run-all-tests.sh"; then pass "$suite is registered"; else fail "$suite is registered" "listed" "missing"; fi
 done
 if grep -Fq "manual-polish-gemini-real.sh" "$SCRIPT_DIR/run-all-tests.sh"; then
