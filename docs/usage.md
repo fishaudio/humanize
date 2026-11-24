@@ -263,6 +263,7 @@ and `metadata.md` for reference.
 
 scripts/polish-gemini.sh --input <file|-> [--output <file>]
                          [--format markdown|text|segments|html] [--auto]
+                         [--backend agy|openrouter]
                          [--model MODEL] [--effort xhigh|high|medium|low]
                          [--timeout SECONDS] [--max-tokens N] [--max-bytes N]
                          [--strict]
@@ -275,19 +276,22 @@ OPTIONS:
                          extension (.html/.htm -> html, .md -> markdown, else text)
   --auto                 Automatic call site: skip when gemini_polish_enabled is false
                          or the config cannot be loaded
-  --model <id>           OpenRouter model ID (default: google/gemini-4-hydrogen)
-  --effort <level>       Reasoning effort (default: xhigh)
+  --backend <name>       agy (default) or openrouter
+  --model <id>           Model of the selected backend: an agy model name
+                         (default: gemini-4-neon) or an OpenRouter model ID
+                         (default: google/gemini-4-neon)
+  --effort <level>       Reasoning effort (default: medium)
   --timeout <seconds>    Overall deadline for the request (default: 900)
-  --max-tokens <n>       Completion budget, reasoning included (default: 131072)
+  --max-tokens <n>       OpenRouter completion budget, reasoning included (default: 131072)
   --max-bytes <n>        Largest input to send (default: 262144)
   --strict               Exit 3 instead of 0 when the original had to be delivered
 ```
 
-Claude and Codex often write documents full of jargon. `polish-gemini` sends text that people will read to a Gemini model on OpenRouter for a readability-only pass, then delivers either the polished text or the exact original bytes.
+Claude and Codex often write documents full of jargon. `polish-gemini` sends text that people will read to a Gemini model for a readability-only pass, then delivers either the polished text or the exact original bytes. By default the request goes through agy, the Antigravity CLI, on the Gemini subscription you are signed in to, with Gemini 4 Neon at medium effort, so a run costs nothing per call. OpenRouter, which bills each call, is the other backend (see [Backends](#backends)).
 
 Gemini acts only as a copy editor:
 
-- The request carries no tools, so Gemini cannot read files, run commands, or search the web. Web-search model IDs (ending in `:online`) are refused.
+- Gemini gets no tool it can use, so it cannot read files, run commands, or search the web. On OpenRouter the request carries no tools, and web-search model IDs (ending in `:online`) are refused. agy is an agent with such tools, so every polish run locks them down, and a run in which agy tries any tool is rejected (`reason=tool_call`).
 - The document is sent as data between per-run marker lines. Instructions inside the document are not followed.
 - Gemini may reword sentences, replace jargon with plainer words, add brief glosses for terms already present, split long sentences, and fix grammar.
 - Gemini must not translate, add or remove facts, change negations or obligation words, or change code, identifiers, paths, URLs, numbers, or document structure.
@@ -306,9 +310,51 @@ Everything else (chat replies, commit messages, PR descriptions, code comments, 
 
 `--auto` marks an automatic call site. With `--auto`, the script skips when `gemini_polish_enabled` is `false` (`reason=disabled`) or when the config cannot be loaded (`reason=config_error`). Without `--auto`, an explicit request always runs.
 
-#### API key setup
+#### Backends
 
-Polishing needs an [OpenRouter](https://openrouter.ai/) API key. The script looks for it in this order:
+`gemini_polish_backend` picks where the request goes. `--backend` and the `HUMANIZE_POLISH_BACKEND` environment variable override it.
+
+| Backend | How it runs | Cost | Needs |
+|---------|-------------|------|-------|
+| `agy` (default) | One headless run of the Antigravity CLI with model `gemini_polish_agy_model` (default `gemini-4-neon`) | Uses your Gemini subscription quota; no charge per call | `agy` installed and signed in |
+| `openrouter` | One request to the OpenRouter chat completions API with model `gemini_polish_model` (default `google/gemini-4-neon`) | Billed per call | An OpenRouter API key |
+
+Both use `gemini_polish_reasoning_effort` (default `medium`), the same contract, the same guard, and the same rule that any failure delivers the original. `--model` names the model of the selected backend.
+
+##### The agy backend
+
+The script looks for `agy` on `PATH`, then at `~/.local/bin/agy`. Set `gemini_polish_agy_bin` (or `HUMANIZE_POLISH_AGY_BIN`) to use another path. Sign in once by running `agy` in a terminal with the Google account that has your Gemini subscription. `agy models` lists the models you can use; the model name and the effort are passed separately (`--model gemini-4-neon --effort medium`).
+
+agy is an agent with tools that edit files, run commands, search the web, and more, and your own agy settings may approve them without asking. Each polish run therefore:
+
+- runs agy from a new, empty temporary folder, which agy treats as its workspace, and removes the folder afterwards;
+- passes settings for this run only, which agy never saves: `toolPermission` `strict` (every tool needs an approval that a headless run cannot give, so agy refuses the call), an empty `agentMode` (no Auto mode), no access outside the workspace, no trusted folders, `useG1Credits` off (a used-up quota never turns into paid AI credits), and deny rules for `command(*)`, `write_file(*)`, `read_file(*)`, `read_url(*)`, and `mcp(*)`;
+- puts a `PreToolUse` hook in that folder that denies every tool call, including web search, which permission rules do not cover;
+- turns off slash commands and skills (`--disable-slash-commands`) and turns on the terminal sandbox (`--sandbox`), and never passes `--dangerously-skip-permissions`;
+- sends the contract and the document on standard input, never on the command line;
+- hides `OPENROUTER_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_APPLICATION_CREDENTIALS`, and `AGY_ADC_AUTH` from agy, so it uses the signed-in subscription and never a key that bills per call;
+- reads agy's `stream-json` events and uses the reply only when agy confirmed the strict permission mode and no tool step or denied action appears.
+
+agy's log names the model it actually used. The run record keeps that name as `model_label`, for example `Gemini 4 Neon (Medium)`.
+
+When agy cannot polish, the original is delivered and the last line says why:
+
+| Reason | Meaning |
+|--------|---------|
+| `agy_not_found` (skipped) | No `agy` command was found |
+| `auth` | agy is not signed in |
+| `quota_exhausted` | The subscription quota is used up |
+| `rate_limited` | Too many requests for now |
+| `bad_model` | agy does not offer the configured model |
+| `timeout` | agy did not finish within `gemini_polish_timeout` |
+| `agy_lockdown` | agy did not confirm the strict tool permission mode |
+| `agy_error` | Any other agy error; the message is shown |
+
+No agy failure falls back to OpenRouter on its own, so polishing never starts costing money without your say. Set `gemini_polish_fallback_to_openrouter` to `true` to send the document to OpenRouter after an agy failure. The fallback needs an OpenRouter API key, and a rejected reply never falls back. The run record then says `backend: openrouter` and `fallback_from: agy:<reason>`.
+
+#### API key setup (OpenRouter backend)
+
+The OpenRouter backend, and the optional fallback, need an [OpenRouter](https://openrouter.ai/) API key. The agy backend needs none. The script looks for the key in this order:
 
 1. the `OPENROUTER_API_KEY` environment variable;
 2. the file named by `gemini_polish_api_key_file`, which holds either the raw key or one `OPENROUTER_API_KEY=value` line (an optional `export` prefix is allowed).
@@ -324,7 +370,7 @@ chmod 600 ~/.env/openrouter_key
 }
 ```
 
-The key is read inside the Python helper. It is never placed on a command line, and it never appears in run records, cache files, stdout, or stderr. A key file that group or others can read produces a warning. Without a key, the original is delivered with `reason=no_api_key`.
+The key is read inside the Python helper. It is never placed on a command line, it never appears in run records, cache files, stdout, or stderr, and agy never sees it. A key file that group or others can read produces a warning. On the OpenRouter backend without a key, the original is delivered with `reason=no_api_key`.
 
 #### Outcomes and exit codes
 
@@ -338,9 +384,9 @@ polish-gemini: outcome=<polished|unchanged|skipped|rejected|failed> reason=<code
 |---------|---------|-----------------|
 | `polished` | The guard accepted a rewrite and it was delivered | `ok` |
 | `unchanged` | Gemini returned the same text | `identical` |
-| `skipped` | Nothing was sent; the original was delivered | `no_api_key`, `disabled`, `config_error`, `empty_input`, `too_large`, `sentinel_collision`, `secret_in_input`, `unsupported_encoding`, `unsupported_html`, `invalid_segments`, `nothing_to_polish`, `missing_dependency` |
+| `skipped` | Nothing was sent; the original was delivered | `agy_not_found`, `no_api_key`, `disabled`, `config_error`, `empty_input`, `too_large`, `sentinel_collision`, `secret_in_input`, `unsupported_encoding`, `unsupported_html`, `invalid_segments`, `nothing_to_polish`, `missing_dependency` |
 | `rejected` | The reply failed the guard; the original was delivered | `envelope`, `structure`, `region_changed`, `protected_token`, `inline_markup`, `script_changed`, `length_ratio`, `segment_mismatch`, `markup_in_text`, `html_mismatch`, `tool_call` |
-| `failed` | The request failed; the original was delivered | `network`, `auth`, `insufficient_credits`, `rate_limited`, `provider_error`, `timeout`, `truncated`, `empty_response`, `bad_json`, `api_error`, `internal_error`, `delivery_error`, `interrupted`, `usage_error` |
+| `failed` | The request failed; the original was delivered | `network`, `auth`, `quota_exhausted`, `insufficient_credits`, `rate_limited`, `bad_model`, `agy_lockdown`, `agy_error`, `provider_error`, `timeout`, `truncated`, `empty_response`, `bad_json`, `api_error`, `internal_error`, `delivery_error`, `interrupted`, `usage_error` |
 
 | Exit code | Meaning |
 |-----------|---------|
@@ -354,7 +400,7 @@ Delivery to stdout is a single write after every check has finished. Delivery to
 
 A signal that arrives while delivery is under way does not cut it short: the write or rename finishes, the outcome line still describes what was delivered (for example `outcome=polished reason=ok delivered=yes`), and the run exits 130 or 143. This also holds for a Ctrl-C sent to the whole process group while the fallback copy runs without Python. `reason=interrupted` with `delivered=no` means the signal came before delivery and nothing was written. A signal that was ignored when the run started (for example SIGINT in a background job started by a non-interactive shell) stays ignored. The script stays the runner's process while the Python helper starts and works: a SIGINT or SIGTERM sent to it, or to its whole process group, before delivery begins ends the run with `reason=interrupted`, `delivered=no`, and exit 130 or 143, also while the helper is still starting. The helper reports that it is ready by writing one byte to a private named pipe (created in `TMPDIR` or `/tmp` and removed again before the helper starts; the script uses it only after checking that what it opened is a named pipe it owns, so a name replaced in a shared directory cannot redirect the byte into another file) and reads no input until the script releases it with SIGUSR1; a signal that came before that is passed on to the helper, which then ends the run. If the script itself is killed (for example with SIGKILL), the helper notices before it delivers and ends as interrupted with nothing delivered. When no such pipe can be made, the helper is not started: the script keeps handling SIGINT and SIGTERM and delivers the original itself (`outcome=skipped reason=missing_dependency delivered=yes`). Diagnostic lines are always single lines starting with `polish-gemini:`; line breaks and control characters in error messages, file names, and config values are replaced with spaces, and no diagnostic can start with `outcome=`. A malformed reply, or any unexpected error inside the script, still delivers the original (`reason=bad_json`, `api_error`, or `internal_error`). When `python3` 3.7 or newer or the helper files cannot be found or started (also when the interpreter disappears between the version check and the start), the script delivers the original itself (`outcome=skipped reason=missing_dependency delivered=yes`).
 
-#### Request details
+#### OpenRouter request details
 
 - One `POST <gemini_polish_base_url>/chat/completions` per run, plus at most one retry.
 - The body holds the model, a system message with the polish-only contract (`prompt-template/gemini/polish-contract.md`), the document in the user message, `reasoning: {"effort": ..., "exclude": true}`, and `max_tokens`. It never holds `tools`, `tool_choice`, or `plugins`.
@@ -390,18 +436,21 @@ For `.html` and `.htm` files, the script polishes only visible text: text nodes 
 
 #### Run records
 
-Each run that sends a request writes `.humanize/skill/<timestamp>-<pid>-<hex>/` with `input.md`, a copy of the source, the raw `candidate.txt`, the delivered `output.md`, and `metadata.md` (`tool: gemini`, `mode: polish`, `backend: openrouter`, model, `effort_used`, status, outcome, reason, token counts, and cost). The cache directory under `~/.cache/humanize/` holds `gemini-run.cmd` (the request without the key), `gemini-run.out` (the response without reasoning text), and `gemini-run.log`. Polish runs appear in `humanize monitor gemini` and `humanize monitor skill`.
+Each run that sends a request writes `.humanize/skill/<timestamp>-<pid>-<hex>/` with `input.md`, a copy of the source, the raw `candidate.txt`, the delivered `output.md`, and `metadata.md` (`tool: gemini`, `mode: polish`, `backend` (`agy` or `openrouter`), model, `model_label` for agy, `fallback_from` after a fallback, `effort_used`, status, outcome, reason, token counts, and cost, which is `subscription` for agy). The cache directory under `~/.cache/humanize/` holds `gemini-run.cmd` (the OpenRouter request without the key, or the agy command line and its standard input), `gemini-run.out` (the response without reasoning text, or agy's events), `gemini-run.log`, and for agy `agy-run.log`, agy's own log. Polish runs appear in `humanize monitor gemini` and `humanize monitor skill`.
 
 #### Privacy and cost
 
-- **Privacy**: polishing is on by default, so in the four default scenarios the document text is sent to OpenRouter and on to Google. Local copies of each run are kept under `.humanize/skill/` (gitignored). Set `gemini_polish_enabled` to `false` to stop automatic polishing.
-- **Cost and time**: reasoning effort `xhigh` is slow and costs money, and the amount of reasoning varies from run to run. In tests on 2026-11-18, short documents (one to three paragraphs) took 12 seconds to 2 minutes and cost $0.02 to $0.14 (about 1,700 to 18,000 reasoning tokens), and a six-section document took about 2 minutes and cost about $0.15 (about 17,000 reasoning tokens). With `max_tokens` at 8,000, one request ran out of tokens before answering, which is why the default is 131,072. Lowering `gemini_polish_reasoning_effort` (for example to `high` or `medium`) reduces both time and cost.
+- **Privacy**: polishing is on by default, so in the four default scenarios the document text is sent to Google: through agy on the default backend, or to OpenRouter and on to Google on the OpenRouter backend. agy also keeps its own conversation history under `~/.gemini/antigravity-cli/`. Local copies of each run are kept under `.humanize/skill/` (gitignored). Set `gemini_polish_enabled` to `false` to stop automatic polishing.
+- **Cost and time on agy**: a run uses your Gemini subscription quota and costs nothing per call. In tests on 2026-11-24 with Gemini 4 Neon at medium effort, short documents (one to three paragraphs) took 14 to 17 seconds and a six-section document took 31 seconds (about 500 to 2,000 reasoning tokens); the same documents on Gemini 4 Hydrogen at `xhigh` through OpenRouter took 12 seconds to 2 minutes. Each run also carries agy's own instructions, about 11,000 input tokens, which count against the subscription quota.
+- **Cost and time on OpenRouter**: each call is billed. These numbers are from Gemini 4 Hydrogen at reasoning effort `xhigh`, the earlier default: `xhigh` is slow and costs money, and the amount of reasoning varies from run to run. In tests on 2026-11-18, short documents (one to three paragraphs) took 12 seconds to 2 minutes and cost $0.02 to $0.14 (about 1,700 to 18,000 reasoning tokens), and a six-section document took about 2 minutes and cost about $0.15 (about 17,000 reasoning tokens). With `max_tokens` at 8,000, one request ran out of tokens before answering, which is why the default is 131,072. Lowering `gemini_polish_reasoning_effort` (for example to `high` or `medium`) reduces both time and cost.
 
 #### Environment variables
 
 | Variable | Purpose |
 |----------|---------|
-| `OPENROUTER_API_KEY` | API key (takes precedence over `gemini_polish_api_key_file`) |
+| `OPENROUTER_API_KEY` | OpenRouter API key (takes precedence over `gemini_polish_api_key_file`); never passed to agy |
+| `HUMANIZE_POLISH_BACKEND` | Overrides `gemini_polish_backend` (`agy` or `openrouter`) |
+| `HUMANIZE_POLISH_AGY_BIN` | Overrides `gemini_polish_agy_bin` (used by the offline tests) |
 | `HUMANIZE_POLISH_BASE_URL` | Overrides `gemini_polish_base_url` (used by the offline tests) |
 | `HUMANIZE_POLISH_BLOCK_RATIO`, `HUMANIZE_POLISH_DOC_RATIO` | Length-ratio bounds as `LOW:HIGH` |
 | `HUMANIZE_POLISH_PYTHON` | Python 3 interpreter to use (default `python3`) |
@@ -426,9 +475,13 @@ Current built-in keys:
 | `alternative_plan_language` | `""` | Optional translated plan variant language; supported values include `Chinese`, `Korean`, `Japanese`, `Spanish`, `French`, `German`, `Portuguese`, `Russian`, `Arabic`, or ISO codes like `zh` |
 | `gen_plan_mode` | `discussion` | Default plan-generation mode |
 | `gemini_polish_enabled` | `true` | Whether automatic (`--auto`) readability polishing runs |
-| `gemini_polish_model` | `google/gemini-4-hydrogen` | OpenRouter model used for polishing |
-| `gemini_polish_reasoning_effort` | `xhigh` | Reasoning effort for polishing (`xhigh`, `high`, `medium`, `low`) |
-| `gemini_polish_max_tokens` | `131072` | Completion budget for one polish request, reasoning included |
+| `gemini_polish_backend` | `agy` | Where polish requests go: `agy` (Antigravity CLI on your Gemini subscription) or `openrouter` (billed per call) |
+| `gemini_polish_agy_model` | `gemini-4-neon` | agy model used for polishing (see `agy models`) |
+| `gemini_polish_agy_bin` | `""` | Path of the agy command; empty means `PATH`, then `~/.local/bin/agy` |
+| `gemini_polish_fallback_to_openrouter` | `false` | Whether an agy failure falls back to OpenRouter (billed per call) |
+| `gemini_polish_model` | `google/gemini-4-neon` | OpenRouter model used for polishing |
+| `gemini_polish_reasoning_effort` | `medium` | Reasoning effort for polishing on either backend (`xhigh`, `high`, `medium`, `low`) |
+| `gemini_polish_max_tokens` | `131072` | Completion budget for one OpenRouter polish request, reasoning included |
 | `gemini_polish_timeout` | `900` | Overall deadline for one polish request, in seconds |
 | `gemini_polish_max_bytes` | `262144` | Largest document that is sent for polishing |
 | `gemini_polish_api_key_file` | `""` | Optional file that holds the OpenRouter API key |

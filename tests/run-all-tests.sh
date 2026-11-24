@@ -99,8 +99,9 @@ TEST_SUITES=(
     "test-model-router.sh"
     # Skill monitor tests
     "test-skill-monitor.sh"
-    # Gemini polish tests (offline, loopback mock)
+    # Gemini polish tests (offline: loopback OpenRouter mock and a stand-in agy)
     "test-polish-gemini.sh"
+    "test-polish-gemini-agy.sh"
     "test-polish-gemini-guard.sh"
     "test-polish-gemini-integration.sh"
     # Robustness tests

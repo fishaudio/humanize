@@ -1,18 +1,21 @@
 #!/usr/bin/env bash
 #
-# Opt-in real-API compatibility check for scripts/polish-gemini.sh
+# Opt-in real compatibility check for scripts/polish-gemini.sh
 #
-# NOT registered in tests/run-all-tests.sh: it calls the real OpenRouter API,
-# takes several minutes, and costs money (roughly $0.10 to $1 per document at
-# reasoning effort xhigh).
+# NOT registered in tests/run-all-tests.sh: it calls a real backend and takes
+# several minutes. On agy it uses the signed-in Gemini subscription quota; on
+# OpenRouter it costs money.
 #
 # Usage:
-#   HUMANIZE_TEST_REAL_OPENROUTER=1 OPENROUTER_API_KEY=... tests/manual-polish-gemini-real.sh [--report FILE]
+#   HUMANIZE_TEST_REAL_AGY=1 tests/manual-polish-gemini-real.sh [--backend agy] [--effort LEVEL] [--report FILE]
+#   HUMANIZE_TEST_REAL_OPENROUTER=1 OPENROUTER_API_KEY=... \
+#       tests/manual-polish-gemini-real.sh --backend openrouter [--report FILE]
 #   HUMANIZE_TEST_REAL_OPENROUTER=1 HUMANIZE_TEST_OPENROUTER_KEY_FILE=~/.env/openrouter_key \
-#       tests/manual-polish-gemini-real.sh [--report FILE]
+#       tests/manual-polish-gemini-real.sh --backend openrouter [--report FILE]
 #
 # Checks (all run in parallel, each in its own temporary project):
-#   1. reasoning effort xhigh is accepted by the configured model
+#   1. the configured reasoning effort is used; on agy, agy's own log names
+#      the configured model and effort (for example Gemini 4 Neon (Medium))
 #   2. a short and a multi-page document finish within the default
 #      max_tokens and timeout (latency, reasoning tokens and cost recorded)
 #   3. a Chinese and an English document keep their language
@@ -20,8 +23,9 @@
 #   5. no reply contains tool calls
 #   6. an HTML page round-trips through the adapter
 #
-# The key is never read by this script: it is passed to the runner through
-# the environment or through a gemini_polish_api_key_file project config.
+# The OpenRouter key is never read by this script: it is passed to the runner
+# through the environment or through a gemini_polish_api_key_file project
+# config.
 #
 
 set -uo pipefail
@@ -30,11 +34,21 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="$PROJECT_ROOT/scripts/polish-gemini.sh"
 REPORT=""
+BACKEND="agy"
+EFFORT="medium"
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --report)
             REPORT="${2:-}"
+            shift 2
+            ;;
+        --backend)
+            BACKEND="${2:-}"
+            shift 2
+            ;;
+        --effort)
+            EFFORT="${2:-}"
             shift 2
             ;;
         *)
@@ -44,18 +58,33 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-if [[ "${HUMANIZE_TEST_REAL_OPENROUTER:-}" != "1" ]]; then
-    echo "SKIP: set HUMANIZE_TEST_REAL_OPENROUTER=1 to run the real-API check (costs money)."
-    exit 0
-fi
-if [[ -z "${OPENROUTER_API_KEY:-}" && -z "${HUMANIZE_TEST_OPENROUTER_KEY_FILE:-}" ]]; then
-    echo "SKIP: set OPENROUTER_API_KEY or HUMANIZE_TEST_OPENROUTER_KEY_FILE."
-    exit 0
-fi
+case "$BACKEND" in
+    agy)
+        if [[ "${HUMANIZE_TEST_REAL_AGY:-}" != "1" ]]; then
+            echo "SKIP: set HUMANIZE_TEST_REAL_AGY=1 to run the real agy check (uses your Gemini subscription quota)."
+            exit 0
+        fi
+        ;;
+    openrouter)
+        if [[ "${HUMANIZE_TEST_REAL_OPENROUTER:-}" != "1" ]]; then
+            echo "SKIP: set HUMANIZE_TEST_REAL_OPENROUTER=1 to run the real-API check (costs money)."
+            exit 0
+        fi
+        if [[ -z "${OPENROUTER_API_KEY:-}" && -z "${HUMANIZE_TEST_OPENROUTER_KEY_FILE:-}" ]]; then
+            echo "SKIP: set OPENROUTER_API_KEY or HUMANIZE_TEST_OPENROUTER_KEY_FILE."
+            exit 0
+        fi
+        ;;
+    *)
+        echo "Unknown backend: $BACKEND (use agy or openrouter)" >&2
+        exit 1
+        ;;
+esac
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
-unset HUMANIZE_POLISH_BASE_URL
+unset HUMANIZE_POLISH_BASE_URL HUMANIZE_POLISH_AGY_BIN
+export HUMANIZE_POLISH_BACKEND="$BACKEND"
 
 # ----------------------------------------------------------------------------
 # Fixtures
@@ -145,14 +174,14 @@ run_case() {
     local start end
     start=$(date +%s)
     CLAUDE_PROJECT_DIR="$proj" XDG_CONFIG_HOME="$WORK/xdg" XDG_CACHE_HOME="$WORK/cache" \
-        "$RUNNER" --input "$fixture" > "$WORK/$name.out" 2> "$WORK/$name.err"
+        "$RUNNER" --input "$fixture" --effort "$EFFORT" > "$WORK/$name.out" 2> "$WORK/$name.err"
     echo $? > "$WORK/$name.rc"
     end=$(date +%s)
     echo $((end - start)) > "$WORK/$name.seconds"
 }
 
 CASES="short long chinese english inject page"
-echo "Running ${CASES// /, } against OpenRouter in parallel; this takes several minutes..."
+echo "Running ${CASES// /, } on $BACKEND (effort $EFFORT) in parallel; this takes several minutes..."
 run_case short "$WORK/fixtures/short.md" &
 run_case long "$WORK/fixtures/long.md" &
 run_case chinese "$WORK/fixtures/chinese.md" &
@@ -186,7 +215,7 @@ record() {
 
 for name in $CASES; do
     outcome="$(tail -n 1 "$WORK/$name.err")"
-    detail="$outcome; $(cat "$WORK/$name.seconds")s; effort_used=$(meta "$name" effort_used); reasoning_tokens=$(meta "$name" reasoning_tokens); completion_tokens=$(meta "$name" completion_tokens); cost=$(meta "$name" cost)"
+    detail="$outcome; $(cat "$WORK/$name.seconds")s; model_label=$(meta "$name" model_label); effort_used=$(meta "$name" effort_used); reasoning_tokens=$(meta "$name" reasoning_tokens); completion_tokens=$(meta "$name" completion_tokens); cost=$(meta "$name" cost)"
     if grep -q "reason=tool_call" "$WORK/$name.err"; then
         record "no tool calls ($name)" FAIL "$detail"
     fi
@@ -196,10 +225,27 @@ for name in $CASES; do
     esac
 done
 
-if [[ "$(meta short effort_used)" == "xhigh" ]]; then
-    record "reasoning effort xhigh accepted" PASS "effort_used=xhigh"
+if [[ "$(meta short effort_used)" == "$EFFORT" ]]; then
+    record "reasoning effort $EFFORT used" PASS "effort_used=$EFFORT"
 else
-    record "reasoning effort xhigh accepted" FAIL "effort_used=$(meta short effort_used)"
+    record "reasoning effort $EFFORT used" FAIL "effort_used=$(meta short effort_used)"
+fi
+if [[ "$BACKEND" == "agy" ]]; then
+    WANT_LABEL="($(tr '[:lower:]' '[:upper:]' <<< "${EFFORT:0:1}")${EFFORT:1})"
+    [[ "$EFFORT" == "xhigh" ]] && WANT_LABEL="(XHigh)"
+    for name in $CASES; do
+        label="$(meta "$name" model_label)"
+        if [[ "$label" == *"Neon"* && "$label" == *"$WANT_LABEL" ]]; then
+            record "agy log names Gemini 4 Neon $WANT_LABEL ($name)" PASS "model_label=$label"
+        else
+            record "agy log names Gemini 4 Neon $WANT_LABEL ($name)" FAIL "model_label=$label"
+        fi
+    done
+    if [[ -z "$(ls -d "${TMPDIR:-/tmp}"/humanize-polish-agy-* 2>/dev/null)" ]]; then
+        record "agy workspaces are removed" PASS "none left"
+    else
+        record "agy workspaces are removed" FAIL "$(ls -d "${TMPDIR:-/tmp}"/humanize-polish-agy-* 2>/dev/null | head -3)"
+    fi
 fi
 if has_script "$WORK/chinese.out" han; then
     record "Chinese document stays Chinese" PASS "$(tail -n 1 "$WORK/chinese.err")"
@@ -232,7 +278,9 @@ if [[ -n "$REPORT" ]]; then
         echo "# Polish Gemini Real-API Check"
         echo ""
         echo "- Date: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        echo "- Model: $(meta short model)"
+        echo "- Backend: $BACKEND"
+        echo "- Model: $(meta short model) ($(meta short model_label))"
+        echo "- Effort: $EFFORT"
         echo ""
         echo "| Check | Result | Detail |"
         echo "|-------|--------|--------|"

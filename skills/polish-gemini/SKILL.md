@@ -1,7 +1,7 @@
 ---
 name: polish-gemini
-description: Polish prose written for people so it is easier to read, using Gemini on OpenRouter as a copy editor only. Use on your own before delivering documentation for people (README files, docs/, guides, reports, release notes) and the visible text of web pages; use for anything else only when the user explicitly asks.
-argument-hint: "--input <file|-> [--output <file>] [--format markdown|text|segments|html] [--auto] [--effort xhigh|high|medium|low] [--strict]"
+description: Polish prose written for people so it is easier to read, using Gemini as a copy editor only (through agy on the user's Gemini subscription by default, or OpenRouter). Use on your own before delivering documentation for people (README files, docs/, guides, reports, release notes) and the visible text of web pages; use for anything else only when the user explicitly asks.
+argument-hint: "--input <file|-> [--output <file>] [--format markdown|text|segments|html] [--auto] [--backend agy|openrouter] [--effort xhigh|high|medium|low] [--strict]"
 allowed-tools: "Bash(${CLAUDE_PLUGIN_ROOT}/scripts/polish-gemini.sh:*)"
 ---
 
@@ -9,7 +9,7 @@ allowed-tools: "Bash(${CLAUDE_PLUGIN_ROOT}/scripts/polish-gemini.sh:*)"
 
 Send a finished human-facing document to Gemini for a readability-only polish, then deliver the result.
 
-Gemini acts only as a copy editor. The request carries no tools, so Gemini cannot read files, run commands, or search the web. It may reword prose and add brief glosses for terms already present. It must not translate, add or remove facts, or change code, identifiers, paths, URLs, numbers, or document structure. A local guard rejects any reply that changes what it can check mechanically. When polishing is skipped, rejected, or fails, the script delivers the exact original bytes and says why.
+Gemini acts only as a copy editor. It gets no tool it can use: the default agy backend runs the Antigravity CLI from an empty temporary folder with every tool refused, and the OpenRouter backend sends no tools, so Gemini cannot read files, run commands, or search the web. It may reword prose and add brief glosses for terms already present. It must not translate, add or remove facts, or change code, identifiers, paths, URLs, numbers, or document structure. A local guard rejects any reply that changes what it can check mechanically. When polishing is skipped, rejected, or fails, the script delivers the exact original bytes and says why.
 
 ## When to Polish
 
@@ -44,7 +44,7 @@ If the user explicitly asks to polish one of these, first warn them that tools p
 
 ## Cost and Time
 
-At the default reasoning effort (`xhigh`), one run takes minutes and costs money: in testing, short documents took 12 seconds to 2 minutes and cost $0.02 to $0.14, and a six-section document took about 2 minutes and cost about $0.15. Polish each finished deliverable once, not after every intermediate edit. Lowering `gemini_polish_reasoning_effort` (or passing `--effort high`) makes runs faster and cheaper.
+On the default agy backend (Gemini 4 Neon, reasoning effort `medium`), a run uses the user's Gemini subscription quota and costs nothing per call. In testing, short documents took about 15 seconds and a six-section document about 30 seconds. On the OpenRouter backend every run costs money. Either way, polish each finished deliverable once, not after every intermediate edit.
 
 ## Procedure
 
@@ -87,9 +87,9 @@ because the shell would re-split the arguments and can fail before the script st
 |---------|---------|------------|
 | `polished` | The guard accepted a rewrite and it was delivered | Review it with the checklist |
 | `unchanged` | Gemini returned the same text | Nothing to review |
-| `skipped` | Nothing was sent (for example `no_api_key`, `disabled`, `too_large`, `empty_input`) | Tell the user the original was kept and why |
+| `skipped` | Nothing was sent (for example `agy_not_found`, `no_api_key`, `disabled`, `too_large`, `empty_input`) | Tell the user the original was kept and why |
 | `rejected` | The reply failed the guard (for example `protected_token`, `structure`, `script_changed`) | Tell the user the original was kept and why |
-| `failed` | The request failed (for example `timeout`, `auth`, `rate_limited`, `truncated`) | Tell the user the original was kept and why |
+| `failed` | The request failed (for example `timeout`, `auth` (agy not signed in), `quota_exhausted`, `rate_limited`, `truncated`) | Tell the user the original was kept and why |
 
 `delivered=no` means nothing was written (usage error, delivery failure, or an interruption before delivery). With exit code 130 or 143 and `delivered=yes`, the run was interrupted after delivery had started; the outcome still says what was delivered, so a `polished` result still needs the review below.
 
@@ -128,7 +128,7 @@ For JSX, TSX, Vue, Svelte, and other component or template files, polish only th
 
 ## Notes
 
-- **API key**: set `OPENROUTER_API_KEY`, or set `gemini_polish_api_key_file` in the humanize config to a file that holds the key (mode 600). Without a key the script delivers the original with `reason=no_api_key`.
-- **Privacy**: the document is sent to OpenRouter and on to Google. Local copies of each run are kept under `.humanize/skill/<id>/`.
+- **Backend**: `gemini_polish_backend` is `agy` by default. agy must be installed and signed in with the account that has the Gemini subscription; without it the script delivers the original with `reason=agy_not_found` or `reason=auth`. It never falls back to OpenRouter unless `gemini_polish_fallback_to_openrouter` is `true`. For the OpenRouter backend, set `OPENROUTER_API_KEY`, or set `gemini_polish_api_key_file` to a file that holds the key (mode 600); without a key it delivers the original with `reason=no_api_key`.
+- **Privacy**: the document is sent to Google, through agy or through OpenRouter. agy also keeps its own conversation history under `~/.gemini/antigravity-cli/`. Local copies of each run are kept under `.humanize/skill/<id>/`.
 - **Reserved markers**: documents that contain the text `@@HUMANIZE-POLISH-` are not sent (`reason=sentinel_collision`).
 - **Protected regions**: text between `<!-- polish:off -->` and `<!-- polish:on -->` must come back byte-identical.
