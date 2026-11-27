@@ -507,11 +507,14 @@ cases = [
     '"/rt/scripts/setup-rlcr-loop.sh" --skip-impl # see --help for options',
     '"/rt/scripts/setup-rlcr-loop.sh" plan.md && echo --help',
     '"/rt/scripts/setup-rlcr-loop.sh" plan.md; echo -h',
+    'bash /rt/scripts/setup-rlcr-loop.sh >help.txt --help',
+    'bash /opt/humanize#dev/scripts/setup-rlcr-loop.sh --skip-impl',
+    '"/rt/scripts/setup-rlcr-loop.sh" plan.md 2>&1 >log.txt',
 ]
 print(" ".join("1" if mod.is_setup_command(c) else "0" for c in cases))
 PY
 )"
-assert_eq "B7 setup command detection (help does not count; comments and later commands ignored)" "1 1 0 0 0 0 1 1 1" "$SETUP_CHECK"
+assert_eq "B7 setup command detection (help does not count; comments and later commands ignored)" "1 1 0 0 0 0 1 1 1 0 1 1" "$SETUP_CHECK"
 
 # B9: conversation A's setup is still waiting to be bound when conversation B
 # runs setup. B must not take A's loop; A's next event still binds it.

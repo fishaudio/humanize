@@ -248,13 +248,29 @@ SHELL_OPERATOR_CHARS = set("();<>|&")
 
 
 def first_command_words(command):
-    """Words of the first simple command, without shell comments or anything
-    after an operator such as ;, &&, || or |."""
+    """Words of the first simple command, roughly as bash reads them:
+    - ;, &&, ||, |, & and parentheses end the command;
+    - a redirection (>, >>, <, 2>&1 and so on) and its target are skipped,
+      and the words after it still belong to the command;
+    - a comment starts only where a word starts with #, so a # inside a word
+      such as /opt/humanize#dev is kept."""
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
+    lexer.commenters = ""
     words = []
+    skip_target = False
     for token in lexer:
         if token and set(token) <= SHELL_OPERATOR_CHARS:
+            if "<" in token or ">" in token:
+                # The next word is the redirection target ("2>&1" lexes as
+                # "2", ">&", "1"), not an argument.
+                skip_target = True
+                continue
+            break
+        if skip_target:
+            skip_target = False
+            continue
+        if token.startswith("#"):
             break
         words.append(token)
     return words
