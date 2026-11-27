@@ -347,6 +347,35 @@ run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"
 assert_eq "A17 hook crash -> allow stop" "" "$OUT"
 unset STUB_LOOP_CODEX_STOP_HOOK_EXIT STUB_LOOP_CODEX_STOP_HOOK_STDERR
 
+# A17b: a reviewer that cannot run gets one explained retry, then the loop
+# pauses instead of making the agent repeat itself
+reset_stubs
+FAIL_FILE="$PROJ_A/.humanize/.agy-review-failures.json"
+rm -f "$FAIL_FILE"
+export STUB_LOOP_CODEX_STOP_HOOK_STDOUT='{"decision":"block","reason":"# Codex Review Failed\n\nerror: unexpected argument"}'
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}')"
+assert_eq "A17b first review failure -> continue" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+assert_contains "A17b first failure: agent explains it and how to retry" 'replying "continue" tries the review again' "$(jq -r '.reason' <<<"$OUT")"
+assert_eq "A17b first failure recorded" "1" "$(jq -r '.failures' "$FAIL_FILE" 2>/dev/null)"
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":1,"terminationReason":"NO_TOOL_CALL"}')"
+assert_eq "A17b second failure in a row -> pause (no reply)" "" "$OUT"
+assert_eq "A17b pause recorded" "1" "$(jq -r '.pauses' "$FAIL_FILE" 2>/dev/null)"
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}')"
+assert_eq "A17b after the user replies: one explained retry again" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+export STUB_LOOP_CODEX_STOP_HOOK_STDOUT='{"decision":"block","reason":"Round 3 feedback: add a test."}'
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":1,"terminationReason":"NO_TOOL_CALL"}')"
+assert_eq "A17b a normal review continues as usual" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+assert_not_contains "A17b no failure note on a normal review" "review could not run" "$(jq -r '.reason' <<<"$OUT")"
+assert_eq "A17b a normal review clears the count" "no" "$([[ -f "$FAIL_FILE" ]] && echo yes || echo no)"
+export STUB_LOOP_CODEX_STOP_HOOK_STDOUT='{"decision":"block","reason":"# Claude CLI Not Found\n\nInstall claude."}'
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":2,"terminationReason":"NO_TOOL_CALL"}')"
+assert_contains "A17b a missing reviewer CLI counts as a failure" "review could not run" "$(jq -r '.reason' <<<"$OUT")"
+OTHER_CONV_STOP="$(payload Stop "$PROJ_A" '{"executionNum":3,"terminationReason":"NO_TOOL_CALL"}' | jq -c '.conversationId = "conv-other"')"
+run_stub stop "$OTHER_CONV_STOP"
+assert_eq "A17b another conversation does not inherit the count" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+rm -f "$FAIL_FILE"
+unset STUB_LOOP_CODEX_STOP_HOOK_STDOUT
+
 # A18: bad input never crashes the adapter
 OUT="$(printf 'not json' | python3 "$STUB_ADAPTER" pre-tool 2>/dev/null)"; RC=$?
 assert_eq "A18 non-JSON input: exit 0" "0" "$RC"
@@ -1002,6 +1031,10 @@ elif [[ -f "$loop/state.md" ]]; then
             printf -- '---\ncurrent_round: %s\nsession_id: %s\n---\n' "$n" "$conv" > "$loop/state.md" ;;
         cancel)
             mv "$loop/state.md" "$loop/cancel-state.md" ;;
+        reviewfail)
+            # The hook rewrites the review prompt on each try and pauses the loop.
+            echo "try $n" > "$loop/round-0-review-prompt.md"
+            printf '{"conversation":"%s","failures":0,"pauses":%s}\n' "$conv" "$((n - 1))" > .humanize/.agy-review-failures.json ;;
         dirty)
             echo "edit $n" >> README.md
             if [[ $n -ge ${MOCK_AGY_FINISH_AT:-3} ]]; then mv "$loop/state.md" "$loop/complete-state.md"; fi ;;
@@ -1140,6 +1173,13 @@ assert_contains "F12 conversation reported during the first turn" "agy conversat
 assert_contains "F12 says how to resume" "--resume mock-conv" "$(cat "$MOCK_AGY_DIR/driver.stderr")"
 for _ in $(seq 1 50); do [[ -f "$MOCK_AGY_DIR/call-1.signal" ]] && break; sleep 0.2; done
 assert_eq "F12 agy was stopped too" "interrupted" "$(cat "$MOCK_AGY_DIR/call-1.signal" 2>/dev/null)"
+
+# A review that keeps failing to run is not progress.
+new_driver_project reviewfail
+MOCK_AGY_SCENARIO=reviewfail run_driver --stall-limit 2 docs/plan.md
+assert_eq "F16 review keeps failing: driver gives up with 2" "2" "$RC"
+assert_eq "F16 review keeps failing: start + 2 resumes" "3" "$CALLS"
+assert_contains "F16 says the review could not run" "the review could not run" "$DRIVER_ERR"
 
 # A log folder inside the project does not hide a stall.
 new_driver_project stall-logs

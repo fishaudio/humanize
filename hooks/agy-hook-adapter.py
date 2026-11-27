@@ -80,6 +80,21 @@ FILE_CHANGE_TOOLS = WRITE_TOOLS | EDIT_TOOLS | MULTI_EDIT_TOOLS | OPAQUE_EDIT_TO
 # git options that take the next word as their value.
 GIT_OPTIONS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
 
+# Stop hook replies meaning the reviewer could not run at all (its CLI is
+# missing, failed, or timed out). Retrying at once rarely helps, and every
+# retry makes the agent write the user another near-identical message (one
+# chat card each when agy runs behind a chat bridge). So the first failure
+# gets one continuation in which the agent explains it, and a second failure
+# in a row pauses the loop until the user replies.
+REVIEW_FAILURE_HEADINGS = ("# Codex Review Failed", "# Codex CLI Not Found", "# Claude CLI Not Found")
+# In .humanize/: {"conversation", "failures" (in a row), "pauses" (in a row)}.
+# scripts/agy-rlcr-run.sh reads "pauses" to stop resuming a loop whose review
+# keeps failing.
+REVIEW_FAILURE_FILE = ".agy-review-failures.json"
+REVIEW_FAILURE_NOTE = """
+[Humanize on agy: the review could not run]
+Tell the user in a few plain words what went wrong and that replying "continue" tries the review again, then end your turn. If the next try fails too, the loop waits for the user instead of retrying."""
+
 SETUP_SCRIPT_NAME = "setup-rlcr-loop.sh"
 # Written by setup-rlcr-loop.sh: line 1 = state.md path, line 2 = setup script path.
 PENDING_SESSION_FILE = ".pending-session-id"
@@ -559,6 +574,35 @@ def continuation_limit():
     return value if value > 0 else DEFAULT_CONTINUATION_LIMIT
 
 
+def is_review_failure(reason):
+    first_line = reason.strip().splitlines()[0] if reason.strip() else ""
+    return first_line.strip().startswith(REVIEW_FAILURE_HEADINGS)
+
+
+def read_review_failures(root, conversation):
+    try:
+        data = json.loads((root / ".humanize" / REVIEW_FAILURE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict) or data.get("conversation") != conversation:
+        data = {}
+    return {"conversation": conversation, "failures": int(data.get("failures") or 0), "pauses": int(data.get("pauses") or 0)}
+
+
+def write_review_failures(root, data):
+    path = root / ".humanize" / REVIEW_FAILURE_FILE
+    try:
+        if not data["failures"] and not data["pauses"]:
+            if path.exists():
+                path.unlink()
+            return
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        print(f"humanize agy adapter: could not record review failures: {exc}", file=sys.stderr)
+
+
 def handle_stop(payload, root):
     termination = str(payload.get("terminationReason") or "")
     if termination not in REVIEWABLE_TERMINATIONS:
@@ -596,9 +640,27 @@ def handle_stop(payload, root):
     elif code != 0 and stderr.strip():
         print(stderr.strip(), file=sys.stderr)
 
+    conversation = str(payload.get("conversationId") or "")
+    failures = read_review_failures(root, conversation)
+    if reason is not None and is_review_failure(reason):
+        failures["failures"] += 1
+        if failures["failures"] >= 2:
+            # Second failure in a row: pause until the user replies. The next
+            # user message starts over with one explained retry.
+            failures["failures"] = 0
+            failures["pauses"] += 1
+            write_review_failures(root, failures)
+            return None
+        write_review_failures(root, failures)
+    elif failures["failures"] or failures["pauses"]:
+        failures = {"conversation": conversation, "failures": 0, "pauses": 0}
+        write_review_failures(root, failures)
+
     if reason is None:
         return None
     text = AGENT_PREAMBLE + "\n" + reason.strip() + "\n"
+    if failures["failures"]:
+        text += REVIEW_FAILURE_NOTE
     if used == limit - 1:
         text += LAST_CONTINUATION_NOTE.format(limit=limit)
     return {"decision": "continue", "reason": text}

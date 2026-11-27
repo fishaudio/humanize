@@ -301,6 +301,24 @@ else
 fi
 reset_mock
 
+# Test: codex exec gets the workspace-write sandbox, never the removed --full-auto
+reset_mock
+export MOCK_CODEX_STDOUT="sandbox-flag-test"
+ASK_CODEX_ARGS_FILE="$TEST_DIR/ask-codex-sandbox-args.txt"
+export MOCK_CODEX_ARGS_FILE="$ASK_CODEX_ARGS_FILE"
+EXIT_CODE=0
+run_ask_codex "sandbox flag test" > /dev/null 2>&1 || EXIT_CODE=$?
+CAPTURED_ARGS="$(cat "$ASK_CODEX_ARGS_FILE" 2>/dev/null || true)"
+if [[ $EXIT_CODE -eq 0 ]] \
+    && echo "$CAPTURED_ARGS" | grep -A1 -x -- '--sandbox' | grep -qx -- 'workspace-write' \
+    && ! echo "$CAPTURED_ARGS" | grep -qx -- '--full-auto'; then
+    pass "codex exec runs with --sandbox workspace-write and without --full-auto"
+else
+    fail "codex exec runs with --sandbox workspace-write and without --full-auto" \
+        "--sandbox workspace-write, no --full-auto" "exit=$EXIT_CODE, args=$CAPTURED_ARGS"
+fi
+reset_mock
+
 # Test: older Codex builds only receive supported hook feature names
 reset_mock
 export MOCK_CODEX_STDOUT="legacy-hook-disable-test"

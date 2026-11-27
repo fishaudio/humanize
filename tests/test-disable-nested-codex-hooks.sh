@@ -222,6 +222,13 @@ else
         "exec --disable hooks --disable plugin_hooks --disable codex_hooks" "$(cat "$TEST_DIR/impl.args" 2>/dev/null || echo missing)"
 fi
 
+if grep -q -- '--sandbox workspace-write' "$TEST_DIR/impl.args" && ! grep -q -- '--full-auto' "$TEST_DIR/impl.args"; then
+    pass "implementation-phase codex exec uses --sandbox workspace-write, not the removed --full-auto"
+else
+    fail "implementation-phase codex exec uses --sandbox workspace-write, not the removed --full-auto" \
+        "--sandbox workspace-write without --full-auto" "$(cat "$TEST_DIR/impl.args" 2>/dev/null || echo missing)"
+fi
+
 REPO_REVIEW="$TEST_DIR/repo-review"
 setup_repo "$REPO_REVIEW"
 run_loop_hook "$REPO_REVIEW" "$TEST_DIR/review.args" "true"

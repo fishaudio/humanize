@@ -20,7 +20,8 @@ Safety while unattended:
   reach outside the project; run unattended loops only where that is
   acceptable.
 - The driver gives up after --stall-limit resumes in a row that change
-  nothing, or after --max-resumes resumes in total.
+  nothing or end with the review failing to run (the hook adapter pauses
+  the loop then), or after --max-resumes resumes in total.
 
 Exit codes: 0 the loop finished; 1 the loop ended another way (cancelled,
 round limit, stopped) or never started; 2 the driver gave up; 64 usage error.
@@ -275,6 +276,24 @@ def fingerprint(root, loop_dir, skip_dirs=()):
     return (name, tuple(files), head, tuple(changed))
 
 
+REVIEW_FAILURE_FILE = ".agy-review-failures.json"  # written by hooks/agy-hook-adapter.py
+
+
+def review_failure_pauses(root, conversation):
+    """How many times in a row the hook adapter paused this conversation's
+    loop because the reviewer could not run."""
+    try:
+        data = json.loads((root / ".humanize" / REVIEW_FAILURE_FILE).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict) or data.get("conversation") != conversation:
+        return 0
+    try:
+        return int(data.get("pauses") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
 def current_round(loop_dir):
     name, active = loop_state(loop_dir)
     if not active:
@@ -455,14 +474,17 @@ class Driver:
                 log(f"giving up after {resumes} resumes (--max-resumes); resume later with --resume {conversation}")
                 return self.finish(loop_dir, 2)
             before = fingerprint(self.root, loop_dir, [self.log_dir])
+            pauses_before = review_failure_pauses(self.root, conversation)
             resumes += 1
             log(f"round {current_round(loop_dir) or '?'} ({name}): resuming agy ({resumes} of at most {options['max_resumes']})")
             code, _found, status = self.run_turn(RESUME_PROMPT, conversation)
             if code != 0 or (status and status != "SUCCESS"):
                 log(f"agy exited with code {code}, status {status or 'unknown'}")
-            if fingerprint(self.root, loop_dir, [self.log_dir]) == before:
+            review_failed = review_failure_pauses(self.root, conversation) > pauses_before
+            if review_failed or fingerprint(self.root, loop_dir, [self.log_dir]) == before:
                 stalled += 1
-                log(f"nothing changed in this resume ({stalled} of at most {options['stall_limit']} in a row)")
+                what = "the review could not run" if review_failed else "nothing changed"
+                log(f"{what} in this resume ({stalled} of at most {options['stall_limit']} in a row)")
                 if stalled >= options["stall_limit"]:
                     log(f"giving up: the loop is not moving; resume later with --resume {conversation}")
                     return self.finish(loop_dir, 2)

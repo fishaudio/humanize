@@ -277,12 +277,14 @@ if [[ -n "$CODEX_EFFORT" ]]; then
 fi
 
 # Determine automation flag based on environment variable
-CODEX_AUTO_FLAG="--full-auto"
+# --sandbox workspace-write is what the old --full-auto alias meant for
+# `codex exec`; current Codex CLIs (0.162 and later) reject --full-auto.
+CODEX_AUTO_FLAGS=("--sandbox" "workspace-write")
 if [[ "${HUMANIZE_CODEX_BYPASS_SANDBOX:-}" == "true" ]] || [[ "${HUMANIZE_CODEX_BYPASS_SANDBOX:-}" == "1" ]]; then
-    CODEX_AUTO_FLAG="--dangerously-bypass-approvals-and-sandbox"
+    CODEX_AUTO_FLAGS=("--dangerously-bypass-approvals-and-sandbox")
 fi
 
-CODEX_EXEC_ARGS+=("$CODEX_AUTO_FLAG" "-C" "$PROJECT_ROOT")
+CODEX_EXEC_ARGS+=("${CODEX_AUTO_FLAGS[@]}" "-C" "$PROJECT_ROOT")
 
 # ========================================
 # Save Debug Command
