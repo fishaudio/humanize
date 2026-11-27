@@ -21,6 +21,11 @@ agy facts this relies on (agy 1.5.x, measured):
 - Stop: {"decision": "continue", "reason": ...} keeps the agent working and
   injects the reason as a system message. agy honors at most 10 such
   continuations per user message; executionNum counts the ones already used.
+  fullyIdle is false while background commands or subagents still run.
+- run_command can return before a slow command finishes, so the PostToolUse
+  event for setup-rlcr-loop.sh may arrive before the loop exists. The adapter
+  remembers which conversation started setup and binds the loop to it on the
+  next event from that conversation.
 
 Output rules for people: the text this adapter injects is read by the coding
 agent (Gemini). It tells the agent to explain things to the user in its own
@@ -29,6 +34,7 @@ plain words and never to paste reviewer output to the user.
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -59,6 +65,12 @@ COMMAND_KEYS = ("CommandLine", "Command", "command")
 CHUNK_KEYS = ("ReplacementChunks", "Chunks", "Edits")
 
 ACTIVE_STATE_FILES = ("state.md", "finalize-state.md", "methodology-analysis-state.md")
+
+SETUP_SCRIPT_NAME = "setup-rlcr-loop.sh"
+# Written by setup-rlcr-loop.sh: line 1 = state.md path, line 2 = setup script path.
+PENDING_SESSION_FILE = ".pending-session-id"
+# Written by this adapter: the agy conversation that started setup.
+SETUP_CONVERSATION_FILE = ".agy-setup-conversation"
 
 AGENT_PREAMBLE = """[Humanize RLCR loop on agy]
 - The loop text below was written for Claude Code. "Claude" means you, the coding agent. Map tool names with the table in the humanize-start-rlcr-loop skill.
@@ -232,6 +244,63 @@ def deny_reason_from_stdout(stdout):
     return None
 
 
+def is_setup_command(command):
+    """True when the command runs setup-rlcr-loop.sh (directly or through bash/sh)."""
+    try:
+        tokens = shlex.split(command)
+    except ValueError:
+        return False
+    if tokens and os.path.basename(tokens[0]) in ("bash", "sh"):
+        tokens = tokens[1:]
+    return bool(tokens) and os.path.basename(tokens[0]) == SETUP_SCRIPT_NAME
+
+
+def remember_setup_conversation(payload, root):
+    """Record which conversation runs setup, before setup creates the loop.
+
+    agy may return from run_command before a slow setup finishes, so the
+    PostToolUse event can arrive before the loop exists. The record lets the
+    next event from the same conversation finish the session binding.
+    """
+    name, args = tool_args(payload)
+    conversation = payload.get("conversationId")
+    if name not in BASH_TOOLS or not conversation:
+        return
+    if not is_setup_command(str(first_value(args, COMMAND_KEYS, ""))):
+        return
+    humanize_dir = root / ".humanize"
+    humanize_dir.mkdir(exist_ok=True)
+    (humanize_dir / SETUP_CONVERSATION_FILE).write_text(str(conversation) + "\n", encoding="utf-8")
+
+
+def bind_pending_session(payload, root):
+    """Bind a just-started loop to the conversation that ran its setup."""
+    humanize_dir = root / ".humanize"
+    pending = humanize_dir / PENDING_SESSION_FILE
+    marker = humanize_dir / SETUP_CONVERSATION_FILE
+    if not pending.is_file() or not marker.is_file():
+        return
+    conversation = payload.get("conversationId")
+    try:
+        recorded = marker.read_text(encoding="utf-8").strip()
+        lines = pending.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    if not conversation or recorded != conversation or len(lines) < 2 or not lines[1].strip():
+        return
+    hook_input = claude_payload(payload, root, "PostToolUse")
+    hook_input["tool_name"] = "Bash"
+    hook_input["tool_input"] = {"command": '"%s"' % lines[1].strip()}
+    code, _stdout, stderr = run_hook("loop-post-bash-hook.sh", hook_input, root)
+    if code != 0 and stderr.strip():
+        print(stderr.strip(), file=sys.stderr)
+    if not pending.exists():
+        try:
+            marker.unlink()
+        except OSError:
+            pass
+
+
 def handle_pre_tool(payload, root):
     name, args = tool_args(payload)
     for script, claude_tool, tool_input in validator_calls(name, args):
@@ -285,6 +354,11 @@ def handle_stop(payload, root):
         # agy would ignore a continuation now. Leave the round unreviewed; the
         # review runs on the next stop, after the user replies "continue".
         return None
+    if payload.get("fullyIdle") is False:
+        # A background command or subagent is still running, so the round is
+        # not finished. Do not review a half-done state; the review runs on a
+        # later stop once agy reports that everything is idle.
+        return None
 
     hook_input = claude_payload(payload, root, "Stop")
     hook_input["stop_hook_active"] = bool(payload.get("continuationActive"))
@@ -333,9 +407,17 @@ def main(argv):
     if not isinstance(payload, dict):
         return 0
     root = project_root(payload)
-    if root is None or not has_active_loop(root):
+    if root is None:
+        return 0
+    if event == "pre-tool":
+        try:
+            remember_setup_conversation(payload, root)
+        except OSError as exc:
+            print(f"humanize agy adapter: could not record the setup conversation: {exc}", file=sys.stderr)
+    if not has_active_loop(root):
         return 0
     try:
+        bind_pending_session(payload, root)
         reply = HANDLERS[event](payload, root)
     except Exception as exc:  # Never crash: a non-zero exit blocks every tool.
         print(f"humanize agy adapter error ({event}): {exc}", file=sys.stderr)

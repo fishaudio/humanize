@@ -62,7 +62,7 @@ A round ends when you believe the whole plan is done, not after one task.
 1. Do the work in the current round prompt (`.humanize/rlcr/<timestamp>/round-<N>-prompt.md`).
 2. Commit your changes.
 3. Write the round summary file that the prompt names.
-4. End your turn. The Humanize Stop hook then runs the reviewer, which can take many minutes.
+4. Wait until your background commands and subagents have finished, then end your turn. The Humanize Stop hook then runs the reviewer, which can take many minutes. It does not start while anything still runs in the background.
 5. If the review finds problems, the hook keeps you working and gives you the next round prompt. Follow it.
 6. After the work passes, the reviewer reviews the code. Fix what it finds the same way.
 7. The loop ends after a finalize round in which you tidy up and write `finalize-summary.md`.

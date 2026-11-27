@@ -3,40 +3,38 @@
 # Read-only Claude reviewer for the RLCR loop.
 #
 # Sourced by loop-codex-stop-hook.sh when rlcr_verifier or rlcr_reviewer is
-# "claude". The nested `claude -p` run can read files and run read-only git
-# commands, and nothing else:
-#   - built-in tools limited to Read, Grep, Glob and Bash;
-#   - Bash limited to read-only git subcommands through --allowedTools (any
-#     other command is denied, because print mode cannot prompt);
-#   - Write, Edit, NotebookEdit, WebFetch and WebSearch explicitly denied;
-#   - hooks disabled, so the nested run cannot re-enter Humanize hooks;
-#   - MCP servers, skills and slash commands disabled;
-#   - no session saved to disk.
+# "claude". The nested `claude -p` run can only read:
+#   - the only built-in tools loaded are Read, Grep and Glob (--tools), so no
+#     shell, no file writes, no web, no subagents. Permission rules the user
+#     has granted elsewhere (for example "allow Bash") cannot add a tool that
+#     is not loaded;
+#   - hooks are disabled, so the nested run cannot re-enter Humanize hooks;
+#   - MCP servers, skills and slash commands are disabled;
+#   - no session is saved to disk.
+# Anything the reviewer would otherwise get from git (the diff, the commit
+# list) is written to a file by the stop hook for it to Read.
 #
 # Required globals: PROJECT_ROOT. Optional: CLAUDE_REVIEW_MODEL.
 #
 
-# Bash patterns the reviewer may run without a prompt.
+CLAUDE_REVIEW_TOOLS="Read,Grep,Glob"
+
 CLAUDE_REVIEW_ALLOWED_TOOLS=(
     "Read"
     "Grep"
     "Glob"
-    "Bash(git diff:*)"
-    "Bash(git log:*)"
-    "Bash(git show:*)"
-    "Bash(git status:*)"
-    "Bash(git rev-parse:*)"
-    "Bash(git merge-base:*)"
-    "Bash(git ls-files:*)"
-    "Bash(git blame:*)"
 )
 
+# Also denied explicitly, in case a future CLI loads extra tools by default.
 CLAUDE_REVIEW_DISALLOWED_TOOLS=(
+    "Bash"
     "Write"
     "Edit"
+    "MultiEdit"
     "NotebookEdit"
     "WebFetch"
     "WebSearch"
+    "Task"
 )
 
 # Build CLAUDE_REVIEW_ARGS for a read-only `claude -p` run.
@@ -50,7 +48,7 @@ build_claude_review_args() {
         --disable-slash-commands
         --permission-mode default
         --settings '{"disableAllHooks":true}'
-        --tools "Read,Grep,Glob,Bash"
+        --tools "$CLAUDE_REVIEW_TOOLS"
         --allowedTools "${CLAUDE_REVIEW_ALLOWED_TOOLS[@]}"
         --disallowedTools "${CLAUDE_REVIEW_DISALLOWED_TOOLS[@]}"
     )
@@ -79,12 +77,49 @@ run_claude_reviewer() {
 
     # CLAUDECODE marks a running Claude Code session; the CLI refuses to start
     # nested sessions while it is set. CLAUDE_PROJECT_DIR belongs to the outer
-    # host and must not leak into the reviewer.
-    # The subshell keeps the unset local to this call.
+    # host and must not leak into the reviewer. The subshell keeps the unset
+    # local to this call.
     (
         unset CLAUDECODE CLAUDE_PROJECT_DIR CLAUDE_CODE_ENTRYPOINT
         cd "$PROJECT_ROOT" && run_with_timeout "$timeout_secs" claude "${CLAUDE_REVIEW_ARGS[@]}"
     ) > "$stdout_file" 2> "$stderr_file"
+}
+
+# Write what the code reviewer needs from git into one file it can Read:
+# the commit list, the uncommitted status, a file summary and the full diff.
+# Arguments: $1=review base (commit or branch), $2=output file.
+write_claude_review_diff() {
+    local review_base="$1"
+    local output_file="$2"
+    {
+        echo "# Changes Under Review"
+        echo ""
+        echo "Review base: $review_base"
+        echo ""
+        echo "## Commits (git log --oneline $review_base..HEAD)"
+        echo ""
+        echo '```text'
+        git -C "$PROJECT_ROOT" log --oneline "$review_base..HEAD" 2>&1 || true
+        echo '```'
+        echo ""
+        echo "## Uncommitted changes (git status --porcelain)"
+        echo ""
+        echo '```text'
+        git -C "$PROJECT_ROOT" status --porcelain 2>&1 || true
+        echo '```'
+        echo ""
+        echo "## Files changed (git diff --stat $review_base...HEAD)"
+        echo ""
+        echo '```text'
+        git -C "$PROJECT_ROOT" diff --stat "$review_base...HEAD" 2>&1 || true
+        echo '```'
+        echo ""
+        echo "## Full diff (git diff $review_base...HEAD)"
+        echo ""
+        echo '```diff'
+        git -C "$PROJECT_ROOT" diff "$review_base...HEAD" 2>&1 || true
+        echo '```'
+    } > "$output_file"
 }
 
 # Fail fast when a configured reviewer CLI is missing.

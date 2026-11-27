@@ -321,6 +321,14 @@ for reason in USER_CANCELED ERROR MAX_INVOCATIONS MAX_FORCED_INVOCATIONS MAX_TOK
     assert_eq "A16 $reason: stop hook not run" "$CALLS_BEFORE" "$(stub_calls loop-codex-stop-hook)"
 done
 
+# Background work still running -> no review yet; a missing flag still reviews.
+CALLS_BEFORE="$(stub_calls loop-codex-stop-hook)"
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL","fullyIdle":false}')"
+assert_eq "A16 fullyIdle false: stop hook not run" "$CALLS_BEFORE" "$(stub_calls loop-codex-stop-hook)"
+assert_eq "A16 fullyIdle false: no reply" "" "$OUT"
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}')"
+assert_eq "A16 fullyIdle missing: stop hook runs" "$((CALLS_BEFORE + 1))" "$(stub_calls loop-codex-stop-hook)"
+
 # A17: allow, exit 2, and broken hook replies
 reset_stubs
 run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}')"
@@ -461,6 +469,54 @@ printf '%s\n%s\n' "$PROJ_S/.humanize/rlcr/2026-04-01_00-00-00/state.md" "$SETUP_
 run_real post-tool "$(payload PostToolUse "$PROJ_S" "$(jq -nc --arg cmd "\"$SETUP_SIG\" plan.md" '{toolCall: {id: "t1", name: "run_command", args: {CommandLine: $cmd}}, error: ""}')")"
 assert_eq "B5 session bound to the agy conversation" "session_id: conv-1" "$(grep '^session_id:' "$PROJ_S/.humanize/rlcr/2026-04-01_00-00-00/state.md")"
 
+# B6: run_command returned before setup finished. The PostToolUse event came
+# too early; the next event from the same conversation binds the loop.
+PROJ_ASYNC="$TEST_DIR/proj-async"
+init_test_git_repo "$PROJ_ASYNC"
+SETUP_CMD_ARGS="$(jq -nc --arg cmd "bash \"$SETUP_SIG\" plan.md --skip-quiz" '{CommandLine: $cmd, WaitMsBeforeAsync: 500}')"
+run_real_pre run_command "$PROJ_ASYNC" "$SETUP_CMD_ARGS"
+assert_eq "B6 setup command recorded before the loop exists" "conv-1" "$(cat "$PROJ_ASYNC/.humanize/.agy-setup-conversation" 2>/dev/null)"
+run_real post-tool "$(payload PostToolUse "$PROJ_ASYNC" "$(jq -nc --argjson args "$SETUP_CMD_ARGS" '{toolCall: {id: "t1", name: "run_command", args: $args}, error: ""}')")"
+# Now setup finishes in the background: state.md and the pending signal appear.
+ASYNC_LOOP="$PROJ_ASYNC/.humanize/rlcr/2026-04-02_00-00-00"
+mkdir -p "$ASYNC_LOOP"
+sed -e 's/^session_id: conv-1$/session_id:/' "$LOOP_B/state.md" > "$ASYNC_LOOP/state.md"
+printf '%s\n%s\n' "$ASYNC_LOOP/state.md" "$SETUP_SIG" > "$PROJ_ASYNC/.humanize/.pending-session-id"
+# Another conversation's event must not take the loop.
+OTHER_READ="$(tool_payload "$PROJ_ASYNC" read_file "{\"Path\":\"$PROJ_ASYNC/file.txt\"}" | jq -c '.conversationId = "someone-else"')"
+run_real pre-tool "$OTHER_READ"
+assert_eq "B6 other conversation does not bind the loop" "session_id:" "$(grep '^session_id:' "$ASYNC_LOOP/state.md")"
+run_real_pre read_file "$PROJ_ASYNC" "{\"Path\":\"$PROJ_ASYNC/file.txt\"}"
+assert_eq "B6 next event from the setup conversation binds the loop" "session_id: conv-1" "$(grep '^session_id:' "$ASYNC_LOOP/state.md")"
+assert_eq "B6 pending signal consumed" "no" "$([[ -e "$PROJ_ASYNC/.humanize/.pending-session-id" ]] && echo yes || echo no)"
+assert_eq "B6 setup record removed" "no" "$([[ -e "$PROJ_ASYNC/.humanize/.agy-setup-conversation" ]] && echo yes || echo no)"
+
+# B7: only real setup invocations are recorded.
+SETUP_CHECK="$(python3 -I - "$ADAPTER" <<'PY'
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location("adapter", sys.argv[1])
+mod = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(mod)
+cases = [
+    '"/rt/scripts/setup-rlcr-loop.sh" plan.md',
+    "bash /rt/scripts/setup-rlcr-loop.sh plan.md",
+    "echo setup-rlcr-loop.sh",
+    "cat /rt/scripts/setup-rlcr-loop.sh",
+    'unbalanced "quote',
+]
+print(" ".join("1" if mod.is_setup_command(c) else "0" for c in cases))
+PY
+)"
+assert_eq "B7 setup command detection" "1 1 0 0 0" "$SETUP_CHECK"
+
+# B8: background work still running -> the real stop hook does not run
+PROJ_IDLE="$TEST_DIR/proj-idle"
+init_test_git_repo "$PROJ_IDLE"
+mkdir -p "$PROJ_IDLE/.humanize/rlcr/2026-03-01_00-00-00"
+cp "$LOOP_B/state.md" "$PROJ_IDLE/.humanize/rlcr/2026-03-01_00-00-00/state.md"
+run_real stop "$(payload Stop "$PROJ_IDLE" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL","fullyIdle":false}')"
+assert_eq "B8 busy agent: no review, no reply" "" "$OUT"
+
 echo ""
 
 # ========================================
@@ -571,9 +627,10 @@ if [[ -f "$TEST_DIR/claude-call-1.args" ]]; then
     ARGS="$(cat "$TEST_DIR/claude-call-1.args")"
     assert_contains "C1 print mode" "-p" "$ARGS"
     assert_contains "C1 hooks disabled" '{"disableAllHooks":true}' "$ARGS"
-    assert_contains "C1 built-in tools limited" "Read,Grep,Glob,Bash" "$ARGS"
-    assert_contains "C1 git diff allowed" "Bash(git diff:*)" "$ARGS"
-    assert_contains "C1 Write denied" "$(printf -- '--disallowedTools\nWrite')" "$ARGS"
+    assert_contains "C1 only Read, Grep and Glob are loaded" "$(printf -- '--tools\nRead,Grep,Glob\n')" "$ARGS"
+    assert_not_contains "C1 no shell patterns are allowed" "Bash(" "$ARGS"
+    assert_contains "C1 Bash denied" "$(printf -- '--disallowedTools\nBash')" "$ARGS"
+    assert_contains "C1 Write denied" "$(printf 'Bash\nWrite')" "$ARGS"
     assert_contains "C1 MCP servers off" "--strict-mcp-config" "$ARGS"
     assert_contains "C1 no session saved" "--no-session-persistence" "$ARGS"
     assert_not_contains "C1 no API-key-only bare mode" "--bare" "$ARGS"
@@ -618,7 +675,11 @@ run_stop_c
 assert_eq "C2 two Claude calls (verify + code review)" "2" "$(ls "$TEST_DIR"/claude-call-*.args 2>/dev/null | wc -l | tr -d ' ')"
 assert_eq "C2 code review finding -> continue" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
 assert_contains "C2 finding reaches the agent" "[P1] feature.txt:1" "$(jq -r '.reason // empty' <<<"$OUT")"
-assert_contains "C2 review prompt names the base" "git diff $BASE_C...HEAD" "$(cat "$TEST_DIR/claude-call-2.stdin" 2>/dev/null)"
+DIFF_FILE_C="$LOOP_C/round-2-review-diff.md"
+assert_contains "C2 review prompt points at the diff file" "$DIFF_FILE_C" "$(cat "$TEST_DIR/claude-call-2.stdin" 2>/dev/null)"
+assert_not_contains "C2 review prompt asks for no shell commands" "Run \`git diff" "$(cat "$TEST_DIR/claude-call-2.stdin" 2>/dev/null)"
+assert_contains "C2 diff file holds the branch diff" "+feature" "$(cat "$DIFF_FILE_C" 2>/dev/null)"
+assert_contains "C2 diff file lists the commits" "add feature" "$(cat "$DIFF_FILE_C" 2>/dev/null)"
 assert_eq "C2 codex not called" "no" "$([[ -f "$TEST_DIR/codex-called" ]] && echo yes || echo no)"
 
 # C3: review phase, Claude finds nothing -> finalize, without the polish step on agy

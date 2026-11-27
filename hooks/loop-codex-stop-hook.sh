@@ -1339,13 +1339,17 @@ Provider: codex
         # Claude has no `review --base` command: render a review prompt that asks
         # for the same [P0-9] finding lines, and replace the audit-only prompt file
         # with the prompt actually sent.
+        # The reviewer has no shell, so give it the diff as a file to Read.
+        local diff_file="$LOOP_DIR/round-${round}-review-diff.md"
+        write_claude_review_diff "$review_base" "$diff_file"
         local claude_fallback="# Code Review - Round ${round}
-Review \`git diff ${review_base}...HEAD\` read-only. End with one finding per line starting with [P0]..[P9], or the single line: No issues found."
+Read {{DIFF_FILE}} (the diff against ${review_base}) and review it. End with one finding per line starting with [P0]..[P9], or the single line: No issues found."
         load_and_render_safe "$TEMPLATE_DIR" "reviewer/claude-code-review.md" "$claude_fallback" \
             "REVIEW_ROUND=$round" \
             "BASE_BRANCH=$BASE_BRANCH" \
             "REVIEW_BASE=$review_base" \
             "REVIEW_BASE_TYPE=$review_base_type" \
+            "DIFF_FILE=$diff_file" \
             "TIMESTAMP=$timestamp" > "$prompt_file"
         {
             echo "# Code review invocation debug info"

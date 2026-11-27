@@ -90,7 +90,7 @@ Codex is the default for both review jobs. To use Claude instead, set `rlcr_veri
 }
 ```
 
-Claude runs read-only: it can read files and run read-only `git` commands, and nothing else. See [Choosing the RLCR Reviewers](usage.md#choosing-the-rlcr-reviewers).
+Claude runs read-only: it can read and search files, and nothing else. The loop hands it the diff as a file to read. See [Choosing the RLCR Reviewers](usage.md#choosing-the-rlcr-reviewers).
 
 ## Watch Progress
 
@@ -109,7 +109,7 @@ agy and Claude Code both run hook scripts, but they send different data. The plu
 - maps agy's tool calls (`write_file`, `edit_file`, `read_file`, `run_command`, and their older names) to the checks Humanize already runs in Claude Code, such as "do not edit the loop's state files" and "do not push";
 - links the loop to the agy conversation right after setup, so other agy conversations in the same project are not affected;
 - runs the same Stop hook as Claude Code when Gemini finishes a turn normally, and passes the reviewer's feedback back to Gemini;
-- does not start a review when you cancel a turn, when agy hits an error, or when agy is past its continuation limit.
+- does not start a review when you cancel a turn, when agy hits an error, when a background command or subagent is still running, or when agy is past its continuation limit.
 
 When a check blocks a tool call, agy shows the reason. Otherwise, the plugin stays silent and agy's own permission settings decide, so installing the plugin never grants extra permissions.
 

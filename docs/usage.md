@@ -600,7 +600,7 @@ Both default to `codex`. To use Claude for both, add this to `.humanize/config.j
 
 The environment variables `HUMANIZE_RLCR_VERIFIER` and `HUMANIZE_RLCR_REVIEWER` override the config for one session.
 
-When Claude reviews, it runs as `claude -p` in read-only mode. It can read files and run read-only `git` commands (`diff`, `log`, `show`, `status`, and similar), but it cannot edit files, browse the web, use MCP servers, or trigger Humanize hooks. Because it cannot write files, it prints its review and the loop saves it. Instead of editing the goal tracker itself, it lists corrections for the coding agent to apply. Codex works as before: `codex exec` checks each round, and `codex review --base` reviews the code.
+When Claude reviews, it runs as `claude -p` in read-only mode. Only the Read, Grep, and Glob tools are loaded, so it can read and search files, but it cannot run shell commands, edit files, browse the web, use MCP servers, or trigger Humanize hooks. Permissions you granted Claude elsewhere, such as "allow Bash", do not change this. For the code review, the loop writes the commit list and the full diff to a file for Claude to read. Because it cannot write files, it prints its review and the loop saves it. Instead of editing the goal tracker itself, it lists corrections for the coding agent to apply. Codex works as before: `codex exec` checks each round, and `codex review --base` reviews the code.
 
 Pick a reviewer from a different model family than the coding agent when you can. Using Claude Code to code and Codex to review (or Gemini in agy to code and Codex or Claude to review) gives a more independent review.
 
