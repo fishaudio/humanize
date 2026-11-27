@@ -378,8 +378,11 @@ def bind_pending_session(payload, root):
 def command_word_lists(command):
     """Split a shell command into the words of each simple command.
     Operators (;, &&, ||, |, &, parentheses) separate commands, and
-    redirections with their targets are dropped. Raises ValueError on
+    redirections with their targets are dropped, including a file
+    descriptor number written before the operator (2>/dev/null).
+    Backslash-newline continuations are joined first. Raises ValueError on
     unbalanced quotes."""
+    command = re.sub(r"\\\r?\n", " ", command)
     lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
     lexer.whitespace_split = True
     lexer.commenters = ""
@@ -389,6 +392,10 @@ def command_word_lists(command):
     for token in lexer:
         if token and set(token) <= SHELL_OPERATOR_CHARS:
             if "<" in token or ">" in token:
+                # shlex cannot tell "2>x" from "2 >x"; dropping the number
+                # in both cases can only make a git push easier to spot.
+                if words and words[-1].isdigit():
+                    words.pop()
                 skip_target = True
                 continue
             if words:
@@ -407,7 +414,10 @@ def command_word_lists(command):
 def runs_git_push(command, depth=0):
     """True when a shell command may run `git push`. Deliberately
     conservative: it also looks inside quoted words such as bash -c "...",
-    and treats a command it cannot parse as a push when it mentions both."""
+    and treats a command it cannot parse as a push when it mentions both.
+    This catches the agent's mistakes, not deliberate evasion (an alias or
+    a script that pushes is not seen here); scripts/agy-rlcr-run.sh also
+    makes git itself refuse to push."""
     if not isinstance(command, str) or "git" not in command or "push" not in command:
         return False
     try:
@@ -456,16 +466,24 @@ def loop_allows_push(payload, root):
     return False
 
 
-def is_inside(path_value, root):
+def resolve_target(path_value, root):
+    """The real location a file tool writes to; relative paths are taken from
+    the project root. None when it cannot be resolved."""
     path = Path(path_value).expanduser()
     if not path.is_absolute():
         path = root / path
     try:
-        resolved = path.resolve()
-        root_resolved = root.resolve()
+        return path.resolve()
+    except (OSError, RuntimeError):
+        return None
+
+
+def is_within(target, base):
+    try:
+        base = Path(base).expanduser().resolve()
     except (OSError, RuntimeError):
         return False
-    return resolved == root_resolved or root_resolved in resolved.parents
+    return target == base or base in target.parents
 
 
 def unattended_denial(payload, root):
@@ -480,8 +498,9 @@ def unattended_denial(payload, root):
         allowed = [root]
         artifacts = payload.get("artifactDirectoryPath")
         if isinstance(artifacts, str) and artifacts:
-            allowed.append(Path(artifacts))
-        if not any(is_inside(path, base) for base in allowed):
+            allowed.append(artifacts)
+        target = resolve_target(path, root)
+        if target is None or not any(is_within(target, base) for base in allowed):
             return {
                 "decision": "deny",
                 "reason": f"Unattended Humanize run: only files inside the project ({root}) may be changed. Blocked: {path}",

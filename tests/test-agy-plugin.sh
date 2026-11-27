@@ -28,7 +28,7 @@ setup_test_dir
 export XDG_CACHE_HOME="$TEST_DIR/.cache"
 export XDG_CONFIG_HOME="$TEST_DIR/.config"
 mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME"
-unset HUMANIZE_RLCR_VERIFIER HUMANIZE_RLCR_REVIEWER HUMANIZE_CLAUDE_REVIEW_MODEL HUMANIZE_AGY_CONTINUATION_LIMIT CLAUDE_PROJECT_DIR
+unset HUMANIZE_RLCR_VERIFIER HUMANIZE_RLCR_REVIEWER HUMANIZE_CLAUDE_REVIEW_MODEL HUMANIZE_AGY_CONTINUATION_LIMIT CLAUDE_PROJECT_DIR HUMANIZE_AGY_UNATTENDED
 
 assert_eq() {
     local name="$1" expected="$2" actual="$3"
@@ -903,6 +903,9 @@ mkdir -p "$ARTIFACTS_E"
 ARTIFACT_PAYLOAD="$(tool_payload "$PROJ_E" write_to_file "{\"TargetFile\":\"$ARTIFACTS_E/task.md\",\"CodeContent\":\"x\"}" | jq -c --arg a "$ARTIFACTS_E" '.artifactDirectoryPath = $a')"
 run_unattended pre-tool "$ARTIFACT_PAYLOAD"
 assert_eq "E2 agy's own artifact folder is allowed" "" "$OUT"
+RELATIVE_ESCAPE="$(tool_payload "$PROJ_E" write_file '{"Path":"link-out/rel.txt","Content":"x"}' | jq -c --arg a "$ARTIFACTS_E" '.artifactDirectoryPath = $a')"
+run_unattended pre-tool "$RELATIVE_ESCAPE"
+assert_eq "E1 a relative symlink out of the project is denied even with an artifact folder" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
 run_unattended_pre write_file "$PROJ_E" "{\"Path\":\"$PROJ_E/src/new.txt\",\"Content\":\"x\"}"
 assert_eq "E2 write inside the project is left to agy" "" "$OUT"
 run_unattended_pre write_file "$PROJ_E" '{"Path":"src/relative.txt","Content":"x"}'
@@ -919,6 +922,12 @@ for cmd in 'git push' 'git push origin HEAD' 'cd sub && git -C .. push' 'bash -c
     assert_eq "E4 denied: $cmd" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
 done
 assert_contains "E4 reason says how to allow pushes" "--push-every-round" "$(jq -r '.reason // empty' <<<"$OUT")"
+for args in '{"CommandLine":"git 2>/dev/null push origin HEAD"}' '{"CommandLine":"git -C . \\\npush origin HEAD"}' '{"CommandLine":"git \\\n  push"}'; do
+    run_unattended_pre run_command "$PROJ_E" "$args"
+    assert_eq "E4 denied: $(jq -r .CommandLine <<<"$args" | tr '\n' ' ')" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+done
+run_unattended_pre run_command "$PROJ_E" '{"CommandLine":"git status 2>/dev/null && git log --oneline \\\n  --grep push"}'
+assert_eq "E4 a log search for push is allowed" "" "$OUT"
 
 # Without the variable nothing changes.
 OUT="$(tool_payload "$PROJ_E" write_file "{\"Path\":\"$OUTSIDE_E/x.txt\",\"Content\":\"x\"}" | python3 "$ADAPTER" pre-tool 2>/dev/null)"
@@ -965,6 +974,11 @@ done
 printf '%s\n' "$@" > "$dir/call-$n.args"
 printf '%s' "$prompt" > "$dir/call-$n.prompt"
 printf 'unattended=%s cwd=%s\n' "${HUMANIZE_AGY_UNATTENDED:-}" "$PWD" > "$dir/call-$n.env"
+env | grep '^GIT_CONFIG_' | sort > "$dir/call-$n.gitenv"
+if [[ -n "${MOCK_AGY_TRY_PUSH:-}" ]]; then
+    git push origin HEAD:refs/heads/probe-$n > "$dir/call-$n.push-out" 2>&1
+    echo $? > "$dir/call-$n.push"
+fi
 [[ -n "$conv" ]] || conv="${MOCK_AGY_CONV:-mock-conv}"
 loop=".humanize/rlcr/2026-05-01_00-00-00"
 scenario="${MOCK_AGY_SCENARIO:-complete}"
@@ -988,10 +1002,18 @@ elif [[ -f "$loop/state.md" ]]; then
             printf -- '---\ncurrent_round: %s\nsession_id: %s\n---\n' "$n" "$conv" > "$loop/state.md" ;;
         cancel)
             mv "$loop/state.md" "$loop/cancel-state.md" ;;
+        dirty)
+            echo "edit $n" >> README.md
+            if [[ $n -ge ${MOCK_AGY_FINISH_AT:-3} ]]; then mv "$loop/state.md" "$loop/complete-state.md"; fi ;;
         stall) : ;;
     esac
 fi
 printf '{"event":"init","conversation_id":"%s","init":{"model":"mock"}}\n' "$conv"
+if [[ "$scenario" == "slow" ]]; then
+    trap 'echo interrupted > "$dir/call-$n.signal"; exit 130' INT TERM
+    sleep 30 &
+    wait $!
+fi
 printf '{"event":"step_update","step":{}}\n'
 printf '{"event":"result","result":{"conversation_id":"%s","status":"SUCCESS","response":"Gemini reply %s"}}\n' "$conv" "$n"
 MOCK
@@ -1080,6 +1102,44 @@ assert_eq "F8 --resume: no start turn" "continue" "$(cat "$MOCK_AGY_DIR/call-1.p
 assert_contains "F8 --resume uses that conversation" "$(printf -- '--conversation\nconv-r')" "$(cat "$MOCK_AGY_DIR/call-1.args")"
 MOCK_AGY_SCENARIO=resume run_driver --resume conv-unknown
 assert_eq "F8 --resume with an unknown conversation exits 1" "1" "$RC"
+
+# git itself refuses to push during an unattended run.
+new_driver_project push
+git init -q --bare "$TEST_DIR/push-remote.git"
+git -C "$PROJ_F" remote add origin "$TEST_DIR/push-remote.git"
+MOCK_AGY_SCENARIO=complete MOCK_AGY_FINISH_AT=2 MOCK_AGY_TRY_PUSH=1 GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.quotepath GIT_CONFIG_VALUE_0=false run_driver docs/plan.md
+assert_eq "F10 push from inside agy fails" "yes" "$([[ "$(cat "$MOCK_AGY_DIR/call-1.push")" != 0 ]] && echo yes || echo no)"
+assert_contains "F10 git names the block" "humanize-unattended-run-blocks-git-push" "$(cat "$MOCK_AGY_DIR/call-1.push-out")"
+assert_eq "F10 nothing reached the remote" "0" "$(git --git-dir="$TEST_DIR/push-remote.git" show-ref | wc -l | tr -d ' ')"
+assert_contains "F10 existing git config from the environment is kept" "GIT_CONFIG_KEY_0=core.quotepath" "$(cat "$MOCK_AGY_DIR/call-1.gitenv")"
+assert_contains "F10 the block is added after it" "GIT_CONFIG_COUNT=2" "$(cat "$MOCK_AGY_DIR/call-1.gitenv")"
+new_driver_project push-allowed
+git -C "$PROJ_F" remote add origin "$TEST_DIR/push-remote.git"
+MOCK_AGY_SCENARIO=complete MOCK_AGY_FINISH_AT=2 MOCK_AGY_TRY_PUSH=1 run_driver docs/plan.md --push-every-round
+assert_eq "F10 --push-every-round: push works" "0" "$(cat "$MOCK_AGY_DIR/call-1.push")"
+assert_eq "F10 --push-every-round: no git config block" "" "$(cat "$MOCK_AGY_DIR/call-1.gitenv")"
+
+# Edits to an already-changed file count as progress.
+new_driver_project dirty
+MOCK_AGY_SCENARIO=dirty MOCK_AGY_FINISH_AT=4 run_driver --stall-limit 2 docs/plan.md
+assert_eq "F11 edits to a dirty file are progress, not a stall" "0" "$RC"
+assert_eq "F11 all four turns ran" "4" "$CALLS"
+
+# Stopping the driver during the first turn stops agy and says how to resume.
+new_driver_project slow
+(cd "$PROJ_F" && MOCK_AGY_SCENARIO=slow exec "$DRIVER" --agy "$MOCK_AGY" docs/plan.md > /dev/null 2> "$MOCK_AGY_DIR/driver.stderr") &
+DRIVER_PID=$!
+for _ in $(seq 1 50); do
+    grep -q 'agy conversation: mock-conv' "$MOCK_AGY_DIR/driver.stderr" 2>/dev/null && break
+    sleep 0.2
+done
+kill -TERM "$DRIVER_PID" 2>/dev/null
+wait "$DRIVER_PID"; RC=$?
+assert_eq "F12 stopped driver exits 130" "130" "$RC"
+assert_contains "F12 conversation reported during the first turn" "agy conversation: mock-conv" "$(cat "$MOCK_AGY_DIR/driver.stderr")"
+assert_contains "F12 says how to resume" "--resume mock-conv" "$(cat "$MOCK_AGY_DIR/driver.stderr")"
+for _ in $(seq 1 50); do [[ -f "$MOCK_AGY_DIR/call-1.signal" ]] && break; sleep 0.2; done
+assert_eq "F12 agy was stopped too" "interrupted" "$(cat "$MOCK_AGY_DIR/call-1.signal" 2>/dev/null)"
 
 new_driver_project usage
 run_driver

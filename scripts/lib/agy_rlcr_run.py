@@ -11,7 +11,10 @@ Safety while unattended:
 - agy's own permission prompts are approved automatically (nobody could
   answer them), so the driver sets HUMANIZE_AGY_UNATTENDED=1. The Humanize
   hook adapter then blocks file changes outside the project and `git push`
-  (unless the loop was started with --push-every-round). agy itself is also
+  (unless the loop was started with --push-every-round). As a backstop the
+  driver also makes git itself refuse to push, through a pushInsteadOf rule
+  in the environment (a remote with its own pushurl is not covered by
+  that rule, only by the hook check). agy itself is also
   told to keep its file tools inside the workspace and not to switch to paid
   AI credits when the subscription quota runs out. Shell commands can still
   reach outside the project; run unattended loops only where that is
@@ -27,6 +30,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -63,10 +67,11 @@ added because nobody is there to answer the quiz.
 
 While the driver runs, agy's permission prompts are approved automatically.
 The Humanize hooks then block file changes outside the project and git push
-(unless you pass --push-every-round), agy keeps its file tools inside the
-project, and agy does not switch to paid AI credits when your quota runs out.
-Shell commands can still reach outside the project, so run unattended loops
-only where that is acceptable.
+(unless you pass --push-every-round; git itself is also set to refuse
+pushes), agy keeps its file tools inside the project, and agy does not
+switch to paid AI credits when your quota runs out. These checks catch
+mistakes; they are not a sandbox. Shell commands can still reach outside the
+project, so run unattended loops only where that is acceptable.
 
 Exit codes: 0 loop finished, 1 loop ended another way or never started,
 2 driver gave up, 64 usage error.
@@ -97,6 +102,11 @@ Nobody is watching this session: a driver script stands in for the user.
 Then do the work the loop gives you until the loop ends."""
 
 RESUME_PROMPT = "continue"
+
+# pushInsteadOf with an empty prefix matches every push URL and rewrites it to
+# a transport git does not have, so `git push` fails while fetch still works.
+# The scheme name is what git shows in its error.
+PUSH_BLOCK_KEY = "url.humanize-unattended-run-blocks-git-push://.pushInsteadOf"
 
 
 class UsageError(Exception):
@@ -214,22 +224,47 @@ def loop_state(loop_dir):
     return None, False
 
 
+def file_stamp(path):
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    return (stat.st_size, stat.st_mtime_ns)
+
+
 def fingerprint(root, loop_dir):
-    """Something that changes whenever the loop or the repository moves on."""
+    """Something that changes whenever the loop or the repository moves on:
+    the loop's files, HEAD, and the size and time of every changed or
+    untracked file (so edits to an already-dirty file count as progress).
+    Files under .humanize/ are left out: the loop folder is checked on its
+    own, and the driver's logs there change on every turn."""
     name, _active = loop_state(loop_dir)
     files = []
     try:
         for path in sorted(loop_dir.iterdir()):
             if path.is_file():
-                stat = path.stat()
-                files.append((path.name, stat.st_size, stat.st_mtime_ns))
+                files.append((path.name, file_stamp(path)))
     except OSError:
         pass
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
     status = subprocess.run(
-        ["git", "status", "--porcelain"], cwd=root, capture_output=True, text=True
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root, capture_output=True, text=True
     ).stdout
-    return (name, tuple(files), head, status)
+    changed = []
+    entries = status.split("\0")
+    index = 0
+    while index < len(entries):
+        entry = entries[index]
+        index += 1
+        if len(entry) < 4:
+            continue
+        code, rel = entry[:2], entry[3:]
+        if "R" in code or "C" in code:
+            index += 1  # the next entry is the old name of a rename or copy
+        if rel == ".humanize" or rel.startswith(".humanize/"):
+            continue
+        changed.append((code, rel, file_stamp(root / rel)))
+    return (name, tuple(files), head, tuple(changed))
 
 
 def current_round(loop_dir):
@@ -262,6 +297,26 @@ def parse_events(path):
     return conversation, status, response
 
 
+def stop_process(process):
+    if process.poll() is not None:
+        return
+    for sig, wait in ((signal.SIGINT, 10), (signal.SIGTERM, 5)):
+        try:
+            process.send_signal(sig)
+            process.wait(timeout=wait)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            return
+    process.kill()
+    process.wait()
+
+
+def raise_keyboard_interrupt(_signum, _frame):
+    raise KeyboardInterrupt
+
+
 class Driver:
     def __init__(self, options, root):
         self.options = options
@@ -272,11 +327,21 @@ class Driver:
         self.log_dir.mkdir(parents=True, exist_ok=True)
         self.turn = 0
         self.last_response = None
+        self.conversation = options["resume"]
         self.env = dict(os.environ)
         self.env[UNATTENDED_ENV] = "1"
         # agy runs in the project root even when the driver was started from a
         # subfolder; PWD must agree, or tools that trust it see the subfolder.
         self.env["PWD"] = str(root)
+
+    def block_git_push(self):
+        try:
+            count = int(self.env.get("GIT_CONFIG_COUNT", "0"))
+        except ValueError:
+            count = 0
+        self.env[f"GIT_CONFIG_KEY_{count}"] = PUSH_BLOCK_KEY
+        self.env[f"GIT_CONFIG_VALUE_{count}"] = ""
+        self.env["GIT_CONFIG_COUNT"] = str(count + 1)
 
     def agy_command(self, prompt, conversation=None):
         command = [self.options["agy"]]
@@ -298,11 +363,36 @@ class Driver:
         with open(self.log_dir / "driver.log", "a", encoding="utf-8") as record:
             record.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} turn {self.turn}: {kind}\n")
         with open(events, "w", encoding="utf-8") as out, open(errors, "w", encoding="utf-8") as err:
-            code = subprocess.run(command, cwd=self.root, env=self.env, stdout=out, stderr=err).returncode
+            process = subprocess.Popen(command, cwd=self.root, env=self.env, stdout=out, stderr=err)
+            try:
+                while True:
+                    try:
+                        code = process.wait(timeout=2)
+                        break
+                    except subprocess.TimeoutExpired:
+                        pass
+                    # Report the conversation as soon as agy names it, so a
+                    # driver stopped during a long first turn can still say
+                    # how to resume.
+                    if self.conversation is None:
+                        self.note_conversation(parse_events(events)[0])
+            except KeyboardInterrupt:
+                # Never leave agy working on the loop after the driver stops.
+                stop_process(process)
+                if self.conversation is None:
+                    self.note_conversation(parse_events(events)[0])
+                raise
         found, status, response = parse_events(events)
+        if self.conversation is None:
+            self.note_conversation(found)
         if response:
             self.last_response = response
         return code, found, status
+
+    def note_conversation(self, conversation):
+        if conversation and self.conversation is None:
+            self.conversation = conversation
+            log(f"agy conversation: {conversation}")
 
     def finish(self, loop_dir, code):
         """Print what Gemini wrote for people: the finalize summary when the
@@ -326,14 +416,20 @@ class Driver:
             if loop_dir is None:
                 log(f"no Humanize loop in this project belongs to agy conversation {conversation}")
                 return 1
+            name, _active = loop_state(loop_dir)
+            pushes_allowed = bool(name) and read_fields(loop_dir / name).get("push_every_round") == "true"
+            if not pushes_allowed:
+                self.block_git_push()
         else:
+            if "--push-every-round" not in options["setup_args"]:
+                self.block_git_push()
             arguments = shlex.join(options["setup_args"])
             log(f"starting agy: humanize-start-rlcr-loop {arguments}")
             code, conversation, status = self.run_turn(START_PROMPT.format(arguments=arguments))
+            conversation = self.conversation
             if not conversation:
                 log(f"agy did not start a conversation (exit {code}); see {self.log_dir}")
                 return self.finish(None, 2)
-            log(f"agy conversation: {conversation}")
             loop_dir = find_loop(self.root, conversation)
             if loop_dir is None:
                 log("the loop did not start; agy's last reply follows")
@@ -383,10 +479,17 @@ def main(argv):
     if shutil.which(options["agy"]) is None:
         print(f"agy-rlcr-run: agy not found: {options['agy']}", file=sys.stderr)
         return 64
+    driver = Driver(options, root)
+    # Stopping the driver (Ctrl-C, kill, tmux kill-session) stops agy too.
+    signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
+    signal.signal(signal.SIGHUP, raise_keyboard_interrupt)
     try:
-        return Driver(options, root).run()
+        return driver.run()
     except KeyboardInterrupt:
-        log("stopped; the loop state is kept. Resume with --resume and the conversation ID above.")
+        if driver.conversation:
+            log(f"stopped; the loop state is kept. Resume with: --resume {driver.conversation}")
+        else:
+            log("stopped before agy started a conversation; nothing to resume.")
         return 130
 
 

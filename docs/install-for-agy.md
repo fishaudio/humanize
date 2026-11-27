@@ -59,21 +59,21 @@ A loop works from a plan file. To turn a rough draft into a plan, ask inside agy
 Use the humanize-gen-plan skill with --input docs/draft.md --output docs/plan.md
 ```
 
-Gemini follows the same steps as `/humanize:gen-plan` in Claude Code, and writes the plan itself:
+Gemini follows the same steps as `/humanize:gen-plan` in Claude Code and writes the plan itself:
 
-1. checks the file paths and confirms that the draft belongs to this repository;
-2. asks Codex to point out risks and gaps in the draft;
-3. writes an initial plan, asks Codex to review it, and revises it until they agree (up to 3 rounds);
-4. asks you about anything only you can decide;
-5. writes the final plan, with acceptance criteria, a task list, and a record of where Gemini and Codex agreed or disagreed.
+1. Checks the file paths and confirms that the draft belongs to this repository.
+2. Asks Codex to point out risks and gaps in the draft.
+3. Writes an initial plan, asks Codex to review it, and revises it until they agree (up to 3 rounds).
+4. Asks you about anything only you can decide.
+5. Writes the final plan, with acceptance criteria, a task list, and a record of where Gemini and Codex agreed or disagreed.
 
-Codex's notes go only to Gemini. The plan keeps the section names and labels that Humanize tools read, such as `Claude Position`. In a plan written in agy, "Claude" there refers to Gemini, and the plan states this.
+Codex's notes go only to Gemini. The plan keeps the section names and labels that Humanize tools read, such as `Claude Position`. In a plan written in agy, "Claude" in those labels refers to Gemini, and the plan states this.
 
 The options are the same as in Claude Code: `--direct` skips the Codex review rounds, `--discussion` keeps them, `--coach` adds short check-in questions, and `--auto-start-rlcr-if-converged` starts the loop right away when nothing is left for you to decide. See the [Usage Guide](usage.md#gen-plan).
 
 ## Start a Loop
 
-Inside agy, in your project, ask to start a loop in plain words, for example:
+From your project inside agy, ask to start a loop in plain words, for example:
 
 ```text
 Use the humanize-start-rlcr-loop skill to start an RLCR loop on docs/plan.md
@@ -109,18 +109,19 @@ To run a loop with nobody watching, for example on a server, start it from a ter
 ~/.gemini/config/plugins/humanize/runtime/scripts/agy-rlcr-run.sh docs/plan.md
 ```
 
-The script starts agy with the `humanize-start-rlcr-loop` skill and replies `continue` for you each time the loop pauses at agy's limit. It adds `--skip-quiz`, because nobody is there to answer the quiz. Any other loop options go after the plan file, as usual. When the loop ends, the script prints Gemini's last reply.
+The script starts agy with the `humanize-start-rlcr-loop` skill and replies `continue` for you each time the loop pauses at agy's limit. It adds `--skip-quiz` because nobody is there to answer the quiz. Any other loop options go after the plan file, as usual. When the loop finishes, the script prints Gemini's finalize summary; if the loop ends another way, it prints Gemini's last reply.
 
 Because nobody can approve agy's permission prompts, the script approves them automatically. To keep that safe:
 
-- Humanize blocks file changes outside the project, and blocks `git push` unless you passed `--push-every-round`;
+- Humanize blocks file changes outside the project;
+- Humanize blocks `git push` unless you passed `--push-every-round`: it checks each command Gemini runs, and it also sets git itself to refuse pushes;
 - agy keeps its file tools inside the project, and does not switch to paid AI credits when your subscription quota runs out.
 
-Shell commands can still reach outside the project, so use unattended runs only on machines and projects where that is acceptable.
+These checks catch mistakes; they are not a sandbox. Shell commands can still reach outside the project, so use unattended runs only on machines and projects where that is acceptable.
 
-The script stops by itself if three resumes in a row change nothing (`--stall-limit`), or after 50 resumes (`--max-resumes`). It saves agy's output in `.humanize/agy-runs/<time>/`. If the script itself stops, for example after a reboot, run it again with `--resume <conversation-id>`; it prints the ID when it starts. Other options: `--model`, `--effort`, and `--log-dir`. Run it with `--help` for details.
+The script stops by itself if three resumes in a row change nothing (`--stall-limit`), or after 50 resumes (`--max-resumes`). It saves agy's output in `.humanize/agy-runs/<time>/`. If the script itself stops (for example, after a reboot), run it again with `--resume <conversation-id>`; it prints the ID when it starts. Other options: `--model`, `--effort`, and `--log-dir`. Run it with `--help` for details.
 
-Exit codes: `0` means the loop finished, `1` means the loop ended another way (for example, cancelled) or never started, and `2` means the script gave up.
+Exit codes: `0` means the loop finished, `1` means it ended another way (for example, cancelled) or never started, and `2` means the script gave up.
 
 To keep it running after you log out, start it inside `tmux` or with `nohup`.
 
