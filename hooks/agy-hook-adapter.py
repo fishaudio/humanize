@@ -244,11 +244,27 @@ def deny_reason_from_stdout(stdout):
     return None
 
 
+SHELL_OPERATOR_CHARS = set("();<>|&")
+
+
+def first_command_words(command):
+    """Words of the first simple command, without shell comments or anything
+    after an operator such as ;, &&, || or |."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    words = []
+    for token in lexer:
+        if token and set(token) <= SHELL_OPERATOR_CHARS:
+            break
+        words.append(token)
+    return words
+
+
 def is_setup_command(command):
     """True when the command starts a loop with setup-rlcr-loop.sh
     (directly or through bash/sh). Help requests do not start a loop."""
     try:
-        tokens = shlex.split(command)
+        tokens = first_command_words(command)
     except ValueError:
         return False
     if tokens and os.path.basename(tokens[0]) in ("bash", "sh"):
@@ -256,6 +272,27 @@ def is_setup_command(command):
     if not tokens or os.path.basename(tokens[0]) != SETUP_SCRIPT_NAME:
         return False
     return not any(token in ("-h", "--help") for token in tokens[1:])
+
+
+def pending_setup_is_live(humanize_dir):
+    """True when .pending-session-id points at a state file that is still
+    waiting for its session_id. A leftover signal from a loop that has since
+    ended (state renamed or removed) or was already bound does not count."""
+    try:
+        lines = (humanize_dir / PENDING_SESSION_FILE).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return False
+    if not lines or not lines[0].strip():
+        return False
+    state = Path(lines[0].strip())
+    try:
+        text = state.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    for line in text.splitlines():
+        if line.startswith("session_id:"):
+            return not line[len("session_id:"):].strip()
+    return True
 
 
 def remember_setup_conversation(payload, root):
@@ -272,7 +309,7 @@ def remember_setup_conversation(payload, root):
     if not is_setup_command(str(first_value(args, COMMAND_KEYS, ""))):
         return
     humanize_dir = root / ".humanize"
-    if (humanize_dir / PENDING_SESSION_FILE).exists():
+    if pending_setup_is_live(humanize_dir):
         # An earlier setup is still waiting to be bound to the conversation
         # that ran it; never hand its loop to this one.
         return

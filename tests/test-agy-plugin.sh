@@ -504,11 +504,14 @@ cases = [
     "cat /rt/scripts/setup-rlcr-loop.sh",
     'unbalanced "quote',
     '"/rt/scripts/setup-rlcr-loop.sh" --help',
+    '"/rt/scripts/setup-rlcr-loop.sh" --skip-impl # see --help for options',
+    '"/rt/scripts/setup-rlcr-loop.sh" plan.md && echo --help',
+    '"/rt/scripts/setup-rlcr-loop.sh" plan.md; echo -h',
 ]
 print(" ".join("1" if mod.is_setup_command(c) else "0" for c in cases))
 PY
 )"
-assert_eq "B7 setup command detection (help does not count)" "1 1 0 0 0 0" "$SETUP_CHECK"
+assert_eq "B7 setup command detection (help does not count; comments and later commands ignored)" "1 1 0 0 0 0 1 1 1" "$SETUP_CHECK"
 
 # B9: conversation A's setup is still waiting to be bound when conversation B
 # runs setup. B must not take A's loop; A's next event still binds it.
@@ -525,6 +528,22 @@ assert_eq "B9 second setup does not take the pending loop" "session_id:" "$(grep
 assert_eq "B9 setup record still names the first conversation" "conv-1" "$(cat "$PROJ_RACE/.humanize/.agy-setup-conversation" 2>/dev/null)"
 run_real_pre read_file "$PROJ_RACE" "{\"Path\":\"$PROJ_RACE/file.txt\"}"
 assert_eq "B9 first conversation still binds its loop" "session_id: conv-1" "$(grep '^session_id:' "$RACE_LOOP/state.md")"
+
+# B10: a leftover signal from a loop that has ended does not block a new setup.
+PROJ_STALE="$TEST_DIR/proj-stale"
+init_test_git_repo "$PROJ_STALE"
+mkdir -p "$PROJ_STALE/.humanize"
+printf '%s\n%s\n' "$PROJ_STALE/.humanize/rlcr/old-loop/state.md" "$SETUP_SIG" > "$PROJ_STALE/.humanize/.pending-session-id"
+NEW_SETUP="$(tool_payload "$PROJ_STALE" run_command "$SETUP_CMD_ARGS" | jq -c '.conversationId = "conv-new"')"
+run_real pre-tool "$NEW_SETUP"
+assert_eq "B10 stale signal: new setup is recorded" "conv-new" "$(cat "$PROJ_STALE/.humanize/.agy-setup-conversation" 2>/dev/null)"
+STALE_LOOP="$PROJ_STALE/.humanize/rlcr/2026-04-04_00-00-00"
+mkdir -p "$STALE_LOOP"
+sed -e 's/^session_id: conv-1$/session_id:/' "$LOOP_B/state.md" > "$STALE_LOOP/state.md"
+printf '%s\n%s\n' "$STALE_LOOP/state.md" "$SETUP_SIG" > "$PROJ_STALE/.humanize/.pending-session-id"
+NEW_READ="$(tool_payload "$PROJ_STALE" read_file "{\"Path\":\"$PROJ_STALE/file.txt\"}" | jq -c '.conversationId = "conv-new"')"
+run_real pre-tool "$NEW_READ"
+assert_eq "B10 stale signal: new loop binds to the new conversation" "session_id: conv-new" "$(grep '^session_id:' "$STALE_LOOP/state.md")"
 
 # B8: background work still running -> the real stop hook does not run
 PROJ_IDLE="$TEST_DIR/proj-idle"
