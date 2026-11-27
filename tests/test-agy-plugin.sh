@@ -503,11 +503,28 @@ cases = [
     "echo setup-rlcr-loop.sh",
     "cat /rt/scripts/setup-rlcr-loop.sh",
     'unbalanced "quote',
+    '"/rt/scripts/setup-rlcr-loop.sh" --help',
 ]
 print(" ".join("1" if mod.is_setup_command(c) else "0" for c in cases))
 PY
 )"
-assert_eq "B7 setup command detection" "1 1 0 0 0" "$SETUP_CHECK"
+assert_eq "B7 setup command detection (help does not count)" "1 1 0 0 0 0" "$SETUP_CHECK"
+
+# B9: conversation A's setup is still waiting to be bound when conversation B
+# runs setup. B must not take A's loop; A's next event still binds it.
+PROJ_RACE="$TEST_DIR/proj-race"
+init_test_git_repo "$PROJ_RACE"
+run_real_pre run_command "$PROJ_RACE" "$SETUP_CMD_ARGS"
+RACE_LOOP="$PROJ_RACE/.humanize/rlcr/2026-04-03_00-00-00"
+mkdir -p "$RACE_LOOP"
+sed -e 's/^session_id: conv-1$/session_id:/' "$LOOP_B/state.md" > "$RACE_LOOP/state.md"
+printf '%s\n%s\n' "$RACE_LOOP/state.md" "$SETUP_SIG" > "$PROJ_RACE/.humanize/.pending-session-id"
+B_SETUP="$(tool_payload "$PROJ_RACE" run_command "$SETUP_CMD_ARGS" | jq -c '.conversationId = "conv-b"')"
+run_real pre-tool "$B_SETUP"
+assert_eq "B9 second setup does not take the pending loop" "session_id:" "$(grep '^session_id:' "$RACE_LOOP/state.md")"
+assert_eq "B9 setup record still names the first conversation" "conv-1" "$(cat "$PROJ_RACE/.humanize/.agy-setup-conversation" 2>/dev/null)"
+run_real_pre read_file "$PROJ_RACE" "{\"Path\":\"$PROJ_RACE/file.txt\"}"
+assert_eq "B9 first conversation still binds its loop" "session_id: conv-1" "$(grep '^session_id:' "$RACE_LOOP/state.md")"
 
 # B8: background work still running -> the real stop hook does not run
 PROJ_IDLE="$TEST_DIR/proj-idle"
@@ -702,6 +719,25 @@ assert_contains "C3 finalize prompt reaches the agent" "finalize-summary.md" "$R
 assert_not_contains "C3 no polish section on agy" "Polish the Finalize Summary" "$REASON"
 assert_not_contains "C3 no polish command on agy" "polish-gemini.sh\" --auto" "$REASON"
 assert_contains "C3 plain-language instruction instead" "Write the Finalize Summary for People" "$REASON"
+
+# C3b: a reply that is neither findings nor "No issues found." is a failed review
+make_loop_c review-unfinished true
+printf 'I could not open the diff file, so I cannot review these changes.\n' > "$MOCK_BIN/claude-review-output"
+rm -f "$TEST_DIR"/claude-call-*
+run_stop_c
+assert_eq "C3b unfinished review does not finalize" "no" "$([[ -f "$LOOP_C/finalize-state.md" ]] && echo yes || echo no)"
+assert_eq "C3b unfinished review blocks" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+assert_contains "C3b agent is told the review failed" "review" "$(jq -r '.reason // empty' <<<"$OUT" | tr 'A-Z' 'a-z')"
+
+# C3c: the review base no longer resolves -> fail before calling Claude
+make_loop_c review-bad-base true
+sed -i.bak -e 's/^base_commit: .*/base_commit: 0123456789abcdef0123456789abcdef01234567/' "$LOOP_C/state.md" && rm -f "$LOOP_C/state.md.bak"
+printf 'Checked.\n\nNo issues found.\n' > "$MOCK_BIN/claude-review-output"
+rm -f "$TEST_DIR"/claude-call-*
+run_stop_c
+assert_eq "C3c bad base does not finalize" "no" "$([[ -f "$LOOP_C/finalize-state.md" ]] && echo yes || echo no)"
+assert_eq "C3c bad base blocks" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+assert_eq "C3c Claude not called without a diff" "0" "$(ls "$TEST_DIR"/claude-call-*.args 2>/dev/null | wc -l | tr -d ' ')"
 
 # C4: the same finalize on Claude Code (no HUMANIZE_HOST) keeps the polish step
 make_loop_c review-clean-claude true

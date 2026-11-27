@@ -88,9 +88,12 @@ run_claude_reviewer() {
 # Write what the code reviewer needs from git into one file it can Read:
 # the commit list, the uncommitted status, a file summary and the full diff.
 # Arguments: $1=review base (commit or branch), $2=output file.
+# Returns 1 (and leaves the git error in the file) when any git step fails,
+# so the caller can block instead of reviewing an incomplete snapshot.
 write_claude_review_diff() {
     local review_base="$1"
     local output_file="$2"
+    local failed=0
     {
         echo "# Changes Under Review"
         echo ""
@@ -99,27 +102,42 @@ write_claude_review_diff() {
         echo "## Commits (git log --oneline $review_base..HEAD)"
         echo ""
         echo '```text'
-        git -C "$PROJECT_ROOT" log --oneline "$review_base..HEAD" 2>&1 || true
+        git -C "$PROJECT_ROOT" log --oneline "$review_base..HEAD" 2>&1 || failed=1
         echo '```'
         echo ""
         echo "## Uncommitted changes (git status --porcelain)"
         echo ""
         echo '```text'
-        git -C "$PROJECT_ROOT" status --porcelain 2>&1 || true
+        git -C "$PROJECT_ROOT" status --porcelain 2>&1 || failed=1
         echo '```'
         echo ""
         echo "## Files changed (git diff --stat $review_base...HEAD)"
         echo ""
         echo '```text'
-        git -C "$PROJECT_ROOT" diff --stat "$review_base...HEAD" 2>&1 || true
+        git -C "$PROJECT_ROOT" diff --stat "$review_base...HEAD" 2>&1 || failed=1
         echo '```'
         echo ""
         echo "## Full diff (git diff $review_base...HEAD)"
         echo ""
         echo '```diff'
-        git -C "$PROJECT_ROOT" diff "$review_base...HEAD" 2>&1 || true
+        git -C "$PROJECT_ROOT" diff "$review_base...HEAD" 2>&1 || failed=1
         echo '```'
+        return "$failed"
     } > "$output_file"
+}
+
+# A finished Claude code review either lists [P0-9] findings (a marker within
+# the first 10 characters of a line, the same rule detect_review_issues uses)
+# or ends with "No issues found.". Anything else, such as "I could not read
+# the diff", is not a review and must not pass as a clean one.
+# Arguments: $1=review output file. Returns 0 when the output is a finished review.
+claude_review_output_is_complete() {
+    local output_file="$1"
+    [[ -s "$output_file" ]] || return 1
+    if tail -n 50 "$output_file" | awk 'substr($0, 1, 10) ~ /\[P[0-9]\]/ { found = 1 } END { exit found ? 0 : 1 }'; then
+        return 0
+    fi
+    grep -qiE '^[[:space:]]*No issues found\.?[[:space:]]*$' "$output_file"
 }
 
 # Fail fast when a configured reviewer CLI is missing.

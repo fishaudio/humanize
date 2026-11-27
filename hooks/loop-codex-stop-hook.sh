@@ -1341,7 +1341,16 @@ Provider: codex
         # with the prompt actually sent.
         # The reviewer has no shell, so give it the diff as a file to Read.
         local diff_file="$LOOP_DIR/round-${round}-review-diff.md"
-        write_claude_review_diff "$review_base" "$diff_file"
+        if ! write_claude_review_diff "$review_base" "$diff_file"; then
+            {
+                echo "Could not collect the changes to review against $review_base."
+                echo "git output saved to: $diff_file"
+                tail -n 20 "$diff_file"
+            } > "$CODEX_REVIEW_LOG_FILE"
+            CODEX_REVIEW_EXIT_CODE=1
+            echo "Code review diff could not be generated (base: $review_base)" >&2
+            return "$CODEX_REVIEW_EXIT_CODE"
+        fi
         local claude_fallback="# Code Review - Round ${round}
 Read {{DIFF_FILE}} (the diff against ${review_base}) and review it. End with one finding per line starting with [P0]..[P9], or the single line: No issues found."
         load_and_render_safe "$TEMPLATE_DIR" "reviewer/claude-code-review.md" "$claude_fallback" \
@@ -1365,6 +1374,10 @@ Read {{DIFF_FILE}} (the diff against ${review_base}) and review it. End with one
         local claude_review_stderr="$CACHE_DIR/round-${round}-claude-review.err"
         run_claude_reviewer "$CODEX_TIMEOUT" "$CODEX_REVIEW_LOG_FILE" "$claude_review_stderr" < "$prompt_file" \
             || CODEX_REVIEW_EXIT_CODE=$?
+        if [[ "$CODEX_REVIEW_EXIT_CODE" -eq 0 ]] && ! claude_review_output_is_complete "$CODEX_REVIEW_LOG_FILE"; then
+            echo "Claude review output has neither [P0-9] findings nor 'No issues found.'; treating it as a failed review." >> "$claude_review_stderr"
+            CODEX_REVIEW_EXIT_CODE=3
+        fi
         # Keep failures visible in the review log, as `codex review` does with 2>&1.
         if [[ "$CODEX_REVIEW_EXIT_CODE" -ne 0 && -s "$claude_review_stderr" ]]; then
             cat "$claude_review_stderr" >> "$CODEX_REVIEW_LOG_FILE"

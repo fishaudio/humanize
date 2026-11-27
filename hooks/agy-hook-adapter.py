@@ -245,14 +245,17 @@ def deny_reason_from_stdout(stdout):
 
 
 def is_setup_command(command):
-    """True when the command runs setup-rlcr-loop.sh (directly or through bash/sh)."""
+    """True when the command starts a loop with setup-rlcr-loop.sh
+    (directly or through bash/sh). Help requests do not start a loop."""
     try:
         tokens = shlex.split(command)
     except ValueError:
         return False
     if tokens and os.path.basename(tokens[0]) in ("bash", "sh"):
         tokens = tokens[1:]
-    return bool(tokens) and os.path.basename(tokens[0]) == SETUP_SCRIPT_NAME
+    if not tokens or os.path.basename(tokens[0]) != SETUP_SCRIPT_NAME:
+        return False
+    return not any(token in ("-h", "--help") for token in tokens[1:])
 
 
 def remember_setup_conversation(payload, root):
@@ -269,6 +272,10 @@ def remember_setup_conversation(payload, root):
     if not is_setup_command(str(first_value(args, COMMAND_KEYS, ""))):
         return
     humanize_dir = root / ".humanize"
+    if (humanize_dir / PENDING_SESSION_FILE).exists():
+        # An earlier setup is still waiting to be bound to the conversation
+        # that ran it; never hand its loop to this one.
+        return
     humanize_dir.mkdir(exist_ok=True)
     (humanize_dir / SETUP_CONVERSATION_FILE).write_text(str(conversation) + "\n", encoding="utf-8")
 
