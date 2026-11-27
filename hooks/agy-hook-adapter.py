@@ -26,6 +26,8 @@ agy facts this relies on (agy 1.5.x, measured):
   event for setup-rlcr-loop.sh may arrive before the loop exists. The adapter
   remembers which conversation started setup and binds the loop to it on the
   next event from that conversation.
+- Hooks inherit agy's environment, so a driver that starts agy can switch on
+  extra checks with an environment variable (see UNATTENDED_ENV).
 
 Output rules for people: the text this adapter injects is read by the coding
 agent (Gemini). It tells the agent to explain things to the user in its own
@@ -34,6 +36,7 @@ plain words and never to paste reviewer output to the user.
 
 import json
 import os
+import re
 import shlex
 import subprocess
 import sys
@@ -65,6 +68,17 @@ COMMAND_KEYS = ("CommandLine", "Command", "command")
 CHUNK_KEYS = ("ReplacementChunks", "Chunks", "Edits")
 
 ACTIVE_STATE_FILES = ("state.md", "finalize-state.md", "methodology-analysis-state.md")
+
+# Set to "1" by scripts/agy-rlcr-run.sh, which runs a loop with nobody at the
+# keyboard and approves agy's own permission prompts automatically. Every tool
+# call then gets two extra checks, whether or not a loop is active yet: file
+# tools may only change files inside the project (or agy's own artifact
+# folder for this conversation), and `git push` is refused unless the loop was
+# started with --push-every-round.
+UNATTENDED_ENV = "HUMANIZE_AGY_UNATTENDED"
+FILE_CHANGE_TOOLS = WRITE_TOOLS | EDIT_TOOLS | MULTI_EDIT_TOOLS | OPAQUE_EDIT_TOOLS
+# git options that take the next word as their value.
+GIT_OPTIONS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"}
 
 SETUP_SCRIPT_NAME = "setup-rlcr-loop.sh"
 # Written by setup-rlcr-loop.sh: line 1 = state.md path, line 2 = setup script path.
@@ -361,6 +375,127 @@ def bind_pending_session(payload, root):
             pass
 
 
+def command_word_lists(command):
+    """Split a shell command into the words of each simple command.
+    Operators (;, &&, ||, |, &, parentheses) separate commands, and
+    redirections with their targets are dropped. Raises ValueError on
+    unbalanced quotes."""
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=True)
+    lexer.whitespace_split = True
+    lexer.commenters = ""
+    commands = []
+    words = []
+    skip_target = False
+    for token in lexer:
+        if token and set(token) <= SHELL_OPERATOR_CHARS:
+            if "<" in token or ">" in token:
+                skip_target = True
+                continue
+            if words:
+                commands.append(words)
+            words = []
+            continue
+        if skip_target:
+            skip_target = False
+            continue
+        words.append(token)
+    if words:
+        commands.append(words)
+    return commands
+
+
+def runs_git_push(command, depth=0):
+    """True when a shell command may run `git push`. Deliberately
+    conservative: it also looks inside quoted words such as bash -c "...",
+    and treats a command it cannot parse as a push when it mentions both."""
+    if not isinstance(command, str) or "git" not in command or "push" not in command:
+        return False
+    try:
+        word_lists = command_word_lists(command)
+    except ValueError:
+        return re.search(r"\bgit\b.*\bpush\b", command, re.S) is not None
+    for words in word_lists:
+        for index, word in enumerate(words):
+            if depth < 3 and any(ch.isspace() for ch in word):
+                if runs_git_push(word, depth + 1):
+                    return True
+                continue
+            if os.path.basename(word.lstrip("$(`")) != "git":
+                continue
+            position = index + 1
+            while position < len(words) and words[position].startswith("-"):
+                option = words[position].split("=", 1)[0]
+                takes_value = option in GIT_OPTIONS_WITH_VALUE and "=" not in words[position]
+                position += 2 if takes_value else 1
+            if position < len(words) and words[position].rstrip(")`") == "push":
+                return True
+    return False
+
+
+def loop_allows_push(payload, root):
+    """True when this conversation's active loop was started with --push-every-round."""
+    conversation = payload.get("conversationId") or ""
+    rlcr = root / ".humanize" / "rlcr"
+    try:
+        loop_dirs = [d for d in rlcr.iterdir() if d.is_dir()]
+    except OSError:
+        return False
+    for loop_dir in loop_dirs:
+        for name in ACTIVE_STATE_FILES:
+            try:
+                text = (loop_dir / name).read_text(encoding="utf-8")
+            except OSError:
+                continue
+            fields = {}
+            for line in text.splitlines():
+                key, sep, value = line.partition(":")
+                if sep:
+                    fields.setdefault(key.strip(), value.strip())
+            if fields.get("session_id") == conversation and fields.get("push_every_round") == "true":
+                return True
+    return False
+
+
+def is_inside(path_value, root):
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        path = root / path
+    try:
+        resolved = path.resolve()
+        root_resolved = root.resolve()
+    except (OSError, RuntimeError):
+        return False
+    return resolved == root_resolved or root_resolved in resolved.parents
+
+
+def unattended_denial(payload, root):
+    """Extra checks while scripts/agy-rlcr-run.sh drives agy unattended."""
+    if os.environ.get(UNATTENDED_ENV) != "1":
+        return None
+    name, args = tool_args(payload)
+    if name in FILE_CHANGE_TOOLS:
+        path = find_path(args)
+        if not path:
+            return {"decision": "deny", "reason": "Unattended Humanize run: could not tell which file this tool changes, so it is blocked."}
+        allowed = [root]
+        artifacts = payload.get("artifactDirectoryPath")
+        if isinstance(artifacts, str) and artifacts:
+            allowed.append(Path(artifacts))
+        if not any(is_inside(path, base) for base in allowed):
+            return {
+                "decision": "deny",
+                "reason": f"Unattended Humanize run: only files inside the project ({root}) may be changed. Blocked: {path}",
+            }
+    if name in BASH_TOOLS:
+        command = first_value(args, COMMAND_KEYS, "")
+        if runs_git_push(command) and not loop_allows_push(payload, root):
+            return {
+                "decision": "deny",
+                "reason": "Unattended Humanize run: git push is blocked because the loop was not started with --push-every-round. Keep your commits local.",
+            }
+    return None
+
+
 def handle_pre_tool(payload, root):
     name, args = tool_args(payload)
     for script, claude_tool, tool_input in validator_calls(name, args):
@@ -474,6 +609,13 @@ def main(argv):
             remember_setup_conversation(payload, root)
         except OSError as exc:
             print(f"humanize agy adapter: could not record the setup conversation: {exc}", file=sys.stderr)
+        try:
+            denial = unattended_denial(payload, root)
+        except Exception as exc:  # Fail closed: nobody is there to notice.
+            denial = {"decision": "deny", "reason": f"Unattended Humanize run: could not check this tool call: {exc}"}
+        if denial is not None:
+            sys.stdout.write(json.dumps(denial) + "\n")
+            return 0
     if not has_active_loop(root):
         return 0
     try:

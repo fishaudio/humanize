@@ -6,7 +6,8 @@
 #   plugin.json            plugin manifest
 #   hooks.json             agy hooks (PreToolUse, PostToolUse, Stop) -> runtime/hooks/agy-hook.sh
 #   skills/<name>/SKILL.md agy skills, with the runtime path filled in
-#   runtime/               Humanize scripts, hooks, templates and config used by the hooks and skills
+#   runtime/               Humanize scripts, hooks, templates, config and command procedures
+#                          used by the hooks and skills
 #
 # The runtime sits in its own folder so agy only loads the plugin parts it
 # knows (manifest, hooks, skills) and never mistakes runtime files for plugin
@@ -22,7 +23,7 @@ PLUGIN_NAME="humanize"
 DRY_RUN="false"
 VALIDATE="auto"
 
-RUNTIME_DIRS=(scripts hooks prompt-template templates config agents)
+RUNTIME_DIRS=(scripts hooks prompt-template templates config agents commands)
 
 usage() {
     cat <<'EOF'
@@ -149,12 +150,20 @@ for skill_dir in sorted((repo / "agy" / "skills").iterdir()):
         raise SystemExit(f"unfilled placeholder left in {source}")
     (target_dir / "SKILL.md").write_text(text, encoding="utf-8")
 
+# The command procedures (for example commands/gen-plan.md, which the
+# humanize-gen-plan skill follows) refer to scripts through the Claude Code
+# plugin variable; point them at this runtime instead.
+for command in sorted((stage / "runtime" / "commands").glob("*.md")):
+    text = command.read_text(encoding="utf-8")
+    command.write_text(text.replace("${CLAUDE_PLUGIN_ROOT}", runtime_root), encoding="utf-8")
+
 (stage / "runtime" / ".humanize-agy-install").write_text(
     json.dumps({"version": version, "source_commit": commit}) + "\n", encoding="utf-8"
 )
 PY
 
-chmod +x "$STAGE/runtime/hooks/agy-hook.sh" "$STAGE/runtime/hooks/agy-hook-adapter.py"
+chmod +x "$STAGE/runtime/hooks/agy-hook.sh" "$STAGE/runtime/hooks/agy-hook-adapter.py" \
+    "$STAGE/runtime/scripts/agy-rlcr-run.sh"
 
 # Swap the new plugin in. A previous copy is moved aside first and removed
 # only after the new one is in place.
@@ -183,7 +192,8 @@ cat <<EOF
 Humanize agy plugin installed.
   plugin folder: $TARGET
   runtime root:  $RUNTIME_ROOT
-  skills:        humanize-start-rlcr-loop, humanize-cancel-rlcr-loop
+  skills:        humanize-gen-plan, humanize-start-rlcr-loop, humanize-cancel-rlcr-loop
+  unattended:    $RUNTIME_ROOT/scripts/agy-rlcr-run.sh <plan-file>
 
 Reviewers default to Codex. To use Claude instead, set "rlcr_verifier" and/or
 "rlcr_reviewer" to "claude" in ~/.config/humanize/config.json or the project's

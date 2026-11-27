@@ -6,6 +6,8 @@
 # - the read-only Claude reviewer (rlcr_verifier / rlcr_reviewer = claude)
 # - finalize prompts on agy (no Gemini polish step)
 # - scripts/install-agy-plugin.sh layout
+# - the unattended-run checks (HUMANIZE_AGY_UNATTENDED)
+# - scripts/agy-rlcr-run.sh, the unattended driver, against a mock agy
 #
 
 set -uo pipefail
@@ -811,7 +813,7 @@ INSTALL_OUT="$(PATH="$MOCK_BIN:$PATH" "$REPO_ROOT/scripts/install-agy-plugin.sh"
 assert_eq "D1 installer exits 0" "0" "$RC"
 TARGET="$PLUGINS/humanize"
 PLUGINS_ABS="$(cd "$PLUGINS" && pwd)"
-for path in plugin.json hooks.json skills/humanize-start-rlcr-loop/SKILL.md skills/humanize-cancel-rlcr-loop/SKILL.md runtime/hooks/agy-hook.sh runtime/hooks/agy-hook-adapter.py runtime/hooks/loop-codex-stop-hook.sh runtime/scripts/setup-rlcr-loop.sh runtime/prompt-template/reviewer/claude-code-review.md runtime/config/default_config.json; do
+for path in plugin.json hooks.json skills/humanize-start-rlcr-loop/SKILL.md skills/humanize-cancel-rlcr-loop/SKILL.md skills/humanize-gen-plan/SKILL.md runtime/commands/gen-plan.md runtime/agents/draft-relevance-checker.md runtime/scripts/agy-rlcr-run.sh runtime/scripts/lib/agy_rlcr_run.py runtime/scripts/ask-codex.sh runtime/hooks/agy-hook.sh runtime/hooks/agy-hook-adapter.py runtime/hooks/loop-codex-stop-hook.sh runtime/scripts/setup-rlcr-loop.sh runtime/prompt-template/reviewer/claude-code-review.md runtime/config/default_config.json; do
     assert_eq "D1 installed $path" "yes" "$([[ -e "$TARGET/$path" ]] && echo yes || echo no)"
 done
 assert_eq "D1 wrapper is executable" "yes" "$([[ -x "$TARGET/runtime/hooks/agy-hook.sh" ]] && echo yes || echo no)"
@@ -824,6 +826,19 @@ assert_not_contains "D3 no placeholder left" "{{" "$START_SKILL"
 for word in 'CLAUDE_PLUGIN_ROOT' '$ARGUMENTS' 'AskUserQuestion tool'; do
     assert_not_contains "D3 no Claude-only reference: $word" "$word" "$START_SKILL"
 done
+GEN_PLAN_SKILL="$(cat "$TARGET/skills/humanize-gen-plan/SKILL.md")"
+assert_contains "D3 gen-plan skill points at the installed procedure" "$PLUGINS_ABS/humanize/runtime/commands/gen-plan.md" "$GEN_PLAN_SKILL"
+assert_contains "D3 gen-plan skill calls the installed ask-codex" "\"$PLUGINS_ABS/humanize/runtime/scripts/ask-codex.sh\"" "$GEN_PLAN_SKILL"
+assert_not_contains "D3 gen-plan skill has no placeholder left" "{{" "$GEN_PLAN_SKILL"
+assert_contains "D3 gen-plan skill keeps the parsed labels" "Claude Position" "$GEN_PLAN_SKILL"
+assert_contains "D3 gen-plan skill forbids polish" "Do not run \`polish-gemini.sh\`" "$GEN_PLAN_SKILL"
+GEN_PLAN_PROC="$(cat "$TARGET/runtime/commands/gen-plan.md")"
+assert_not_contains "D3 installed gen-plan procedure has no plugin variable left" '${CLAUDE_PLUGIN_ROOT}' "$GEN_PLAN_PROC"
+assert_contains "D3 installed gen-plan procedure uses the runtime scripts" "\"$PLUGINS_ABS/humanize/runtime/scripts/validate-gen-plan-io.sh\"" "$GEN_PLAN_PROC"
+assert_contains "D3 repository gen-plan procedure is unchanged" '${CLAUDE_PLUGIN_ROOT}/scripts/validate-gen-plan-io.sh' "$(cat "$REPO_ROOT/commands/gen-plan.md")"
+assert_contains "D3 start skill explains unattended runs" "\"$PLUGINS_ABS/humanize/runtime/scripts/agy-rlcr-run.sh\"" "$START_SKILL"
+assert_eq "D3 driver is executable" "yes" "$([[ -x "$TARGET/runtime/scripts/agy-rlcr-run.sh" ]] && echo yes || echo no)"
+assert_contains "D3 installer lists the gen-plan skill" "humanize-gen-plan" "$INSTALL_OUT"
 assert_eq "D3 no __pycache__ copied" "" "$(find "$TARGET" -name __pycache__)"
 assert_eq "D3 no top-level agents or rules folder" "no" "$([[ -e "$TARGET/agents" || -e "$TARGET/rules" ]] && echo yes || echo no)"
 
@@ -852,5 +867,233 @@ if command -v agy >/dev/null 2>&1; then
 else
     skip "D7 agy plugin validate" "agy not installed"
 fi
+
+# ========================================
+# Part E: unattended-run checks
+# ========================================
+
+echo "--- Part E: unattended-run checks ---"
+
+PROJ_E="$TEST_DIR/proj-unattended"
+init_test_git_repo "$PROJ_E"
+OUTSIDE_E="$TEST_DIR/outside-e"
+mkdir -p "$OUTSIDE_E"
+
+run_unattended() {
+    OUT="$(printf '%s' "$2" | HUMANIZE_AGY_UNATTENDED=1 python3 "$ADAPTER" "$1" 2>"$TEST_DIR/real-stderr")"
+    RC=$?
+}
+run_unattended_pre() {
+    local payload_json
+    payload_json="$(tool_payload "$2" "$1" "$3")"
+    run_unattended pre-tool "$payload_json"
+}
+
+# No loop yet: the checks apply from the first tool call.
+run_unattended_pre write_file "$PROJ_E" "{\"Path\":\"$OUTSIDE_E/x.txt\",\"Content\":\"x\"}"
+assert_eq "E1 write outside the project is denied" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+assert_contains "E1 reason names the project" "only files inside the project" "$(jq -r '.reason // empty' <<<"$OUT")"
+run_unattended_pre write_file "$PROJ_E" "{\"Path\":\"$PROJ_E/../outside-e/y.txt\",\"Content\":\"x\"}"
+assert_eq "E1 a .. path out of the project is denied" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+ln -s "$OUTSIDE_E" "$PROJ_E/link-out"
+run_unattended_pre edit_file "$PROJ_E" "{\"Path\":\"$PROJ_E/link-out/z.txt\",\"Target\":\"a\",\"Replacement\":\"b\"}"
+assert_eq "E1 a symlink out of the project is denied" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+ARTIFACTS_E="$TEST_DIR/agy-brain/conv-1"
+mkdir -p "$ARTIFACTS_E"
+ARTIFACT_PAYLOAD="$(tool_payload "$PROJ_E" write_to_file "{\"TargetFile\":\"$ARTIFACTS_E/task.md\",\"CodeContent\":\"x\"}" | jq -c --arg a "$ARTIFACTS_E" '.artifactDirectoryPath = $a')"
+run_unattended pre-tool "$ARTIFACT_PAYLOAD"
+assert_eq "E2 agy's own artifact folder is allowed" "" "$OUT"
+run_unattended_pre write_file "$PROJ_E" "{\"Path\":\"$PROJ_E/src/new.txt\",\"Content\":\"x\"}"
+assert_eq "E2 write inside the project is left to agy" "" "$OUT"
+run_unattended_pre write_file "$PROJ_E" '{"Path":"src/relative.txt","Content":"x"}'
+assert_eq "E2 relative path inside the project is left to agy" "" "$OUT"
+run_unattended_pre read_file "$PROJ_E" "{\"Path\":\"$OUTSIDE_E/x.txt\"}"
+assert_eq "E2 reading outside the project is allowed" "" "$OUT"
+run_unattended_pre sed_file "$PROJ_E" '{"Expression":"s/a/b/"}'
+assert_eq "E3 file tool without a path is denied" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+
+run_unattended_pre run_command "$PROJ_E" '{"CommandLine":"git add -A && git commit -m \"push the fix\""}'
+assert_eq "E4 commit mentioning push is allowed" "" "$OUT"
+for cmd in 'git push' 'git push origin HEAD' 'cd sub && git -C .. push' 'bash -c \"git push\"' 'echo $(git push)'; do
+    run_unattended_pre run_command "$PROJ_E" "{\"CommandLine\":\"$cmd\"}"
+    assert_eq "E4 denied: $cmd" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+done
+assert_contains "E4 reason says how to allow pushes" "--push-every-round" "$(jq -r '.reason // empty' <<<"$OUT")"
+
+# Without the variable nothing changes.
+OUT="$(tool_payload "$PROJ_E" write_file "{\"Path\":\"$OUTSIDE_E/x.txt\",\"Content\":\"x\"}" | python3 "$ADAPTER" pre-tool 2>/dev/null)"
+assert_eq "E5 attended: write outside the project is left to agy" "" "$OUT"
+OUT="$(tool_payload "$PROJ_E" run_command '{"CommandLine":"git push"}' | python3 "$ADAPTER" pre-tool 2>/dev/null)"
+assert_eq "E5 attended: git push is left to agy" "" "$OUT"
+
+# A loop started with --push-every-round may push; other conversations may not.
+PROJ_EP="$TEST_DIR/proj-unattended-push"
+init_test_git_repo "$PROJ_EP"
+LOOP_EP="$PROJ_EP/.humanize/rlcr/2026-04-05_00-00-00"
+mkdir -p "$LOOP_EP"
+sed -e 's/^push_every_round: .*/push_every_round: true/' "$LOOP_B/state.md" > "$LOOP_EP/state.md"
+cp "$LOOP_B/goal-tracker.md" "$LOOP_EP/" 2>/dev/null || true
+run_unattended_pre run_command "$PROJ_EP" '{"CommandLine":"git push"}'
+assert_eq "E6 push allowed with --push-every-round" "" "$(jq -r '.decision // empty' <<<"$OUT")"
+OTHER_PUSH="$(tool_payload "$PROJ_EP" run_command '{"CommandLine":"git push"}' | jq -c '.conversationId = "conv-other"')"
+run_unattended pre-tool "$OTHER_PUSH"
+assert_eq "E6 push denied for another conversation" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
+
+# ========================================
+# Part F: agy-rlcr-run.sh with a mock agy
+# ========================================
+
+echo "--- Part F: agy-rlcr-run.sh ---"
+
+DRIVER="$REPO_ROOT/scripts/agy-rlcr-run.sh"
+MOCK_AGY="$TEST_DIR/mock-agy/agy"
+mkdir -p "$(dirname "$MOCK_AGY")"
+cat > "$MOCK_AGY" <<'MOCK'
+#!/usr/bin/env bash
+# Mock agy: records each call and moves a fake loop forward.
+dir="${MOCK_AGY_DIR:?}"
+n=$(( $(cat "$dir/count" 2>/dev/null || echo 0) + 1 ))
+echo "$n" > "$dir/count"
+conv="" prompt=""
+args=("$@")
+for ((i = 0; i < ${#args[@]}; i++)); do
+    case "${args[$i]}" in
+        --conversation) conv="${args[$((i + 1))]}" ;;
+        -p) prompt="${args[$((i + 1))]}" ;;
+    esac
+done
+printf '%s\n' "$@" > "$dir/call-$n.args"
+printf '%s' "$prompt" > "$dir/call-$n.prompt"
+printf 'unattended=%s cwd=%s\n' "${HUMANIZE_AGY_UNATTENDED:-}" "$PWD" > "$dir/call-$n.env"
+[[ -n "$conv" ]] || conv="${MOCK_AGY_CONV:-mock-conv}"
+loop=".humanize/rlcr/2026-05-01_00-00-00"
+scenario="${MOCK_AGY_SCENARIO:-complete}"
+if [[ "$scenario" == "noconv" ]]; then
+    echo "agy: not signed in" >&2
+    exit 1
+fi
+if [[ $n -eq 1 && "$scenario" != "nostart" && "$scenario" != "resume" ]]; then
+    mkdir -p "$loop"
+    printf -- '---\ncurrent_round: 0\nsession_id: %s\n---\n' "$conv" > "$loop/state.md"
+elif [[ -f "$loop/state.md" ]]; then
+    case "$scenario" in
+        complete|resume)
+            round=$(( n - 1 ))
+            printf -- '---\ncurrent_round: %s\nsession_id: %s\n---\n' "$round" "$conv" > "$loop/state.md"
+            if [[ $n -ge ${MOCK_AGY_FINISH_AT:-3} ]]; then
+                mv "$loop/state.md" "$loop/complete-state.md"
+                [[ "$scenario" == "complete" ]] && printf '# Finalize Summary\n\nWritten by Gemini.\n' > "$loop/finalize-summary.md"
+            fi ;;
+        forever)
+            printf -- '---\ncurrent_round: %s\nsession_id: %s\n---\n' "$n" "$conv" > "$loop/state.md" ;;
+        cancel)
+            mv "$loop/state.md" "$loop/cancel-state.md" ;;
+        stall) : ;;
+    esac
+fi
+printf '{"event":"init","conversation_id":"%s","init":{"model":"mock"}}\n' "$conv"
+printf '{"event":"step_update","step":{}}\n'
+printf '{"event":"result","result":{"conversation_id":"%s","status":"SUCCESS","response":"Gemini reply %s"}}\n' "$conv" "$n"
+MOCK
+chmod +x "$MOCK_AGY"
+
+new_driver_project() {
+    PROJ_F="$TEST_DIR/proj-driver-$1"
+    init_test_git_repo "$PROJ_F"
+    export MOCK_AGY_DIR="$TEST_DIR/mock-agy-$1"
+    mkdir -p "$MOCK_AGY_DIR"
+}
+run_driver() {
+    DRIVER_OUT="$(cd "$PROJ_F" && "$DRIVER" --agy "$MOCK_AGY" "$@" 2>"$MOCK_AGY_DIR/driver.stderr")"
+    RC=$?
+    DRIVER_ERR="$(cat "$MOCK_AGY_DIR/driver.stderr")"
+    CALLS="$(cat "$MOCK_AGY_DIR/count" 2>/dev/null || echo 0)"
+}
+
+new_driver_project complete
+MOCK_AGY_SCENARIO=complete run_driver --model gemini-test --log-dir "$TEST_DIR/f1-logs" docs/plan.md --max 5
+assert_eq "F1 finished loop exits 0" "0" "$RC"
+assert_eq "F1 three agy turns (start + 2 resumes)" "3" "$CALLS"
+assert_eq "F1 prints Gemini's finalize summary" "$(printf '# Finalize Summary\n\nWritten by Gemini.')" "$DRIVER_OUT"
+assert_contains "F1 start prompt uses the start skill" "humanize-start-rlcr-loop" "$(cat "$MOCK_AGY_DIR/call-1.prompt")"
+assert_contains "F1 start prompt passes the setup arguments and --skip-quiz" "docs/plan.md --max 5 --skip-quiz" "$(cat "$MOCK_AGY_DIR/call-1.prompt")"
+assert_contains "F1 start prompt says nobody is watching" "Nobody is watching" "$(cat "$MOCK_AGY_DIR/call-1.prompt")"
+assert_not_contains "F1 start turn is a new conversation" "--conversation" "$(cat "$MOCK_AGY_DIR/call-1.args")"
+assert_eq "F1 resume says continue" "continue" "$(cat "$MOCK_AGY_DIR/call-2.prompt")"
+assert_contains "F1 resume uses the same conversation" "$(printf -- '--conversation\nmock-conv')" "$(cat "$MOCK_AGY_DIR/call-2.args")"
+F1_SETTINGS="$(sed -n '/^--settings$/{n;p;}' "$MOCK_AGY_DIR/call-3.args")"
+assert_eq "F1 approves agy's prompts" "always-proceed" "$(jq -r '.toolPermission' <<<"$F1_SETTINGS")"
+assert_eq "F1 keeps agy's file tools in the workspace" "false" "$(jq -r '.allowNonWorkspaceAccess' <<<"$F1_SETTINGS")"
+assert_eq "F1 never switches to paid credits" "false" "$(jq -r '.useG1Credits' <<<"$F1_SETTINGS")"
+assert_contains "F1 forwards --model" "$(printf -- '--model\ngemini-test')" "$(cat "$MOCK_AGY_DIR/call-3.args")"
+assert_contains "F1 stream-json output" "stream-json" "$(cat "$MOCK_AGY_DIR/call-1.args")"
+assert_eq "F1 agy runs unattended in the project root" "unattended=1 cwd=$(cd "$PROJ_F" && pwd -P)" "$(cat "$MOCK_AGY_DIR/call-2.env")"
+assert_contains "F1 driver reports the conversation" "mock-conv" "$DRIVER_ERR"
+assert_eq "F1 agy output kept per turn" "yes" "$([[ -s "$TEST_DIR/f1-logs/turn-001.jsonl" && -s "$TEST_DIR/f1-logs/turn-003.jsonl" ]] && echo yes || echo no)"
+
+mkdir -p "$PROJ_F/sub/dir"
+rm -f "$MOCK_AGY_DIR"/count "$MOCK_AGY_DIR"/call-*
+rm -rf "$PROJ_F/.humanize/rlcr"
+OUT="$(cd "$PROJ_F/sub/dir" && MOCK_AGY_SCENARIO=complete MOCK_AGY_FINISH_AT=2 "$DRIVER" --agy "$MOCK_AGY" docs/plan.md 2>/dev/null)"; RC=$?
+assert_eq "F1 started from a subfolder: exits 0" "0" "$RC"
+assert_eq "F1 started from a subfolder: agy still runs in the project root" "unattended=1 cwd=$(cd "$PROJ_F" && pwd -P)" "$(cat "$MOCK_AGY_DIR/call-1.env")"
+
+new_driver_project yolo
+MOCK_AGY_SCENARIO=complete MOCK_AGY_FINISH_AT=2 run_driver docs/plan.md --yolo
+assert_eq "F2 finished loop exits 0" "0" "$RC"
+assert_not_contains "F2 --skip-quiz not added after --yolo" "--skip-quiz" "$(cat "$MOCK_AGY_DIR/call-1.prompt")"
+assert_eq "F2 default log folder under .humanize/agy-runs" "yes" "$(ls "$PROJ_F"/.humanize/agy-runs/*/turn-001.jsonl >/dev/null 2>&1 && echo yes || echo no)"
+
+new_driver_project stall
+MOCK_AGY_SCENARIO=stall run_driver --stall-limit 2 docs/plan.md
+assert_eq "F3 stalled loop: driver gives up with 2" "2" "$RC"
+assert_eq "F3 stalled loop: start + 2 resumes" "3" "$CALLS"
+assert_contains "F3 says how to resume" "--resume mock-conv" "$DRIVER_ERR"
+
+new_driver_project forever
+MOCK_AGY_SCENARIO=forever run_driver --max-resumes 2 docs/plan.md
+assert_eq "F4 resume cap: driver gives up with 2" "2" "$RC"
+assert_eq "F4 resume cap: start + 2 resumes" "3" "$CALLS"
+
+new_driver_project nostart
+MOCK_AGY_SCENARIO=nostart run_driver docs/plan.md
+assert_eq "F5 loop never started exits 1" "1" "$RC"
+assert_eq "F5 one agy turn only" "1" "$CALLS"
+assert_eq "F5 prints Gemini's reply" "Gemini reply 1" "$DRIVER_OUT"
+
+new_driver_project cancel
+MOCK_AGY_SCENARIO=cancel run_driver docs/plan.md
+assert_eq "F6 cancelled loop exits 1" "1" "$RC"
+assert_contains "F6 names the end state" "cancel-state.md" "$DRIVER_ERR"
+
+new_driver_project noconv
+MOCK_AGY_SCENARIO=noconv run_driver docs/plan.md
+assert_eq "F7 agy failure before a conversation exits 2" "2" "$RC"
+
+new_driver_project resume
+mkdir -p "$PROJ_F/.humanize/rlcr/2026-05-01_00-00-00"
+printf -- '---\ncurrent_round: 4\nsession_id: conv-r\n---\n' > "$PROJ_F/.humanize/rlcr/2026-05-01_00-00-00/state.md"
+MOCK_AGY_SCENARIO=resume MOCK_AGY_FINISH_AT=2 run_driver --resume conv-r
+assert_eq "F8 --resume drives the existing loop to the end" "0" "$RC"
+assert_eq "F8 without a finalize summary, prints Gemini's last reply" "Gemini reply 2" "$DRIVER_OUT"
+assert_eq "F8 --resume: no start turn" "continue" "$(cat "$MOCK_AGY_DIR/call-1.prompt")"
+assert_contains "F8 --resume uses that conversation" "$(printf -- '--conversation\nconv-r')" "$(cat "$MOCK_AGY_DIR/call-1.args")"
+MOCK_AGY_SCENARIO=resume run_driver --resume conv-unknown
+assert_eq "F8 --resume with an unknown conversation exits 1" "1" "$RC"
+
+new_driver_project usage
+run_driver
+assert_eq "F9 no plan exits 64" "64" "$RC"
+run_driver --resume conv-r docs/plan.md
+assert_eq "F9 --resume with a plan exits 64" "64" "$RC"
+run_driver --stall-limit zero docs/plan.md
+assert_eq "F9 bad number exits 64" "64" "$RC"
+assert_eq "F9 usage errors start no agy" "0" "$CALLS"
+mkdir -p "$TEST_DIR/not-a-repo-f"
+OUT="$(cd "$TEST_DIR/not-a-repo-f" && "$DRIVER" --agy "$MOCK_AGY" docs/plan.md 2>&1)"; RC=$?
+assert_eq "F9 outside a git repository exits 64" "64" "$RC"
+OUT="$("$DRIVER" --help)"; RC=$?
+assert_eq "F9 --help exits 0" "0" "$RC"
+assert_contains "F9 --help explains the safety checks" "git push" "$OUT"
 
 print_test_summary "agy Plugin Tests"

@@ -106,6 +106,18 @@ The loop state lives in files, so nothing is lost during a pause.
 4. Treat the files the loop writes (`round-*-prompt.md`, `round-*-review-result.md`) as the source of truth.
 5. Do not `git push` unless the loop was started with `--push-every-round`.
 
+## Running Unattended
+
+If the user wants a loop to run with nobody watching (for example on a server), tell them to start it from a terminal in the project instead of from this conversation:
+
+```bash
+"{{HUMANIZE_RUNTIME_ROOT}}/scripts/agy-rlcr-run.sh" <plan-path> <options>
+```
+
+The script starts agy for them and says "continue" each time the loop pauses at agy's limit. It approves agy's permission prompts automatically, and Humanize then blocks file changes outside the project and `git push`. Its `--help` explains the options.
+
+If a prompt says nobody is watching the session, never wait for answers: explain any blocker in your final reply, and when the loop pauses at agy's limit, just end your turn.
+
 ## Monitoring
 
 The user can watch progress from another terminal:

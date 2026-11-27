@@ -1,8 +1,8 @@
 # Install Humanize for agy (Antigravity CLI)
 
-This guide sets up the Humanize RLCR loop inside agy, Google's Antigravity CLI. In this setup, Gemini writes the code, and an independent reviewer checks the work: Codex by default, or Claude if you choose it.
+This guide sets up Humanize inside agy, Google's Antigravity CLI. In this setup, Gemini writes the plan and the code, and an independent reviewer checks the work: Codex by default, or Claude if you choose it.
 
-Everything people read comes from Gemini: its replies, the documents and web pages it writes, and the finalize summary at the end of the loop. The reviewer's output goes only to Gemini, which explains it to you in its own words.
+Everything people read comes from Gemini: its replies; the plans, documents, and web pages it writes; and the final summary at the end of the loop. The reviewer's output goes only to Gemini, which explains it to you in its own words.
 
 ## What You Need
 
@@ -24,9 +24,11 @@ This writes the plugin to `~/.gemini/config/plugins/humanize/`:
 |------|------------|
 | `plugin.json` | Plugin manifest |
 | `hooks.json` | The hooks agy runs before and after tool calls, and when Gemini tries to stop |
+| `skills/humanize-gen-plan/` | Skill that turns a draft into a plan |
 | `skills/humanize-start-rlcr-loop/` | Skill that starts a loop |
 | `skills/humanize-cancel-rlcr-loop/` | Skill that cancels a loop |
-| `runtime/` | Humanize scripts, hooks, and prompt templates used by the hooks and skills |
+| `runtime/` | Humanize scripts, hooks, prompt templates, and command procedures used by the hooks and skills |
+| `runtime/scripts/agy-rlcr-run.sh` | Script that runs a loop with nobody watching |
 
 Run the same command again to update. It replaces the old copy.
 
@@ -47,7 +49,27 @@ agy plugin validate ~/.gemini/config/plugins/humanize
 agy plugin list
 ```
 
-`validate` should report 2 skills and 1 hook file.
+`validate` should report 3 skills and 1 hook file.
+
+## Write a Plan
+
+A loop works from a plan file. To turn a rough draft into a plan, ask inside agy, for example:
+
+```text
+Use the humanize-gen-plan skill with --input docs/draft.md --output docs/plan.md
+```
+
+Gemini follows the same steps as `/humanize:gen-plan` in Claude Code, and writes the plan itself:
+
+1. checks the file paths and confirms that the draft belongs to this repository;
+2. asks Codex to point out risks and gaps in the draft;
+3. writes an initial plan, asks Codex to review it, and revises it until they agree (up to 3 rounds);
+4. asks you about anything only you can decide;
+5. writes the final plan, with acceptance criteria, a task list, and a record of where Gemini and Codex agreed or disagreed.
+
+Codex's notes go only to Gemini. The plan keeps the section names and labels that Humanize tools read, such as `Claude Position`. In a plan written in agy, "Claude" there refers to Gemini, and the plan states this.
+
+The options are the same as in Claude Code: `--direct` skips the Codex review rounds, `--discussion` keeps them, `--coach` adds short check-in questions, and `--auto-start-rlcr-if-converged` starts the loop right away when nothing is left for you to decide. See the [Usage Guide](usage.md#gen-plan).
 
 ## Start a Loop
 
@@ -63,7 +85,7 @@ Gemini then:
 2. asks you two questions about the plan to make sure you know what it will build (add `--skip-quiz` to skip them);
 3. runs the setup script and works through the plan in rounds;
 4. tries to stop at the end of each round. The Humanize hook then asks the reviewer whether the round is done. If it is not, Gemini gets the feedback and keeps working;
-5. once the work is done, the reviewer reviews the code. Gemini fixes what the reviewer finds the same way;
+5. once the work is done, the reviewer checks the code, and Gemini fixes what the reviewer finds in the same way;
 6. finishes with a short tidy-up round and writes `finalize-summary.md` for you.
 
 The options are the same as `/humanize:start-rlcr-loop` in Claude Code, except `--agent-teams`, which only works in Claude Code. See the [Usage Guide](usage.md#start-rlcr-loop).
@@ -72,12 +94,35 @@ To cancel, ask Gemini to use the `humanize-cancel-rlcr-loop` skill.
 
 ## The 10-Continuation Pause
 
-agy lets a hook keep the agent going at most 10 times per message you send, and each review round uses one continuation. So a long loop pauses about every 10 rounds:
+agy lets a hook keep the agent going at most 10 times per message you send, and each review round uses one continuation. As a result, a long loop pauses about every 10 rounds:
 
 - Before the pause, Gemini tells you that the loop stopped only because of this limit.
 - Reply `continue`. The review of the last round runs, and the loop goes on from there.
 
 The loop keeps its state in files under `.humanize/rlcr/`, so nothing is lost during a pause.
+
+## Run a Loop Unattended
+
+To run a loop with nobody watching, for example on a server, start it from a terminal in the project instead of from inside agy:
+
+```bash
+~/.gemini/config/plugins/humanize/runtime/scripts/agy-rlcr-run.sh docs/plan.md
+```
+
+The script starts agy with the `humanize-start-rlcr-loop` skill and replies `continue` for you each time the loop pauses at agy's limit. It adds `--skip-quiz`, because nobody is there to answer the quiz. Any other loop options go after the plan file, as usual. When the loop ends, the script prints Gemini's last reply.
+
+Because nobody can approve agy's permission prompts, the script approves them automatically. To keep that safe:
+
+- Humanize blocks file changes outside the project, and blocks `git push` unless you passed `--push-every-round`;
+- agy keeps its file tools inside the project, and does not switch to paid AI credits when your subscription quota runs out.
+
+Shell commands can still reach outside the project, so use unattended runs only on machines and projects where that is acceptable.
+
+The script stops by itself if three resumes in a row change nothing (`--stall-limit`), or after 50 resumes (`--max-resumes`). It saves agy's output in `.humanize/agy-runs/<time>/`. If the script itself stops, for example after a reboot, run it again with `--resume <conversation-id>`; it prints the ID when it starts. Other options: `--model`, `--effort`, and `--log-dir`. Run it with `--help` for details.
+
+Exit codes: `0` means the loop finished, `1` means the loop ended another way (for example, cancelled) or never started, and `2` means the script gave up.
+
+To keep it running after you log out, start it inside `tmux` or with `nohup`.
 
 ## Choosing the Reviewer
 
@@ -111,7 +156,7 @@ agy and Claude Code both run hook scripts, but they send different data. The plu
 - runs the same Stop hook as Claude Code when Gemini finishes a turn normally, and passes the reviewer's feedback back to Gemini;
 - does not start a review when you cancel a turn, when agy hits an error, when a background command or subagent is still running, or when agy is past its continuation limit.
 
-When a check blocks a tool call, agy shows the reason. Otherwise, the plugin stays silent and agy's own permission settings decide, so installing the plugin never grants extra permissions.
+When a check blocks a tool call, agy shows the reason. Otherwise, the plugin stays silent and agy's own permission settings decide, so installing the plugin never grants extra permissions. The only extra checks come from `agy-rlcr-run.sh`: it sets `HUMANIZE_AGY_UNATTENDED=1`, and the adapter then also blocks file changes outside the project and `git push`.
 
 ## Troubleshooting
 
