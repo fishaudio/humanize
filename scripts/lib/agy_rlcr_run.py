@@ -286,10 +286,11 @@ def review_failure_pauses(root, conversation):
         data = json.loads((root / ".humanize" / REVIEW_FAILURE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return 0
-    if not isinstance(data, dict) or data.get("conversation") != conversation:
+    entry = data.get(conversation) if isinstance(data, dict) else None
+    if not isinstance(entry, dict):
         return 0
     try:
-        return int(data.get("pauses") or 0)
+        return int(entry.get("pauses") or 0)
     except (TypeError, ValueError):
         return 0
 

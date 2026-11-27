@@ -356,10 +356,10 @@ export STUB_LOOP_CODEX_STOP_HOOK_STDOUT='{"decision":"block","reason":"# Codex R
 run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}')"
 assert_eq "A17b first review failure -> continue" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
 assert_contains "A17b first failure: agent explains it and how to retry" 'replying "continue" tries the review again' "$(jq -r '.reason' <<<"$OUT")"
-assert_eq "A17b first failure recorded" "1" "$(jq -r '.failures' "$FAIL_FILE" 2>/dev/null)"
+assert_eq "A17b first failure recorded" "1" "$(jq -r '."conv-1".failures' "$FAIL_FILE" 2>/dev/null)"
 run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":1,"terminationReason":"NO_TOOL_CALL"}')"
 assert_eq "A17b second failure in a row -> pause (no reply)" "" "$OUT"
-assert_eq "A17b pause recorded" "1" "$(jq -r '.pauses' "$FAIL_FILE" 2>/dev/null)"
+assert_eq "A17b pause recorded" "1" "$(jq -r '."conv-1".pauses' "$FAIL_FILE" 2>/dev/null)"
 run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":0,"terminationReason":"NO_TOOL_CALL"}')"
 assert_eq "A17b after the user replies: one explained retry again" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
 export STUB_LOOP_CODEX_STOP_HOOK_STDOUT='{"decision":"block","reason":"Round 3 feedback: add a test."}'
@@ -373,6 +373,12 @@ assert_contains "A17b a missing reviewer CLI counts as a failure" "review could 
 OTHER_CONV_STOP="$(payload Stop "$PROJ_A" '{"executionNum":3,"terminationReason":"NO_TOOL_CALL"}' | jq -c '.conversationId = "conv-other"')"
 run_stub stop "$OTHER_CONV_STOP"
 assert_eq "A17b another conversation does not inherit the count" "continue" "$(jq -r '.decision // empty' <<<"$OUT")"
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":3,"terminationReason":"NO_TOOL_CALL"}')"
+assert_eq "A17b interleaved failures: each conversation keeps its own count" "" "$OUT"
+rm -f "$FAIL_FILE"
+run_stub stop "$(payload Stop "$PROJ_A" '{"executionNum":9,"terminationReason":"NO_TOOL_CALL"}')"
+assert_contains "A17b failure at the last continuation: failure note" "review could not run" "$(jq -r '.reason' <<<"$OUT")"
+assert_not_contains "A17b failure at the last continuation: no conflicting limit note" "last automatic continuation" "$(jq -r '.reason' <<<"$OUT")"
 rm -f "$FAIL_FILE"
 unset STUB_LOOP_CODEX_STOP_HOOK_STDOUT
 
@@ -1034,7 +1040,7 @@ elif [[ -f "$loop/state.md" ]]; then
         reviewfail)
             # The hook rewrites the review prompt on each try and pauses the loop.
             echo "try $n" > "$loop/round-0-review-prompt.md"
-            printf '{"conversation":"%s","failures":0,"pauses":%s}\n' "$conv" "$((n - 1))" > .humanize/.agy-review-failures.json ;;
+            printf '{"other-conv":{"failures":1,"pauses":0},"%s":{"failures":0,"pauses":%s}}\n' "$conv" "$((n - 1))" > .humanize/.agy-review-failures.json ;;
         dirty)
             echo "edit $n" >> README.md
             if [[ $n -ge ${MOCK_AGY_FINISH_AT:-3} ]]; then mv "$loop/state.md" "$loop/complete-state.md"; fi ;;

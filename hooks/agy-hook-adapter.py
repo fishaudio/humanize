@@ -87,7 +87,7 @@ GIT_OPTIONS_WITH_VALUE = {"-C", "-c", "--git-dir", "--work-tree", "--namespace",
 # gets one continuation in which the agent explains it, and a second failure
 # in a row pauses the loop until the user replies.
 REVIEW_FAILURE_HEADINGS = ("# Codex Review Failed", "# Codex CLI Not Found", "# Claude CLI Not Found")
-# In .humanize/: {"conversation", "failures" (in a row), "pauses" (in a row)}.
+# In .humanize/: {<conversation id>: {"failures": in a row, "pauses": in a row}}.
 # scripts/agy-rlcr-run.sh reads "pauses" to stop resuming a loop whose review
 # keeps failing.
 REVIEW_FAILURE_FILE = ".agy-review-failures.json"
@@ -579,20 +579,33 @@ def is_review_failure(reason):
     return first_line.strip().startswith(REVIEW_FAILURE_HEADINGS)
 
 
-def read_review_failures(root, conversation):
+def load_review_failures(root):
     try:
         data = json.loads((root / ".humanize" / REVIEW_FAILURE_FILE).read_text(encoding="utf-8"))
     except (OSError, ValueError):
-        data = {}
-    if not isinstance(data, dict) or data.get("conversation") != conversation:
-        data = {}
-    return {"conversation": conversation, "failures": int(data.get("failures") or 0), "pauses": int(data.get("pauses") or 0)}
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def write_review_failures(root, data):
-    path = root / ".humanize" / REVIEW_FAILURE_FILE
+def read_review_failures(root, conversation):
+    entry = load_review_failures(root).get(conversation)
+    entry = entry if isinstance(entry, dict) else {}
     try:
-        if not data["failures"] and not data["pauses"]:
+        return {"failures": int(entry.get("failures") or 0), "pauses": int(entry.get("pauses") or 0)}
+    except (TypeError, ValueError):
+        return {"failures": 0, "pauses": 0}
+
+
+def write_review_failures(root, conversation, counts):
+    """Update this conversation's entry; other conversations' entries stay."""
+    path = root / ".humanize" / REVIEW_FAILURE_FILE
+    data = load_review_failures(root)
+    if counts["failures"] or counts["pauses"]:
+        data[conversation] = counts
+    else:
+        data.pop(conversation, None)
+    try:
+        if not data:
             if path.exists():
                 path.unlink()
             return
@@ -649,19 +662,21 @@ def handle_stop(payload, root):
             # user message starts over with one explained retry.
             failures["failures"] = 0
             failures["pauses"] += 1
-            write_review_failures(root, failures)
+            write_review_failures(root, conversation, failures)
             return None
-        write_review_failures(root, failures)
+        write_review_failures(root, conversation, failures)
     elif failures["failures"] or failures["pauses"]:
-        failures = {"conversation": conversation, "failures": 0, "pauses": 0}
-        write_review_failures(root, failures)
+        failures = {"failures": 0, "pauses": 0}
+        write_review_failures(root, conversation, failures)
 
     if reason is None:
         return None
     text = AGENT_PREAMBLE + "\n" + reason.strip() + "\n"
     if failures["failures"]:
+        # Not the limit note as well: it would tell the agent to finish the
+        # round as usual, while the failure note says to explain and stop.
         text += REVIEW_FAILURE_NOTE
-    if used == limit - 1:
+    elif used == limit - 1:
         text += LAST_CONTINUATION_NOTE.format(limit=limit)
     return {"decision": "continue", "reason": text}
 
