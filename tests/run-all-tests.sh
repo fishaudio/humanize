@@ -86,6 +86,7 @@ TEST_SUITES=(
     "test-config-merge.sh"
     "test-config-error-handling.sh"
     "test-codex-hook-install.sh"
+    "test-agy-plugin.sh"
     "test-unified-codex-config.sh"
     "test-disable-nested-codex-hooks.sh"
     # Session ID and Agent Teams tests

@@ -1,6 +1,9 @@
 {
   "codex_model": "gpt-5.5",
   "codex_effort": "high",
+  "rlcr_verifier": "codex",
+  "rlcr_reviewer": "codex",
+  "claude_review_model": "",
   "bitlesson_model": "haiku",
   "agent_teams": false,
   "alternative_plan_language": "",

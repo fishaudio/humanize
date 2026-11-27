@@ -349,8 +349,13 @@ PROJECT_ROOT="$(resolve_project_root)" || {
 
 MISSING_DEPS=()
 
-if ! command -v codex &>/dev/null; then
+# Reviewer CLIs follow rlcr_verifier / rlcr_reviewer (loop-common.sh): codex by default.
+if [[ "${RLCR_VERIFIER:-codex}" == "codex" || "${RLCR_REVIEWER:-codex}" == "codex" ]] && ! command -v codex &>/dev/null; then
     MISSING_DEPS+=("codex  - Install: https://github.com/openai/codex")
+fi
+
+if [[ "${RLCR_VERIFIER:-codex}" == "claude" || "${RLCR_REVIEWER:-codex}" == "claude" ]] && ! command -v claude &>/dev/null; then
+    MISSING_DEPS+=("claude - Install Claude Code, or set rlcr_verifier and rlcr_reviewer to codex")
 fi
 
 if ! command -v jq &>/dev/null; then

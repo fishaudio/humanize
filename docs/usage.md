@@ -532,6 +532,9 @@ Current built-in keys:
 |-----|---------|-------------|
 | `codex_model` | `gpt-5.5` | Shared default model for Codex-backed review and analysis |
 | `codex_effort` | `high` | Shared default reasoning effort (`max`, `xhigh`, `high`, `medium`, `low`) |
+| `rlcr_verifier` | `codex` | Who checks each RLCR round to decide whether the work is done: `codex` or `claude` |
+| `rlcr_reviewer` | `codex` | Who runs the RLCR code review phase: `codex` or `claude` |
+| `claude_review_model` | `""` | Model for Claude when it is a reviewer (for example `opus`); empty means the Claude CLI default |
 | `bitlesson_model` | `haiku` | Model used by the BitLesson selector agent |
 | `provider_mode` | unset | Optional runtime mode hint such as `codex-only` |
 | `agent_teams` | `false` | Project-level default for agent teams workflow |
@@ -578,6 +581,28 @@ Codex model is resolved with this precedence:
 2. Feature-specific defaults
 3. Config-backed defaults from the 4-layer hierarchy above
 4. Hardcoded fallback (`gpt-5.5:high`)
+
+### Choosing the RLCR Reviewers
+
+An RLCR loop has two review jobs, and you can assign each one to Codex or Claude:
+
+- `rlcr_verifier` checks the summary at the end of each round and decides whether the work is done.
+- `rlcr_reviewer` reviews the code once the work is done and reports problems as `[P0]` to `[P9]` findings.
+
+Both default to `codex`. To use Claude for both, add this to `.humanize/config.json`:
+
+```json
+{
+  "rlcr_verifier": "claude",
+  "rlcr_reviewer": "claude"
+}
+```
+
+The environment variables `HUMANIZE_RLCR_VERIFIER` and `HUMANIZE_RLCR_REVIEWER` override the config for one session.
+
+When Claude reviews, it runs as `claude -p` in read-only mode. It can read files and run read-only `git` commands (`diff`, `log`, `show`, `status`, and similar), but it cannot edit files, browse the web, use MCP servers, or trigger Humanize hooks. Because it cannot write files, it prints its review and the loop saves it. Instead of editing the goal tracker itself, it lists corrections for the coding agent to apply. Codex works as before: `codex exec` checks each round, and `codex review --base` reviews the code.
+
+Pick a reviewer from a different model family than the coding agent when you can. Using Claude Code to code and Codex to review (or Gemini in agy to code and Codex or Claude to review) gives a more independent review.
 
 **Migration note**: If your `.humanize/config.json` contains the legacy keys
 `loop_reviewer_model` or `loop_reviewer_effort`, they are silently ignored.

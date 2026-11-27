@@ -53,6 +53,14 @@ source "$PLUGIN_ROOT/scripts/portable-timeout.sh"
 # Source methodology analysis library
 source "$SCRIPT_DIR/lib/methodology-analysis.sh"
 
+# Source the read-only Claude reviewer (used when rlcr_verifier or
+# rlcr_reviewer is "claude"; RLCR_VERIFIER and RLCR_REVIEWER come from loop-common.sh)
+source "$SCRIPT_DIR/lib/claude-reviewer.sh"
+
+# HUMANIZE_HOST names the coding agent's host. The agy hook adapter sets it to
+# "agy"; Claude Code and Codex leave it unset.
+HUMANIZE_HOST="${HUMANIZE_HOST:-}"
+
 # Default timeout for git operations (30 seconds)
 GIT_TIMEOUT=30
 
@@ -1016,8 +1024,17 @@ SUMMARY_CONTENT=$(cat "$SUMMARY_FILE")
 # Shared prompt section for Goal Tracker Update Requests (used in both Full Alignment and Regular reviews)
 GOAL_TRACKER_SECTION_FALLBACK="## Goal Tracker Updates
 If Claude's summary includes a Goal Tracker Update Request section, apply the requested changes to {{GOAL_TRACKER_FILE}}."
-GOAL_TRACKER_UPDATE_SECTION=$(load_and_render_safe "$TEMPLATE_DIR" "codex/goal-tracker-update-section.md" "$GOAL_TRACKER_SECTION_FALLBACK" \
-    "GOAL_TRACKER_FILE=$GOAL_TRACKER_FILE")
+if [[ "$RLCR_VERIFIER" == "claude" ]]; then
+    # The Claude verifier is read-only, so it lists tracker corrections for the
+    # coding agent instead of editing the tracker itself.
+    GOAL_TRACKER_SECTION_FALLBACK="## Goal Tracker Corrections
+You cannot edit files. List any goal tracker changes the coding agent must make to {{GOAL_TRACKER_FILE}} under a 'Goal Tracker Corrections' heading."
+    GOAL_TRACKER_UPDATE_SECTION=$(load_and_render_safe "$TEMPLATE_DIR" "reviewer/goal-tracker-readonly-section.md" "$GOAL_TRACKER_SECTION_FALLBACK" \
+        "GOAL_TRACKER_FILE=$GOAL_TRACKER_FILE")
+else
+    GOAL_TRACKER_UPDATE_SECTION=$(load_and_render_safe "$TEMPLATE_DIR" "codex/goal-tracker-update-section.md" "$GOAL_TRACKER_SECTION_FALLBACK" \
+        "GOAL_TRACKER_FILE=$GOAL_TRACKER_FILE")
+fi
 
 # Determine if this is a Full Alignment Check round (every FULL_REVIEW_ROUND rounds)
 # Full Alignment Checks occur at rounds (N-1), (2N-1), (3N-1), etc. where N=FULL_REVIEW_ROUND
@@ -1131,14 +1148,48 @@ else
         "REVIEW_RESULT_FILE=$REVIEW_RESULT_FILE" > "$REVIEW_PROMPT_FILE"
 fi
 
+if [[ "$RLCR_VERIFIER" == "claude" ]]; then
+    READ_ONLY_VERIFIER_FALLBACK="
+## Reviewer Mode: Read-Only
+You cannot edit or create files. Print your complete review to standard output instead of writing {{REVIEW_RESULT_FILE}}."
+    load_and_render_safe "$TEMPLATE_DIR" "reviewer/read-only-verifier-note.md" "$READ_ONLY_VERIFIER_FALLBACK" \
+        "REVIEW_RESULT_FILE=$REVIEW_RESULT_FILE" >> "$REVIEW_PROMPT_FILE"
+fi
+
 # ========================================
 # Shared Setup: Cache Directory and Codex Arguments
 # ========================================
 # Initialize these before the REVIEW_STARTED guard so they are available in both
 # impl phase (codex exec) and review phase (codex review)
 
-# First, check if Codex CLI exists
-if ! command -v codex >/dev/null 2>&1; then
+# First, check that the configured reviewer CLIs exist
+MISSING_REVIEWER_CLI=""
+if [[ "$REVIEW_STARTED" == "true" ]]; then
+    MISSING_REVIEWER_CLI="$(find_missing_reviewer_cli "$RLCR_REVIEWER")" || true
+else
+    MISSING_REVIEWER_CLI="$(find_missing_reviewer_cli "$RLCR_VERIFIER" "$RLCR_REVIEWER")" || true
+fi
+if [[ "$MISSING_REVIEWER_CLI" == "claude" ]]; then
+    REASON="# Claude CLI Not Found
+
+The 'claude' CLI is not installed or not in PATH.
+This RLCR loop is configured to use Claude as a reviewer (rlcr_verifier=$RLCR_VERIFIER, rlcr_reviewer=$RLCR_REVIEWER).
+
+**To fix:**
+1. Install Claude Code, or set rlcr_verifier and rlcr_reviewer to codex in the Humanize config
+2. Retry the exit
+
+Or cancel the loop with the cancel-rlcr-loop script."
+
+    cat <<EOF
+{
+    "decision": "block",
+    "reason": $(echo "$REASON" | jq -Rs .)
+}
+EOF
+    exit 0
+fi
+if [[ "$MISSING_REVIEWER_CLI" == "codex" ]]; then
     REASON="# Codex CLI Not Found
 
 The 'codex' CLI is not installed or not in PATH.
@@ -1283,10 +1334,45 @@ Provider: codex
         echo "codex review ${CODEX_DISABLE_HOOKS_ARGS[*]+"${CODEX_DISABLE_HOOKS_ARGS[*]}"} --base $review_base ${CODEX_REVIEW_ARGS[*]}"
     } > "$CODEX_REVIEW_CMD_FILE"
 
+    CODEX_REVIEW_EXIT_CODE=0
+    if [[ "$RLCR_REVIEWER" == "claude" ]]; then
+        # Claude has no `review --base` command: render a review prompt that asks
+        # for the same [P0-9] finding lines, and replace the audit-only prompt file
+        # with the prompt actually sent.
+        local claude_fallback="# Code Review - Round ${round}
+Review \`git diff ${review_base}...HEAD\` read-only. End with one finding per line starting with [P0]..[P9], or the single line: No issues found."
+        load_and_render_safe "$TEMPLATE_DIR" "reviewer/claude-code-review.md" "$claude_fallback" \
+            "REVIEW_ROUND=$round" \
+            "BASE_BRANCH=$BASE_BRANCH" \
+            "REVIEW_BASE=$review_base" \
+            "REVIEW_BASE_TYPE=$review_base_type" \
+            "TIMESTAMP=$timestamp" > "$prompt_file"
+        {
+            echo "# Code review invocation debug info"
+            echo "# Reviewer: claude"
+            echo "# Timestamp: $timestamp"
+            echo "# Working directory: $PROJECT_ROOT"
+            echo "# Review base ($review_base_type): $review_base"
+            echo "# Timeout: $CODEX_TIMEOUT seconds"
+            echo ""
+            describe_claude_review_command
+        } > "$CODEX_REVIEW_CMD_FILE"
+        echo "Running Claude code review with timeout ${CODEX_TIMEOUT}s in $PROJECT_ROOT (base: $review_base)..." >&2
+        local claude_review_stderr="$CACHE_DIR/round-${round}-claude-review.err"
+        run_claude_reviewer "$CODEX_TIMEOUT" "$CODEX_REVIEW_LOG_FILE" "$claude_review_stderr" < "$prompt_file" \
+            || CODEX_REVIEW_EXIT_CODE=$?
+        # Keep failures visible in the review log, as `codex review` does with 2>&1.
+        if [[ "$CODEX_REVIEW_EXIT_CODE" -ne 0 && -s "$claude_review_stderr" ]]; then
+            cat "$claude_review_stderr" >> "$CODEX_REVIEW_LOG_FILE"
+        fi
+        echo "Code review exit code: $CODEX_REVIEW_EXIT_CODE" >&2
+        echo "Code review log saved to: $CODEX_REVIEW_LOG_FILE" >&2
+        return "$CODEX_REVIEW_EXIT_CODE"
+    fi
+
     echo "Code review command saved to: $CODEX_REVIEW_CMD_FILE" >&2
     echo "Running codex review with timeout ${CODEX_TIMEOUT}s in $PROJECT_ROOT (base: $review_base)..." >&2
 
-    CODEX_REVIEW_EXIT_CODE=0
     (cd "$PROJECT_ROOT" && run_with_timeout "$CODEX_TIMEOUT" codex review ${CODEX_DISABLE_HOOKS_ARGS[@]+"${CODEX_DISABLE_HOOKS_ARGS[@]}"} --base "$review_base" "${CODEX_REVIEW_ARGS[@]}") \
         > "$CODEX_REVIEW_LOG_FILE" 2>&1 || CODEX_REVIEW_EXIT_CODE=$?
 
@@ -1338,6 +1424,20 @@ run_and_handle_code_review() {
         echo "Code review passed with no issues. Proceeding to finalize phase." >&2
         enter_finalize_phase "" "$success_msg"
     fi
+}
+
+# On agy the coding agent is Gemini, so the finalize summary is already written
+# by Gemini and a second Gemini pass through polish-gemini.sh adds nothing.
+# Drop the "## Polish the Finalize Summary" section (up to the next "## "
+# heading, or the end) and ask for plain language directly.
+strip_polish_section_for_gemini_writer() {
+    awk '
+        /^## Polish the Finalize Summary[[:space:]]*$/ { skipping = 1; next }
+        skipping && /^## / { skipping = 0 }
+        !skipping { print }
+    '
+    printf '\n## Write the Finalize Summary for People\n\n'
+    printf 'The finalize summary is read by people. Write it yourself in plain, everyday language: short sentences, no unexplained jargon, and each term explained the first time it appears. Do not run polish-gemini.sh on it.\n'
 }
 
 # Enter finalize phase with appropriate prompt
@@ -1424,6 +1524,10 @@ Focus on the code changes made during this RLCR session. Focus more on changes b
             "GOAL_TRACKER_FILE=$GOAL_TRACKER_FILE" \
             "BASE_BRANCH=$BASE_BRANCH" \
             "START_BRANCH=$START_BRANCH")
+    fi
+
+    if [[ "$HUMANIZE_HOST" == "agy" ]]; then
+        finalize_prompt="$(printf '%s\n' "$finalize_prompt" | strip_polish_section_for_gemini_writer)"
     fi
 
     jq -n \
@@ -1712,7 +1816,7 @@ if [[ "$REVIEW_STARTED" == "true" ]]; then
     # Jump directly to Review Phase section below (after the COMPLETE/STOP handling)
 else
 
-echo "Running summary review for round $CURRENT_ROUND via codex..." >&2
+echo "Running summary review for round $CURRENT_ROUND via $RLCR_VERIFIER..." >&2
 
 CODEX_CMD_FILE="$CACHE_DIR/round-${CURRENT_ROUND}-codex-run.cmd"
 CODEX_STDOUT_FILE="$CACHE_DIR/round-${CURRENT_ROUND}-codex-run.out"
@@ -1721,26 +1825,42 @@ CODEX_STDERR_FILE="$CACHE_DIR/round-${CURRENT_ROUND}-codex-run.log"
 # Save the command for debugging
 CODEX_PROMPT_CONTENT=$(cat "$REVIEW_PROMPT_FILE")
 {
-    echo "# Codex invocation debug info"
+    echo "# Summary review invocation debug info"
+    echo "# Verifier: $RLCR_VERIFIER"
     echo "# Timestamp: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "# Working directory: $PROJECT_ROOT"
     echo "# Timeout: $CODEX_TIMEOUT seconds"
     echo ""
-    echo "codex exec ${CODEX_DISABLE_HOOKS_ARGS[*]+"${CODEX_DISABLE_HOOKS_ARGS[*]}"} ${CODEX_EXEC_ARGS[*]} \"<prompt>\""
+    if [[ "$RLCR_VERIFIER" == "claude" ]]; then
+        describe_claude_review_command
+    else
+        echo "codex exec ${CODEX_DISABLE_HOOKS_ARGS[*]+"${CODEX_DISABLE_HOOKS_ARGS[*]}"} ${CODEX_EXEC_ARGS[*]} \"<prompt>\""
+    fi
     echo ""
     echo "# Prompt content:"
     echo "$CODEX_PROMPT_CONTENT"
 } > "$CODEX_CMD_FILE"
 
-echo "Codex command saved to: $CODEX_CMD_FILE" >&2
+echo "Summary review command saved to: $CODEX_CMD_FILE" >&2
 echo "Running summary review with timeout ${CODEX_TIMEOUT}s..." >&2
 
 CODEX_EXIT_CODE=0
-printf '%s' "$CODEX_PROMPT_CONTENT" | run_with_timeout "$CODEX_TIMEOUT" codex exec ${CODEX_DISABLE_HOOKS_ARGS[@]+"${CODEX_DISABLE_HOOKS_ARGS[@]}"} "${CODEX_EXEC_ARGS[@]}" - \
-    > "$CODEX_STDOUT_FILE" 2> "$CODEX_STDERR_FILE" || CODEX_EXIT_CODE=$?
+if [[ "$RLCR_VERIFIER" == "claude" ]]; then
+    printf '%s' "$CODEX_PROMPT_CONTENT" | run_claude_reviewer "$CODEX_TIMEOUT" "$CODEX_STDOUT_FILE" "$CODEX_STDERR_FILE" \
+        || CODEX_EXIT_CODE=$?
+else
+    printf '%s' "$CODEX_PROMPT_CONTENT" | run_with_timeout "$CODEX_TIMEOUT" codex exec ${CODEX_DISABLE_HOOKS_ARGS[@]+"${CODEX_DISABLE_HOOKS_ARGS[@]}"} "${CODEX_EXEC_ARGS[@]}" - \
+        > "$CODEX_STDOUT_FILE" 2> "$CODEX_STDERR_FILE" || CODEX_EXIT_CODE=$?
+fi
 
-echo "Codex exit code: $CODEX_EXIT_CODE" >&2
+echo "Summary review exit code: $CODEX_EXIT_CODE" >&2
 echo "Codex stdout saved to: $CODEX_STDOUT_FILE" >&2
+
+# The read-only Claude verifier never writes the result file itself; its stdout
+# is the review. Replace any earlier result file for this round with it.
+if [[ "$RLCR_VERIFIER" == "claude" && "$CODEX_EXIT_CODE" -eq 0 && -s "$CODEX_STDOUT_FILE" ]]; then
+    cp "$CODEX_STDOUT_FILE" "$REVIEW_RESULT_FILE" 2>/dev/null || true
+fi
 echo "Codex stderr saved to: $CODEX_STDERR_FILE" >&2
 
 # ========================================

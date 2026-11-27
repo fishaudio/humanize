@@ -43,6 +43,8 @@ The loop has two phases: **Implementation** (Claude works, Codex reviews summari
 
 Requires [codex CLI](https://github.com/openai/codex) for review. See the full [Installation Guide](docs/install-for-claude.md) for prerequisites and alternative setup options.
 
+To run the loop inside agy (Google's Antigravity CLI) with Gemini writing the code and Codex or Claude reviewing it, see [Install for agy](docs/install-for-agy.md).
+
 ## Quick Start
 
 1. **Generate an idea draft** from a loose thought (optional — skip if you already have a draft):
@@ -114,6 +116,7 @@ Requires [codex CLI](https://github.com/openai/codex) for review. See the full [
 - [Install for Claude Code](docs/install-for-claude.md) -- Full installation instructions
 - [Install for Codex](docs/install-for-codex.md) -- Codex skill runtime setup
 - [Install for Kimi](docs/install-for-kimi.md) -- Kimi CLI skill setup
+- [Install for agy](docs/install-for-agy.md) -- agy plugin: Gemini writes the code, Codex or Claude reviews it
 - [Configuration](docs/usage.md#configuration) -- Shared config hierarchy and override rules
 - [Bitter Lesson Workflow](docs/bitlesson.md) -- Project memory, selector routing, and delta validation
 

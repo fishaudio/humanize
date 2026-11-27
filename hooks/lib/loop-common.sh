@@ -233,7 +233,35 @@ DEFAULT_CODEX_EFFORT="${DEFAULT_CODEX_EFFORT:-${_cfg_codex_effort:-high}}"
 # Precedence: pre-set by caller (e.g. --agent-teams flag) > config value > hardcoded fallback (false)
 _cfg_agent_teams="$(get_config_value "$_LOOP_COMMON_CONFIG" "agent_teams" 2>/dev/null || true)"
 DEFAULT_AGENT_TEAMS="${DEFAULT_AGENT_TEAMS:-${_cfg_agent_teams:-false}}"
-unset _cfg_codex_model _cfg_codex_effort _cfg_agent_teams
+
+# Load the RLCR reviewer roles from merged config.
+# rlcr_verifier runs the per-round summary review (is the work done?).
+# rlcr_reviewer runs the code review phase ([P0-9] findings).
+# Each is "codex" (default) or "claude". Precedence: environment
+# (HUMANIZE_RLCR_VERIFIER / HUMANIZE_RLCR_REVIEWER) > config > "codex".
+_normalize_reviewer_provider() {
+    local value="$1" key="$2"
+    case "$value" in
+        "") return 0 ;;
+        codex|claude) printf '%s' "$value" ;;
+        *)
+            echo "Warning: Invalid $key: $value (expected codex or claude); using codex" >&2
+            printf 'codex'
+            ;;
+    esac
+}
+_cfg_rlcr_verifier="$(_normalize_reviewer_provider "${HUMANIZE_RLCR_VERIFIER:-$(get_config_value "$_LOOP_COMMON_CONFIG" "rlcr_verifier" 2>/dev/null || true)}" "rlcr_verifier")"
+_cfg_rlcr_reviewer="$(_normalize_reviewer_provider "${HUMANIZE_RLCR_REVIEWER:-$(get_config_value "$_LOOP_COMMON_CONFIG" "rlcr_reviewer" 2>/dev/null || true)}" "rlcr_reviewer")"
+RLCR_VERIFIER="${_cfg_rlcr_verifier:-codex}"
+RLCR_REVIEWER="${_cfg_rlcr_reviewer:-codex}"
+# Model passed to `claude -p --model` when Claude is a reviewer; empty uses the Claude CLI default.
+CLAUDE_REVIEW_MODEL="${HUMANIZE_CLAUDE_REVIEW_MODEL:-$(get_config_value "$_LOOP_COMMON_CONFIG" "claude_review_model" 2>/dev/null || true)}"
+if [[ -n "$CLAUDE_REVIEW_MODEL" && ! "$CLAUDE_REVIEW_MODEL" =~ ^[a-zA-Z0-9._:-]+$ ]]; then
+    echo "Warning: Invalid claude_review_model: $CLAUDE_REVIEW_MODEL; using the Claude CLI default" >&2
+    CLAUDE_REVIEW_MODEL=""
+fi
+unset -f _normalize_reviewer_provider
+unset _cfg_codex_model _cfg_codex_effort _cfg_agent_teams _cfg_rlcr_verifier _cfg_rlcr_reviewer
 
 unset _LOOP_COMMON_PROJECT_ROOT _LOOP_COMMON_CONFIG
 
