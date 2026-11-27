@@ -232,12 +232,13 @@ def file_stamp(path):
     return (stat.st_size, stat.st_mtime_ns)
 
 
-def fingerprint(root, loop_dir):
+def fingerprint(root, loop_dir, skip_dirs=()):
     """Something that changes whenever the loop or the repository moves on:
     the loop's files, HEAD, and the size and time of every changed or
     untracked file (so edits to an already-dirty file count as progress).
-    Files under .humanize/ are left out: the loop folder is checked on its
-    own, and the driver's logs there change on every turn."""
+    Files under .humanize/ and skip_dirs (the driver's log folder) are left
+    out: the loop folder is checked on its own, and the logs change on every
+    turn."""
     name, _active = loop_state(loop_dir)
     files = []
     try:
@@ -247,21 +248,28 @@ def fingerprint(root, loop_dir):
     except OSError:
         pass
     head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=root, capture_output=True, text=True).stdout.strip()
+    # Bytes, not text: -z prints file names unquoted, and they need not be UTF-8.
     status = subprocess.run(
-        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root, capture_output=True, text=True
+        ["git", "status", "--porcelain=v1", "-z", "--untracked-files=all"], cwd=root, capture_output=True
     ).stdout
+    skipped = [".humanize"]
+    for folder in skip_dirs:
+        try:
+            skipped.append(Path(folder).resolve().relative_to(root).as_posix())
+        except (OSError, ValueError):
+            continue  # outside the project: git status never lists it
     changed = []
-    entries = status.split("\0")
+    entries = status.split(b"\0")
     index = 0
     while index < len(entries):
         entry = entries[index]
         index += 1
         if len(entry) < 4:
             continue
-        code, rel = entry[:2], entry[3:]
+        code, rel = os.fsdecode(entry[:2]), os.fsdecode(entry[3:])
         if "R" in code or "C" in code:
             index += 1  # the next entry is the old name of a rename or copy
-        if rel == ".humanize" or rel.startswith(".humanize/"):
+        if any(rel == folder or rel.startswith(folder + "/") for folder in skipped):
             continue
         changed.append((code, rel, file_stamp(root / rel)))
     return (name, tuple(files), head, tuple(changed))
@@ -446,13 +454,13 @@ class Driver:
             if resumes >= options["max_resumes"]:
                 log(f"giving up after {resumes} resumes (--max-resumes); resume later with --resume {conversation}")
                 return self.finish(loop_dir, 2)
-            before = fingerprint(self.root, loop_dir)
+            before = fingerprint(self.root, loop_dir, [self.log_dir])
             resumes += 1
             log(f"round {current_round(loop_dir) or '?'} ({name}): resuming agy ({resumes} of at most {options['max_resumes']})")
             code, _found, status = self.run_turn(RESUME_PROMPT, conversation)
             if code != 0 or (status and status != "SUCCESS"):
                 log(f"agy exited with code {code}, status {status or 'unknown'}")
-            if fingerprint(self.root, loop_dir) == before:
+            if fingerprint(self.root, loop_dir, [self.log_dir]) == before:
                 stalled += 1
                 log(f"nothing changed in this resume ({stalled} of at most {options['stall_limit']} in a row)")
                 if stalled >= options["stall_limit"]:
@@ -481,8 +489,10 @@ def main(argv):
         return 64
     driver = Driver(options, root)
     # Stopping the driver (Ctrl-C, kill, tmux kill-session) stops agy too.
+    # A hangup is ignored when the driver was started that way (nohup).
     signal.signal(signal.SIGTERM, raise_keyboard_interrupt)
-    signal.signal(signal.SIGHUP, raise_keyboard_interrupt)
+    if signal.getsignal(signal.SIGHUP) != signal.SIG_IGN:
+        signal.signal(signal.SIGHUP, raise_keyboard_interrupt)
     try:
         return driver.run()
     except KeyboardInterrupt:

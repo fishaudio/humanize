@@ -375,11 +375,11 @@ def bind_pending_session(payload, root):
             pass
 
 
-def command_word_lists(command):
+def command_word_lists(command, drop_fd_numbers=False):
     """Split a shell command into the words of each simple command.
     Operators (;, &&, ||, |, &, parentheses) separate commands, and
-    redirections with their targets are dropped, including a file
-    descriptor number written before the operator (2>/dev/null).
+    redirections with their targets are dropped. With drop_fd_numbers, a
+    number right before a redirection is dropped too, as in 2>/dev/null.
     Backslash-newline continuations are joined first. Raises ValueError on
     unbalanced quotes."""
     command = re.sub(r"\\\r?\n", " ", command)
@@ -392,9 +392,7 @@ def command_word_lists(command):
     for token in lexer:
         if token and set(token) <= SHELL_OPERATOR_CHARS:
             if "<" in token or ">" in token:
-                # shlex cannot tell "2>x" from "2 >x"; dropping the number
-                # in both cases can only make a git push easier to spot.
-                if words and words[-1].isdigit():
+                if drop_fd_numbers and words and words[-1].isdigit():
                     words.pop()
                 skip_target = True
                 continue
@@ -420,10 +418,16 @@ def runs_git_push(command, depth=0):
     makes git itself refuse to push."""
     if not isinstance(command, str) or "git" not in command or "push" not in command:
         return False
+    # shlex cannot tell "2>x" (a file descriptor) from "2 >x" (an argument),
+    # so check both readings.
     try:
-        word_lists = command_word_lists(command)
+        readings = [command_word_lists(command, drop) for drop in (False, True)]
     except ValueError:
         return re.search(r"\bgit\b.*\bpush\b", command, re.S) is not None
+    return any(words_run_git_push(word_lists, depth) for word_lists in readings)
+
+
+def words_run_git_push(word_lists, depth):
     for words in word_lists:
         for index, word in enumerate(words):
             if depth < 3 and any(ch.isspace() for ch in word):

@@ -922,7 +922,7 @@ for cmd in 'git push' 'git push origin HEAD' 'cd sub && git -C .. push' 'bash -c
     assert_eq "E4 denied: $cmd" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
 done
 assert_contains "E4 reason says how to allow pushes" "--push-every-round" "$(jq -r '.reason // empty' <<<"$OUT")"
-for args in '{"CommandLine":"git 2>/dev/null push origin HEAD"}' '{"CommandLine":"git -C . \\\npush origin HEAD"}' '{"CommandLine":"git \\\n  push"}'; do
+for args in '{"CommandLine":"git -C 123 >/dev/null push origin HEAD"}' '{"CommandLine":"git 2>/dev/null push origin HEAD"}' '{"CommandLine":"git -C . \\\npush origin HEAD"}' '{"CommandLine":"git \\\n  push"}'; do
     run_unattended_pre run_command "$PROJ_E" "$args"
     assert_eq "E4 denied: $(jq -r .CommandLine <<<"$args" | tr '\n' ' ')" "deny" "$(jq -r '.decision // empty' <<<"$OUT")"
 done
@@ -1140,6 +1140,37 @@ assert_contains "F12 conversation reported during the first turn" "agy conversat
 assert_contains "F12 says how to resume" "--resume mock-conv" "$(cat "$MOCK_AGY_DIR/driver.stderr")"
 for _ in $(seq 1 50); do [[ -f "$MOCK_AGY_DIR/call-1.signal" ]] && break; sleep 0.2; done
 assert_eq "F12 agy was stopped too" "interrupted" "$(cat "$MOCK_AGY_DIR/call-1.signal" 2>/dev/null)"
+
+# A log folder inside the project does not hide a stall.
+new_driver_project stall-logs
+MOCK_AGY_SCENARIO=stall run_driver --stall-limit 2 --log-dir logs docs/plan.md
+assert_eq "F13 in-project log folder: stall still detected" "2" "$RC"
+assert_eq "F13 in-project log folder: start + 2 resumes" "3" "$CALLS"
+
+# A file name that is not UTF-8 does not crash the progress check.
+new_driver_project bytes-name
+if python3 -c 'import os,sys; open(os.fsencode(sys.argv[1]) + b"/caf\xe9.txt", "w").write("x")' "$PROJ_F" 2>/dev/null; then
+    MOCK_AGY_SCENARIO=stall run_driver --stall-limit 2 docs/plan.md
+    assert_eq "F14 non-UTF-8 file name: driver keeps working" "2" "$RC"
+    assert_not_contains "F14 non-UTF-8 file name: no traceback" "Traceback" "$DRIVER_ERR"
+else
+    skip "F14 non-UTF-8 file name" "this file system refuses such names"
+fi
+
+# Started with hangups ignored (nohup), the driver survives a hangup.
+new_driver_project nohup
+(cd "$PROJ_F" && trap '' HUP && MOCK_AGY_SCENARIO=slow exec "$DRIVER" --agy "$MOCK_AGY" docs/plan.md > /dev/null 2> "$MOCK_AGY_DIR/driver.stderr") &
+DRIVER_PID=$!
+for _ in $(seq 1 50); do
+    grep -q 'agy conversation: mock-conv' "$MOCK_AGY_DIR/driver.stderr" 2>/dev/null && break
+    sleep 0.2
+done
+kill -HUP "$DRIVER_PID" 2>/dev/null
+sleep 1
+assert_eq "F15 nohup: hangup does not stop the driver" "yes" "$(kill -0 "$DRIVER_PID" 2>/dev/null && echo yes || echo no)"
+kill -TERM "$DRIVER_PID" 2>/dev/null
+wait "$DRIVER_PID"; RC=$?
+assert_eq "F15 nohup: SIGTERM still stops it" "130" "$RC"
 
 new_driver_project usage
 run_driver
